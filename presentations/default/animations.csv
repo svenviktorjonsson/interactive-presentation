@@ -1,0 +1,3 @@
+id,when,how,from,durationMs,delayMs
+title,enter,fade,left,1500,0
+join_qr,enter,pixelate,,1500,0

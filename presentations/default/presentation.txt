@@ -1,0 +1,13 @@
+# presentation.txt v1 (canonical)
+
+view[name=home]:
+text[name=title]:
+Welcome to my presentation
+
+image[name=join_qr]
+
+view[name=view2,refView=home,loc=right]:
+text[name=v2_note]:
+Hur bra är vi på att estimera 30 sekunder tror ni?
+
+timer[name=timer1,showTime=1,barColor=orange,stat=gaussian,lineColor=green,min=20,max=40,binSize=0.5]

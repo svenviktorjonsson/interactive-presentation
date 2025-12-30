@@ -1,0 +1,16 @@
+{
+  "name": "interactive-presentation",
+  "private": true,
+  "scripts": {
+    "dev:web": "npm --prefix apps/web run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "preview:web": "npm --prefix apps/web run preview",
+    "typecheck": "npm --prefix apps/web run typecheck"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3",
+    "vite": "^6.0.5"
+  }
+}
+
+

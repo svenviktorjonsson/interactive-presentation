@@ -1,0 +1,5 @@
+id,view,x,y,w,h,rotationDeg,anchor,align
+title,home,-0.0925926,-0.2777778,0.8333333,0.0833333,0,centerCenter,center
+join_qr,home,-0.0925926,-0.0925926,0.1851852,0.1851852,0,centerCenter,
+v2_note,view2,0.2143610613202289,-0.3708106528935587,0.6481481,0.0833333,0,bottomRight,center
+timer1,view2,-0.12349066132022847,0.09704719839606857,1.35,0.78,0,centerCenter,

@@ -1,0 +1,409 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --panel: rgba(255, 255, 255, 0.06);
+  --text: rgba(255, 255, 255, 0.92);
+  --muted: rgba(255, 255, 255, 0.65);
+  --border: rgba(255, 255, 255, 0.12);
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 700px at 50% 10%, rgba(110, 168, 255, 0.12), transparent 60%),
+    radial-gradient(900px 500px at 30% 80%, rgba(255, 120, 190, 0.08), transparent 65%),
+    var(--bg);
+  /* Prefer KaTeX's roman font to match \mathrm{...} style across the app */
+  font-family: KaTeX_Main, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+  color: var(--text);
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+.stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.overlay {
+  position: absolute;
+  inset: 0;
+  /* Must be interactive so nodes (and resize/rotate handles) can receive clicks. */
+  pointer-events: auto;
+}
+
+.node {
+  pointer-events: auto;
+  user-select: none;
+  overflow: visible;
+  /* Ensure non-math text matches KaTeX \mathrm{...} */
+  font-family: KaTeX_Main, Times New Roman, serif;
+  font-weight: 400;
+}
+
+/* KaTeX defaults to ~1.21em; for mixed text+math we want math to match surrounding text size */
+.node .katex {
+  font-size: 1em;
+}
+
+.node .katex-display {
+  margin: 0;
+}
+
+.node.is-selected {
+  outline: 2px solid rgba(110, 168, 255, 0.9);
+  outline-offset: 2px;
+}
+
+.node-qr {
+  display: block;
+}
+
+.node-qr .qr-box {
+  border-radius: 16px;
+  border: 1px solid var(--border);
+  background: transparent;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.node-qr .qr-img {
+  width: 86%;
+  height: 86%;
+  object-fit: contain;
+  image-rendering: pixelated;
+  border-radius: 10px;
+  background: transparent;
+}
+
+
+.node-iframe {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.22);
+  overflow: visible;
+}
+
+.node-iframe .iframe-frame {
+  position: absolute;
+  inset: 0;
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.node-iframe .iframe {
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.1);
+}
+
+.node-image .image {
+  border-radius: 12px;
+}
+
+.node-timer .timer-frame {
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.node-timer .timer-header {
+  pointer-events: auto;
+}
+
+.node-timer .timer-status {
+  margin-left: auto;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.78);
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.node-timer .timer-btn {
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.22);
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.node-timer .timer-btn.primary {
+  border-color: rgba(110, 168, 255, 0.34);
+  background: rgba(110, 168, 255, 0.20);
+}
+
+.handles {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  z-index: 50;
+}
+
+.handle {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: rgba(110, 168, 255, 0.95);
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  position: absolute;
+  pointer-events: auto;
+  z-index: 60;
+}
+
+.handle.rotate {
+  width: 12px;
+  height: 12px;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.anchor-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.35);
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  position: absolute;
+  pointer-events: auto;
+  cursor: pointer;
+  transform: translate(-50%, -50%);
+  z-index: 65;
+}
+
+.anchor-dot[data-anchor="centerCenter"] {
+  /* Keep the center point a bit more subtle ("alpha in the center"). */
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.anchor-dot.is-current {
+  background: rgba(255, 40, 40, 0.95);
+  border-color: rgba(0, 0, 0, 0.55);
+  box-shadow: 0 0 0 2px rgba(255, 40, 40, 0.18);
+}
+
+.anchor-dot:hover {
+  /* Hover for NON-current points (blue) */
+  background: rgba(110, 168, 255, 0.72);
+  box-shadow: 0 0 0 2px rgba(110, 168, 255, 0.18);
+}
+
+.anchor-dot.is-current:hover {
+  /* Hover for the CURRENT anchor: stay red, get brighter */
+  background: rgba(255, 40, 40, 1);
+  box-shadow: 0 0 0 2px rgba(255, 40, 40, 0.28);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: grid;
+  place-items: center;
+  z-index: 9999;
+}
+
+.modal {
+  width: min(980px, calc(100vw - 40px));
+  height: min(720px, calc(100vh - 40px));
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(10, 14, 26, 0.92);
+  backdrop-filter: blur(12px);
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.modal-title {
+  font-weight: 700;
+}
+
+.tabs {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.tab {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.tab.is-active {
+  background: rgba(110, 168, 255, 0.18);
+  border-color: rgba(110, 168, 255, 0.32);
+}
+
+.modal-body {
+  padding: 14px;
+  overflow: auto;
+  display: grid;
+  gap: 12px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.field label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  box-sizing: border-box;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  padding: 10px 10px;
+  font-family: inherit;
+}
+
+.field select {
+  color-scheme: dark;
+}
+
+/* Windows can still render option lists with a light background unless we set it */
+.field select option {
+  background: #0b1020;
+  color: rgba(255, 255, 255, 0.92);
+}
+
+.field textarea {
+  min-height: 180px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+}
+
+.preview {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  white-space: pre-wrap;
+}
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.12);
+}
+
+.btn {
+  border-radius: 12px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-weight: 700;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+
+.btn.primary {
+  background: rgba(110, 168, 255, 0.22);
+  border-color: rgba(110, 168, 255, 0.34);
+}
+
+.fs-prompt {
+  position: absolute;
+  right: 14px;
+  top: 14px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(10px);
+  padding: 10px 12px;
+  border-radius: 12px;
+  pointer-events: auto;
+  display: grid;
+  gap: 6px;
+}
+
+.mode-toggle {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(10px);
+  padding: 10px 12px;
+  border-radius: 12px;
+  pointer-events: auto;
+  display: grid;
+  gap: 6px;
+  z-index: 2000;
+}
+
+.mode-toggle button {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.mode-toggle .hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.fs-prompt button {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.fs-prompt button:hover {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.fs-prompt .hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+
