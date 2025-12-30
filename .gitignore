@@ -1,0 +1,46 @@
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+.vscode/
+.idea/
+.cursor/
+
+# ---- Python / Poetry ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+.venv/
+venv/
+ENV/
+env/
+
+# ---- Node / Vite / TS ----
+node_modules/
+dist/
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+.eslintcache
+
+# ---- Builds / artifacts ----
+*.log
+*.tmp
+
+# ---- Presentation runtime-generated media ----
+# QR is generated at runtime from the active tunnel URL.
+presentations/**/media/join_qr.png
+
+
