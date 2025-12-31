@@ -30,6 +30,21 @@ function applyTransform(el: HTMLElement, node: NodeModel, px: { x: number; y: nu
 }
 
 export function createDomNode(node: NodeModel): DomNodeHandle | null {
+  if (node.type === "group") {
+    const el = document.createElement("div");
+    el.classList.add("node-group");
+    el.style.boxSizing = "border-box";
+    el.style.background = "transparent";
+    // Allow selection handles to render outside bounds.
+    el.style.overflow = "visible";
+    setCommonStyles(el, node);
+    const update = (n: NodeModel) => {
+      if (n.type !== "group") return;
+      setCommonStyles(el, n);
+    };
+    update(node);
+    return { id: node.id, el, update, destroy: () => el.remove() };
+  }
   if (node.type === "text") {
     const el = document.createElement("div");
     el.style.whiteSpace = "pre-wrap";
@@ -177,7 +192,13 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     img.style.objectFit = "contain";
     img.style.display = "block";
     img.decoding = "async";
-    img.loading = "lazy";
+    // Images are frequently used for critical UI (e.g. join QR).
+    // Avoid any browser heuristics delaying load.
+    img.loading = "eager";
+    img.addEventListener("error", () => {
+      // eslint-disable-next-line no-console
+      console.warn("[ip] image failed to load", { id: node.id, src: (node as any).src });
+    });
     (img.style as any).imageRendering = "pixelated";
     frame.append(canvas, img);
     el.append(frame);
@@ -201,15 +222,43 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     frame.className = "timer-frame";
     frame.style.position = "absolute";
     frame.style.inset = "0";
-    frame.style.overflow = "hidden";
-    frame.style.borderRadius = "12px";
+    // Allow composite sub-elements (labels/arrows) to be placed outside 0..1 of the timer rect.
+    // The timer "data rect" is still the timer node bounds; sub-elements may extend outside.
+    frame.style.overflow = "visible";
+    // The composite rect should be a plain rectangle (no rounding).
+    frame.style.borderRadius = "0";
+
+    // Overlay is only a faint background layer to indicate the timer composite rect.
+    // Subcomponents (labels/arrows) are rendered as siblings elsewhere so hiding this overlay
+    // shows a clean composite in edit mode.
+    const overlay = document.createElement("div");
+    overlay.className = "timer-overlay";
+    overlay.style.position = "absolute";
+    overlay.style.inset = "0";
+    overlay.style.pointerEvents = "none";
+
+    const overlayBg = document.createElement("div");
+    overlayBg.className = "timer-overlay-bg";
+    overlayBg.style.position = "absolute";
+    // Data region only (aligned with default axis arrows).
+    // left=0.08, right=0.92, top=0.10, bottom=0.90
+    overlayBg.style.left = "8%";
+    overlayBg.style.right = "8%";
+    overlayBg.style.top = "10%";
+    overlayBg.style.bottom = "10%";
+    overlayBg.style.background = "rgba(255,255,255,0.10)";
+    overlayBg.style.borderRadius = "0";
+    overlayBg.style.pointerEvents = "none";
+    overlay.append(overlayBg);
 
     const header = document.createElement("div");
     header.className = "timer-header";
     header.style.position = "absolute";
-    header.style.left = "10px";
-    header.style.right = "10px";
-    header.style.top = "10px";
+    // Buttons should live outside the timer "data rect" overlay. Place them above.
+    header.style.left = "0";
+    header.style.right = "0";
+    header.style.top = "-44px";
+    header.style.padding = "0 10px";
     header.style.display = "flex";
     header.style.gap = "10px";
     header.style.alignItems = "center";
@@ -227,11 +276,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     resetBtn.textContent = "Reset";
     resetBtn.dataset.action = "timer-reset";
 
-    const status = document.createElement("div");
-    status.className = "timer-status";
-    status.textContent = "Stopped";
-
-    header.append(startBtn, resetBtn, status);
+    header.append(startBtn, resetBtn);
 
     const canvas = document.createElement("canvas");
     canvas.className = "timer-canvas";
@@ -239,8 +284,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     canvas.style.inset = "0";
     canvas.style.width = "100%";
     canvas.style.height = "100%";
+    canvas.style.borderRadius = "0";
 
-    frame.append(canvas, header);
+    frame.append(overlay, canvas, header);
     el.append(frame);
 
     setCommonStyles(el, node);
@@ -257,6 +303,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       else delete (el.dataset as any).maxS;
       if (typeof (n as any).binSizeS === "number") el.dataset.binSizeS = String((n as any).binSizeS);
       else delete (el.dataset as any).binSizeS;
+      el.dataset.compositeEditing = "0";
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -312,6 +359,54 @@ export function layoutDomNodes(args: {
     console.log("[ip][anim]", ...a);
   };
   const dpr = window.devicePixelRatio || 1;
+
+  const byId = new Map(model.nodes.map((n) => [n.id, n]));
+  const memoWorld = new Map<string, any>();
+  const resolving = new Set<string>();
+
+  const resolveWorldTransform = (node: any): any => {
+    if (!node || node.space !== "world") return node?.transform;
+    if (memoWorld.has(node.id)) return memoWorld.get(node.id);
+    if (resolving.has(node.id)) return node.transform; // break cycles
+    resolving.add(node.id);
+
+    const parentId = String(node.parentId ?? "").trim();
+    if (!parentId) {
+      resolving.delete(node.id);
+      memoWorld.set(node.id, node.transform);
+      return node.transform;
+    }
+
+    const parent = byId.get(parentId) as any;
+    if (!parent) {
+      resolving.delete(node.id);
+      memoWorld.set(node.id, node.transform);
+      return node.transform;
+    }
+
+    const pt = resolveWorldTransform(parent);
+    const pr = (pt?.rotationDeg ?? 0) * (Math.PI / 180);
+    const cos = Math.cos(pr);
+    const sin = Math.sin(pr);
+    const scale = Math.max(1e-6, Number(pt?.h ?? 1));
+    const lt = node.transform ?? { x: 0, y: 0, w: 0.1, h: 0.05 };
+    const lx = Number(lt.x ?? 0) * scale;
+    const ly = Number(lt.y ?? 0) * scale;
+    const rx = lx * cos - ly * sin;
+    const ry = lx * sin + ly * cos;
+    const rotDeg = (pt?.rotationDeg ?? 0) + (lt.rotationDeg ?? 0);
+    const out = {
+      x: Number(pt?.x ?? 0) + rx,
+      y: Number(pt?.y ?? 0) + ry,
+      w: Number(lt.w ?? 0.1) * scale,
+      h: Number(lt.h ?? 0.05) * scale,
+      rotationDeg: rotDeg,
+      anchor: lt.anchor ?? pt?.anchor ?? "topLeft"
+    };
+    resolving.delete(node.id);
+    memoWorld.set(node.id, out);
+    return out;
+  };
 
   // Pixelate helper: `p` is expected to already be STEP-QUANTIZED (e.g. 0, 0.05, 0.10, ... 1.0).
   const setPixelate = (hostEl: HTMLElement, pxW: number, pxH: number, p: number, steps = 20) => {
@@ -392,16 +487,26 @@ export function layoutDomNodes(args: {
     const handle = domNodes.get(node.id);
     if (!handle) continue;
 
-    let px: { x: number; y: number; w: number; h: number };
+    // Logical visibility: if false, always hide (independent of culling).
+    if (node.visible === false) {
+      handle.el.style.display = "none";
+      handle.update(node);
+      continue;
+    }
 
-    if (node.space === "world") {
-      const wPx = node.transform.w * camera.zoom;
-      const hPx = node.transform.h * camera.zoom;
-      const p = worldToScreen({ x: node.transform.x, y: node.transform.y }, camera, screen);
-      const { dx, dy } = anchorOffsetPx(node.transform.anchor, wPx, hPx);
+    let px: { x: number; y: number; w: number; h: number };
+    const nAny: any = node as any;
+    const wt = node.space === "world" ? resolveWorldTransform(nAny) : node.transform;
+    const nodeLayout: any = node.space === "world" ? { ...node, transform: wt } : node;
+
+    if (nodeLayout.space === "world") {
+      const wPx = nodeLayout.transform.w * camera.zoom;
+      const hPx = nodeLayout.transform.h * camera.zoom;
+      const p = worldToScreen({ x: nodeLayout.transform.x, y: nodeLayout.transform.y }, camera, screen);
+      const { dx, dy } = anchorOffsetPx(nodeLayout.transform.anchor, wPx, hPx);
       px = { x: p.x + dx, y: p.y + dy, w: wPx, h: hPx };
     } else {
-      px = { x: node.transform.x, y: node.transform.y, w: node.transform.w, h: node.transform.h };
+      px = { x: nodeLayout.transform.x, y: nodeLayout.transform.y, w: nodeLayout.transform.w, h: nodeLayout.transform.h };
     }
 
     // Cull if < 1 px on either dimension.
@@ -410,27 +515,36 @@ export function layoutDomNodes(args: {
       continue;
     }
 
-    if (!handle.el.isConnected) overlayEl.appendChild(handle.el);
-    applyTransform(handle.el, node, px);
-
-    // If the node is hidden, do NOT advance enter animations in the background.
-    // (Otherwise pixelate/fade can "finish" while invisible, and later appear instantly.)
-    if (node.visible === false) {
-      handle.update(node);
+    // Viewport culling (performance): don't lay out / redraw nodes that are off-screen.
+    // NOTE: This does NOT change the node's logical visibility; it just avoids work.
+    const marginPx = 80;
+    const off =
+      px.x + px.w < -marginPx ||
+      px.y + px.h < -marginPx ||
+      px.x > screen.w + marginPx ||
+      px.y > screen.h + marginPx;
+    if (off) {
+      handle.el.style.display = "none";
       continue;
     }
 
-    // Make text scale with world zoom AND with its own geometry size (so resizing the box scales the font).
-    if (node.type === "text") {
-      const z = node.space === "world" ? camera.zoom : 1;
-      // Heuristic: font size tracks the node's height. (Keeps proportional scaling when resizing corners.)
-      const fontPx = Math.max(1, (node.transform.h ?? 40) * 0.6 * z);
-      handle.el.style.fontSize = `${fontPx}px`;
+    if (!handle.el.isConnected) overlayEl.appendChild(handle.el);
+    handle.el.style.display = "block";
+    applyTransform(handle.el, nodeLayout, px);
+    handle.update(nodeLayout);
+
+    // Text sizing:
+    // - `fontPx` (world/design px) is the persisted base size.
+    // - camera zoom scales it into screen pixels.
+    if (nodeLayout.type === "text") {
+      const z = nodeLayout.space === "world" ? camera.zoom : 1;
+      const baseFontPx = Math.max(1, Number((nodeLayout as any).fontPx ?? (nodeLayout.transform.h ?? 40) * 0.6));
+      handle.el.style.fontSize = `${Math.max(1, baseFontPx * z)}px`;
     }
 
     // Intro animations (appear)
-    const appear: any = (node as any).appear;
-    const disappear: any = (node as any).disappear;
+    const appear: any = (nodeLayout as any).appear;
+    const disappear: any = (nodeLayout as any).disappear;
 
     // Detect visibility edges so enter animations start deterministically on "show".
     // This avoids timing-sensitive behavior (e.g. pressing ArrowRight before the image loads).

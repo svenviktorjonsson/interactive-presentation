@@ -54,6 +54,8 @@ export interface BaseNodeModel {
   space: Space;
   zIndex?: number;
   transform: Transform2D;
+  /** Optional hierarchical parent (used by `group`). If set, transform is interpreted in parent-local coords. */
+  parentId?: string;
   visible?: boolean;
   opacity?: number;
   appear?: AnimSpec;
@@ -64,6 +66,8 @@ export interface TextNodeModel extends BaseNodeModel {
   type: "text";
   text: string;
   align?: "left" | "center" | "right";
+  /** Font size in world/design pixels (scaled by camera zoom at render time). */
+  fontPx?: number;
 }
 
 export interface QrNodeModel extends BaseNodeModel {
@@ -108,6 +112,10 @@ export interface TimerNodeModel extends BaseNodeModel {
   compositeDir?: string;
 }
 
+export interface GroupNodeModel extends BaseNodeModel {
+  type: "group";
+}
+
 export type NodeModel =
   | TextNodeModel
   | QrNodeModel
@@ -116,6 +124,7 @@ export type NodeModel =
   | BulletsNodeModel
   | TableNodeModel
   | TimerNodeModel
+  | GroupNodeModel
   | BaseNodeModel;
 
 export interface CameraKeyframe {

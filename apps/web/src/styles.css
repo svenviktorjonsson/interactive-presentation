@@ -67,7 +67,7 @@ body {
 
 .node.is-selected {
   outline: 2px solid rgba(110, 168, 255, 0.9);
-  outline-offset: 2px;
+  outline-offset: 0px;
 }
 
 .node-qr {
@@ -117,37 +117,44 @@ body {
 }
 
 .node-timer .timer-frame {
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.04);
+  border: none;
+  background: transparent;
 }
 
 .node-timer .timer-header {
   pointer-events: auto;
 }
 
-.node-timer .timer-status {
-  margin-left: auto;
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.78);
-  padding: 6px 10px;
-  border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  background: rgba(0, 0, 0, 0.18);
-}
+/* timer-status removed (buttons already convey state) */
 
 .node-timer .timer-btn {
-  padding: 8px 10px;
+  padding: 12px 14px;
   border-radius: 10px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(0, 0, 0, 0.22);
+  border: none;
+  background: rgba(255, 255, 255, 0.08);
   color: rgba(255, 255, 255, 0.92);
   font-weight: 800;
   cursor: pointer;
+  font-size: 16px;
 }
 
 .node-timer .timer-btn.primary {
-  border-color: rgba(110, 168, 255, 0.34);
-  background: rgba(110, 168, 255, 0.20);
+  background: rgba(110, 168, 255, 0.22);
+}
+
+.ip-hide-node {
+  display: none !important;
+}
+
+.ip-dim-node {
+  opacity: 0.10 !important;
+  pointer-events: none !important;
+  filter: grayscale(0.5);
+}
+
+.timer-sub.is-selected {
+  outline: 2px solid rgba(110, 168, 255, 0.9);
+  outline-offset: 0px;
 }
 
 .handles {
@@ -158,20 +165,48 @@ body {
 }
 
 .handle {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  background: rgba(110, 168, 255, 0.95);
-  border: 1px solid rgba(0, 0, 0, 0.35);
+  /* Large invisible hitbox so hovering "outside" corners/edges still works nicely */
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: transparent;
+  border: none;
   position: absolute;
   pointer-events: auto;
   z-index: 60;
+  cursor: default;
 }
 
-.handle.rotate {
-  width: 12px;
-  height: 12px;
-  background: rgba(255, 255, 255, 0.92);
+/* Cursor-only UX (no visible glyphs). Hitboxes + cursor changes only on hover. */
+.handle.edge-n,
+.handle.edge-s {
+  cursor: ns-resize !important;
+}
+.handle.edge-e,
+.handle.edge-w {
+  cursor: ew-resize !important;
+}
+.handle.corner.scale-se {
+  cursor: nwse-resize !important;
+}
+.handle.corner.scale-sw {
+  cursor: nesw-resize !important;
+}
+.handle.corner.rot {
+  cursor: grab !important;
+}
+
+/* Rotation uses the standard hand cursor */
+
+/* Keep old classnames harmless (we no longer show symbols) */
+.handle.rotate-corner,
+.handle.resize-ew,
+.handle.resize-ns,
+.handle.scale-se,
+.handle.scale-sw,
+.handle.rot-tl,
+.handle.rot-tr {
+  background: transparent;
 }
 
 .anchor-dot {

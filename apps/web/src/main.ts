@@ -2,7 +2,7 @@ import QRCode from "qrcode";
 import katex from "katex";
 import "katex/dist/katex.min.css";
 import type { PresentationModel } from "@interactive/content";
-import { Engine } from "@interactive/engine";
+import { Engine, screenToWorld } from "@interactive/engine";
 import "./styles.css";
 
 // When the backend serves the built frontend, same-origin fetch works.
@@ -105,6 +105,8 @@ async function fetchTimerState(): Promise<TimerState | null> {
 function drawTimerNode(el: HTMLElement, state: TimerState) {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas.timer-canvas");
   if (!canvas) return;
+  // Skip when culled/hidden.
+  if (el.offsetParent === null) return;
   const r = el.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const W = Math.max(2, Math.round(r.width * dpr));
@@ -118,38 +120,19 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.clearRect(0, 0, W, H);
 
-  const phi = 1.618;
-  const m = 16 * dpr;
-  const plotW = W - m * 2;
-  const plotH = H - m * 2;
-  const yLen = plotH * 0.78;
-  const xLen = Math.min(plotW * 0.92, yLen * phi);
-  const ox = m + (plotW * 0.08);
-  const oy = m + (plotH * 0.90);
+  // Define the data-rect coordinate system so it aligns with the default axis arrows.
+  // (left/bottom axes sit on the rectangle borders)
+  const leftF = 0.08;
+  const rightF = 0.92;
+  const topF = 0.10;
+  const bottomF = 0.90;
+  const ox = leftF * W;
+  const oy = bottomF * H;
+  const xLen = (rightF - leftF) * W;
+  const yLen = (bottomF - topF) * H;
 
-  // Axes
-  ctx.strokeStyle = "rgba(255,255,255,0.75)";
-  ctx.lineWidth = 2 * dpr;
-  ctx.beginPath();
-  ctx.moveTo(ox, oy);
-  ctx.lineTo(ox + xLen, oy);
-  ctx.moveTo(ox, oy);
-  ctx.lineTo(ox, oy - yLen);
-  ctx.stroke();
-
-  const arrow = (x0: number, y0: number, x1: number, y1: number) => {
-    const ang = Math.atan2(y1 - y0, x1 - x0);
-    const L = 10 * dpr;
-    ctx.beginPath();
-    ctx.moveTo(x1, y1);
-    ctx.lineTo(x1 - L * Math.cos(ang - Math.PI / 6), y1 - L * Math.sin(ang - Math.PI / 6));
-    ctx.lineTo(x1 - L * Math.cos(ang + Math.PI / 6), y1 - L * Math.sin(ang + Math.PI / 6));
-    ctx.closePath();
-    ctx.fillStyle = "rgba(255,255,255,0.75)";
-    ctx.fill();
-  };
-  arrow(ox, oy, ox + xLen, oy);
-  arrow(ox, oy, ox, oy - yLen);
+  // No border around the graph area. The data rect is an invisible reference;
+  // only ticks/ticklabels should "stick out" of it.
 
   // Data
   const samples = state.samplesMs ?? [];
@@ -182,6 +165,49 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   }
   ctx.globalAlpha = 1;
 
+  // Ticks + tick labels (KaTeX font) — drawn on the canvas layer.
+  ctx.save();
+  // +50% vs the previous 18px baseline
+  ctx.font = `${Math.max(14, Math.round(27 * dpr))}px KaTeX_Main, Times New Roman, serif`;
+  ctx.fillStyle = "rgba(255,255,255,0.80)";
+  ctx.strokeStyle = "rgba(255,255,255,0.32)";
+  ctx.lineWidth = 2.0 * dpr;
+
+  // X ticks at bin edges from min..max using binSize
+  const tickLen = 20 * dpr;
+  const fmt = (v: number) => {
+    // Avoid noisy decimals but keep bin edges like 20.5.
+    const s = Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(2);
+    return s.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  };
+
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  for (let i = 0; i <= bins; i++) {
+    const v = minS + i * binSizeS;
+    const x = ox + ((v - minS) / span) * xLen;
+    // Tick mark
+    ctx.beginPath();
+    ctx.moveTo(x, oy);
+    ctx.lineTo(x, oy + tickLen);
+    ctx.stroke();
+    // Label
+    ctx.fillText(fmt(v), x, oy + tickLen + 8 * dpr);
+  }
+
+  // Y ticks: 0,10,20,...,100 (%)
+  ctx.textAlign = "right";
+  ctx.textBaseline = "middle";
+  for (let p = 0; p <= 100; p += 10) {
+    const y = oy - (p / 100) * yLen;
+    ctx.beginPath();
+    ctx.moveTo(ox, y);
+    ctx.lineTo(ox - tickLen, y);
+    ctx.stroke();
+    ctx.fillText(String(p), ox - tickLen - 10 * dpr, y);
+  }
+  ctx.restore();
+
   // Gaussian overlay normalized 0..1
   const mu = (state.stats.meanMs ?? 0) / 1000;
   const sigma = Math.max(1e-6, (state.stats.sigmaMs ?? 0) / 1000);
@@ -203,11 +229,13 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
     ctx.stroke();
   }
 
-  // Update presenter status label
-  const statusEl = el.querySelector<HTMLElement>(".timer-status");
   const startBtn = el.querySelector<HTMLButtonElement>('button[data-action="timer-startstop"]');
-  if (statusEl) statusEl.textContent = state.accepting ? "Running" : "Stopped";
   if (startBtn) startBtn.textContent = state.accepting ? "Stop" : "Start";
+
+  // In global Edit mode, hide the timer overlay shading (data-rect background).
+  const mode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
+  const bg = el.querySelector<HTMLElement>(".timer-overlay-bg");
+  if (bg) bg.style.display = mode === "edit" ? "none" : "block";
 }
 
 function attachTimerNodeHandlers(stage: HTMLElement) {
@@ -234,6 +262,240 @@ function attachTimerNodeHandlers(stage: HTMLElement) {
   });
 }
 
+function applyDataBindings(template: string, data: Record<string, string | number>) {
+  return template.replaceAll(/\{\{([a-zA-Z_][\w.]*)\}\}/g, (_m, key) => {
+    const v = (data as any)[key];
+    if (v === undefined || v === null) return "-";
+    if (typeof v === "number" && !Number.isFinite(v)) return "-";
+    return String(v);
+  });
+}
+
+function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
+  const m = engine.getModel();
+  const node = m?.nodes.find((n) => n.id === timerId) as any;
+  const el = engine.getNodeElement(timerId);
+  if (!node || !el) return null;
+
+  const frame = el.querySelector<HTMLElement>(":scope .timer-frame");
+  if (!frame) return null;
+
+  let layer = frame.querySelector<HTMLElement>(":scope .timer-sub-layer");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.className = "timer-sub-layer";
+    layer.dataset.timerId = timerId;
+    layer.style.position = "absolute";
+    layer.style.inset = "0";
+    layer.style.overflow = "visible";
+    layer.style.pointerEvents = "none";
+    frame.append(layer);
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("timer-sub-svg");
+    svg.style.position = "absolute";
+    svg.style.inset = "0";
+    svg.style.width = "100%";
+    svg.style.height = "100%";
+    svg.style.overflow = "visible";
+    svg.style.pointerEvents = "none";
+    layer.append(svg);
+
+    const geoms: Record<string, any> = node.compositeGeometries ?? {};
+    const text = String(node.elementsText ?? "");
+    const lines = text.split(/\r?\n/);
+    const arrowSpecs: Array<{
+      id: string;
+      x0: number;
+      y0: number;
+      x1: number;
+      y1: number;
+      color: string;
+      width: number;
+    }> = [];
+    for (const ln0 of lines) {
+      const ln = ln0.trim();
+      if (!ln || ln.startsWith("#")) continue;
+
+      // text[name=id]: content
+      const mt = ln.match(/^text\[name=(?<id>[a-zA-Z_]\w*)\]\s*:\s*(?<content>.*)$/);
+      if (mt?.groups) {
+        const sid = mt.groups.id;
+        const content = mt.groups.content ?? "";
+        const g = geoms[sid] ?? { x: 0.5, y: 0.5, w: 0.4, h: 0.1, rotationDeg: 0, anchor: "centerCenter", align: "center" };
+        const d = document.createElement("div");
+        d.className = "timer-sub timer-sub-text";
+        d.dataset.subId = sid;
+        d.dataset.template = content;
+        // Keep a stable content child so KaTeX updates don't wipe selection handles.
+        const contentEl = document.createElement("div");
+        contentEl.className = "timer-sub-content";
+        contentEl.style.width = "100%";
+        contentEl.style.height = "100%";
+        contentEl.style.display = "grid";
+        contentEl.style.placeItems = "center";
+        d.append(contentEl);
+        d.style.position = "absolute";
+        d.style.left = `${(g.x ?? 0.5) * 100}%`;
+        d.style.top = `${(g.y ?? 0.5) * 100}%`;
+        d.style.width = `${(g.w ?? 0.4) * 100}%`;
+        d.style.height = `${(g.h ?? 0.1) * 100}%`;
+        d.style.transform = "translate(-50%, -50%)";
+        // Default should be clean (no per-element "pill" overlay).
+        // In composite edit mode we can temporarily add outlines via JS if desired.
+        d.style.padding = "0";
+        d.style.borderRadius = "0";
+        d.style.border = "none";
+        d.style.background = "transparent";
+        d.style.color = "rgba(255,255,255,0.92)";
+        d.style.userSelect = "none";
+        d.style.pointerEvents = "none";
+        d.style.whiteSpace = "nowrap";
+        // Match global text nodes (KaTeX roman)
+        d.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+        d.style.fontWeight = "400";
+        d.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+        const rot = Number(g.rotationDeg ?? 0);
+        if (rot) d.style.rotate = `${rot}deg`;
+        layer.append(d);
+        continue;
+      }
+
+      // arrow[name=id,from=(x,y),to=(x,y),color=...,width=...]
+      const ma = ln.match(
+        /^arrow\[name=(?<id>[a-zA-Z_]\w*),from=\((?<x0>-?(?:\d+\.?\d*|\.\d+)),(?<y0>-?(?:\d+\.?\d*|\.\d+))\),to=\((?<x1>-?(?:\d+\.?\d*|\.\d+)),(?<y1>-?(?:\d+\.?\d*|\.\d+))\)(?:,color=(?<color>[^,\]]+))?(?:,width=(?<width>-?(?:\d+\.?\d*|\.\d+)))?\]$/
+      );
+      if (ma?.groups) {
+        const sid = ma.groups.id;
+        arrowSpecs.push({
+          id: sid,
+          x0: Number(ma.groups.x0),
+          y0: Number(ma.groups.y0),
+          x1: Number(ma.groups.x1),
+          y1: Number(ma.groups.y1),
+          color: (ma.groups.color ?? "white").trim(),
+          width: ma.groups.width == null ? 0.006 : Number(ma.groups.width)
+        });
+        continue;
+      }
+    }
+    (layer as any).__arrowSpecs = arrowSpecs;
+    (layer as any).__textGeoms = geoms;
+    (layer as any).__elementsText = text;
+  }
+
+  return layer;
+}
+
+function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .timer-sub-text"));
+  for (const t of els) {
+    const sid = t.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    // Size + position (allow outside 0..1)
+    const x = Number(g.x ?? 0.5);
+    const y = Number(g.y ?? 0.5);
+    const w = Number(g.w ?? 0.4);
+    const h = Number(g.h ?? 0.1);
+    const anchor = String(g.anchor ?? t.dataset.anchor ?? "centerCenter");
+    t.dataset.anchor = anchor;
+    t.style.left = `${x * 100}%`;
+    t.style.top = `${y * 100}%`;
+    t.style.width = `${w * 100}%`;
+    t.style.height = `${h * 100}%`;
+    t.style.rotate = `${Number(g.rotationDeg ?? 0)}deg`;
+    t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+
+    // Font size scales with the element height on screen.
+    const fontPx = Math.max(16, Math.round(timerEl.offsetHeight * h * 0.85));
+    t.style.fontSize = `${fontPx}px`;
+
+    const tpl = t.dataset.template ?? "";
+    const resolved = applyDataBindings(tpl, data);
+    t.dataset.rawText = resolved;
+    // Render KaTeX inline/display same as normal text nodes.
+    const contentEl = t.querySelector<HTMLElement>(":scope .timer-sub-content");
+    if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+  }
+}
+
+function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
+  const svg = layer.querySelector<SVGSVGElement>(":scope > .timer-sub-svg");
+  if (!svg) return;
+  const specs: any[] = (layer as any).__arrowSpecs ?? [];
+  if (!Array.isArray(specs) || specs.length === 0) {
+    svg.replaceChildren();
+    return;
+  }
+
+  // Use offsetWidth/offsetHeight so rotation (CSS transform) does NOT change the arrow scaling/length.
+  const w = Math.max(1, timerEl.offsetWidth);
+  const h = Math.max(1, timerEl.offsetHeight);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  const timerId = layer.dataset.timerId ?? "timer";
+
+  // Map arrow coordinates in "data-rect space":
+  // u in [0..1] across x, v in [0..1] up y. Allow >1 to extend beyond the rect.
+  // This matches the plot area used by drawTimerNode().
+  const leftF = 0.08;
+  const rightF = 0.92;
+  const topF = 0.10;
+  const bottomF = 0.90;
+  const ox = leftF * w;
+  const oy = bottomF * h;
+  const xLen = (rightF - leftF) * w;
+  const yLen = (bottomF - topF) * h;
+  const mapX = (u: number) => ox + u * xLen;
+  const mapY = (vUp: number) => oy - vUp * yLen;
+
+  for (const a of specs) {
+    const relW = typeof a.width === "number" && isFinite(a.width) ? a.width : 0.006;
+    const lwPx = Math.max(1, Math.min(18, relW * Math.min(w, h)));
+    const headWPx = 3 * lwPx;
+    const headLPx = 5 * lwPx;
+
+    const x1 = mapX(Number(a.x0 ?? 0));
+    const y1 = mapY(Number(a.y0 ?? 0));
+    const x2 = mapX(Number(a.x1 ?? 1));
+    const y2 = mapY(Number(a.y1 ?? 1));
+
+    const markerId = `arrowhead-${timerId}-${a.id}`;
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.setAttribute("id", markerId);
+    marker.setAttribute("markerUnits", "userSpaceOnUse");
+    marker.setAttribute("markerWidth", String(headLPx));
+    marker.setAttribute("markerHeight", String(headWPx));
+    // Attach the base of the arrowhead at the line end, so the arrowhead extends the line.
+    marker.setAttribute("refX", "0");
+    marker.setAttribute("refY", String(headWPx / 2));
+    marker.setAttribute("orient", "auto");
+
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    // Base at x=0, tip at x=headLPx (extends beyond line end).
+    path.setAttribute("d", `M0,0 L${headLPx},${headWPx / 2} L0,${headWPx} Z`);
+    path.setAttribute("fill", a.color ?? "white");
+    marker.append(path);
+    defs.append(marker);
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+    line.setAttribute("stroke", a.color ?? "white");
+    line.setAttribute("stroke-width", String(lwPx));
+    line.setAttribute("stroke-linecap", "round");
+    line.setAttribute("marker-end", `url(#${markerId})`);
+    g.append(line);
+  }
+
+  svg.replaceChildren(defs, g);
+}
+
 function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTMLElement) {
   if (__timerPollStarted) return;
   __timerPollStarted = true;
@@ -244,11 +506,29 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
     if (st) __timerState = st;
     const cur = engine.getModel();
     if (!cur || !__timerState) return;
+    const fmtS = (ms: any) => {
+      const v = typeof ms === "number" ? ms : Number(ms);
+      if (!Number.isFinite(v)) return "-";
+      return (v / 1000).toFixed(2);
+    };
     for (const n of cur.nodes) {
       if (n.type !== "timer") continue;
       const el = engine.getNodeElement(n.id);
       if (!el) continue;
       drawTimerNode(el, __timerState);
+      const layer = ensureTimerCompositeLayer(engine, n.id);
+      if (layer) renderTimerCompositeArrows(el, layer);
+      if (layer) {
+        const countN = Number.isFinite(__timerState.stats.n) ? Number(__timerState.stats.n) : 0;
+        const data: Record<string, string | number> = {
+          // Generic (per-composite) bindings: avoid timer.meanS; keep it as {{mean}}, {{sigma}}, {{n}}.
+          name: n.id,
+          mean: countN > 0 ? fmtS(__timerState.stats.meanMs) : "-",
+          sigma: countN > 1 ? fmtS(__timerState.stats.sigmaMs) : "-",
+          count: countN > 0 ? String(countN) : "-"
+        };
+        renderTimerCompositeTexts(el, layer, data);
+      }
     }
   };
 
@@ -388,16 +668,48 @@ function ensureHandles(el: HTMLElement) {
     h.style.transform = "translate(-50%, -50%)";
     return h;
   };
+  // Hover regions (in the node's local coordinate system; they rotate with the node):
+  // - strips located 5..20px outside each edge for resize
+  // - squares located 5..20px outside corners:
+  //   - top corners: rotate
+  //   - bottom corners: scale (diagonal)
+  const px15 = "15px";
+  const px20 = "20px";
+  const mkStrip = (name: string, left: string, top: string, w: string, h: string, cls = "") => {
+    const d = document.createElement("div");
+    d.className = `handle ${cls}`.trim();
+    d.dataset.handle = name;
+    d.style.left = left;
+    d.style.top = top;
+    d.style.width = w;
+    d.style.height = h;
+    d.style.transform = "none";
+    return d;
+  };
+  const mkCorner = (name: string, left: string, top: string, cls = "") => {
+    const d = document.createElement("div");
+    d.className = `handle ${cls}`.trim();
+    d.dataset.handle = name;
+    d.style.left = left;
+    d.style.top = top;
+    d.style.width = px15;
+    d.style.height = px15;
+    d.style.transform = "none";
+    return d;
+  };
+
   handles.append(
-    mk("nw", "0%", "0%"),
-    mk("n", "50%", "0%"),
-    mk("ne", "100%", "0%"),
-    mk("e", "100%", "50%"),
-    mk("se", "100%", "100%"),
-    mk("s", "50%", "100%"),
-    mk("sw", "0%", "100%"),
-    mk("w", "0%", "50%"),
-    mk("rot", "50%", "-18px", "rotate")
+    // edge resize strips (outside)
+    mkStrip("n", "0", `-${px20}`, "100%", px15, "edge edge-n"),
+    mkStrip("e", "calc(100% + 5px)", "0", px15, "100%", "edge edge-e"),
+    mkStrip("s", "0", "calc(100% + 5px)", "100%", px15, "edge edge-s"),
+    mkStrip("w", `-${px20}`, "0", px15, "100%", "edge edge-w"),
+
+    // corner squares (outside)
+    mkCorner("rot-tl", `-${px20}`, `-${px20}`, "corner rot rot-tl"),
+    mkCorner("rot-tr", "calc(100% + 5px)", `-${px20}`, "corner rot rot-tr"),
+    mkCorner("sw", `-${px20}`, "calc(100% + 5px)", "corner scale scale-sw"),
+    mkCorner("se", "calc(100% + 5px)", "calc(100% + 5px)", "corner scale scale-se")
   );
 
   const mkAnchor = (anchor: string, left: string, top: string) => {
@@ -488,10 +800,253 @@ function topLeftToAnchorWorld(rect: { x: number; y: number; w: number; h: number
 
 function attachEditor(stage: HTMLElement, engine: Engine) {
   const selected = new Set<string>();
+  let lastContextWorld: { x: number; y: number } | null = null;
+  let activeViewId: string = stage.dataset.viewId || "home";
 
   const undoStack: PresentationModel[] = [];
   const redoStack: PresentationModel[] = [];
   const cloneModel = (m: PresentationModel): PresentationModel => JSON.parse(JSON.stringify(m)) as PresentationModel;
+
+  const getActiveViewId = () => stage.dataset.viewId || activeViewId || "home";
+
+  const nextId = (prefix: string) => {
+    const m = engine.getModel();
+    const ids = new Set((m?.nodes ?? []).map((n) => n.id));
+    for (let i = 1; i < 10000; i++) {
+      const id = `${prefix}${i}`;
+      if (!ids.has(id)) return id;
+    }
+    return `${prefix}${Date.now()}`;
+  };
+
+  const anchorOffsetPxLocal = (anchor: string | undefined, w: number, h: number) => {
+    switch (anchor) {
+      case "center":
+      case "centerCenter":
+        return { dx: -w / 2, dy: -h / 2 };
+      case "top":
+      case "topCenter":
+        return { dx: -w / 2, dy: 0 };
+      case "bottom":
+      case "bottomCenter":
+        return { dx: -w / 2, dy: -h };
+      case "left":
+      case "centerLeft":
+        return { dx: 0, dy: -h / 2 };
+      case "right":
+      case "centerRight":
+        return { dx: -w, dy: -h / 2 };
+      case "topRight":
+        return { dx: -w, dy: 0 };
+      case "bottomLeft":
+        return { dx: 0, dy: -h };
+      case "bottomRight":
+        return { dx: -w, dy: -h };
+      case "topLeft":
+      default:
+        return { dx: 0, dy: 0 };
+    }
+  };
+
+  const rectCornersWorld = (t: any) => {
+    const w = Number(t.w ?? 0);
+    const h = Number(t.h ?? 0);
+    const { dx, dy } = anchorOffsetPxLocal(t.anchor, w, h);
+    const rot = (Number(t.rotationDeg ?? 0) * Math.PI) / 180;
+    const cos = Math.cos(rot);
+    const sin = Math.sin(rot);
+    const ax = Number(t.x ?? 0);
+    const ay = Number(t.y ?? 0);
+    const pts = [
+      { x: dx, y: dy },
+      { x: dx + w, y: dy },
+      { x: dx + w, y: dy + h },
+      { x: dx, y: dy + h }
+    ];
+    return pts.map((p) => ({ x: ax + p.x * cos - p.y * sin, y: ay + p.x * sin + p.y * cos }));
+  };
+
+  const resolveSelectableId = (id0: string) => {
+    const m = engine.getModel();
+    let id = id0;
+    const seen = new Set<string>();
+    while (true) {
+      if (seen.has(id)) return id0;
+      seen.add(id);
+      const n: any = m?.nodes.find((x) => x.id === id);
+      const p = String(n?.parentId ?? "").trim();
+      if (!p) return id;
+      id = p;
+    }
+  };
+
+  // Context menu (edit mode): add nodes / group selection.
+  const menu = document.createElement("div");
+  menu.className = "ctx-menu";
+  menu.style.position = "fixed";
+  menu.style.zIndex = "99999";
+  menu.style.minWidth = "180px";
+  menu.style.padding = "6px";
+  menu.style.borderRadius = "10px";
+  menu.style.border = "1px solid rgba(255,255,255,0.16)";
+  menu.style.background = "rgba(15,17,24,0.96)";
+  menu.style.boxShadow = "0 12px 40px rgba(0,0,0,0.45)";
+  menu.style.display = "none";
+  const hideMenu = () => (menu.style.display = "none");
+  document.body.append(menu);
+  window.addEventListener("pointerdown", (ev) => {
+    if (menu.style.display !== "none" && !menu.contains(ev.target as any)) hideMenu();
+  });
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") hideMenu();
+  });
+
+  const addTextAt = async (world: { x: number; y: number }) => {
+    const model = engine.getModel();
+    if (!model) return;
+    const before = cloneModel(model);
+    const id = nextId("text");
+    const node: any = {
+      id,
+      type: "text",
+      space: "world",
+      text: "New text",
+      align: "center",
+      transform: { x: world.x, y: world.y, w: 520, h: 80, anchor: "centerCenter", rotationDeg: 0 }
+    };
+    model.nodes.push(node);
+    const viewId = getActiveViewId();
+    const view = model.views.find((v) => v.id === viewId) ?? model.views[0];
+    if (view && !view.show.includes(id)) view.show.push(id);
+    engine.setModel(cloneModel(model));
+    hydrateTextMath(engine, model);
+    selected.clear();
+    selected.add(id);
+    applySelection();
+    await commit(before);
+  };
+
+  const groupSelection = async () => {
+    const model = engine.getModel();
+    if (!model) return;
+    const ids = Array.from(selected);
+    if (ids.length < 2) return;
+    const nodesById = new Map(model.nodes.map((n: any) => [n.id, n]));
+    const nodes = ids.map((id) => nodesById.get(id)).filter(Boolean) as any[];
+    if (nodes.length < 2) return;
+
+    let minX = Infinity,
+      minY = Infinity,
+      maxX = -Infinity,
+      maxY = -Infinity;
+    for (const n of nodes) {
+      const cs = rectCornersWorld(n.transform);
+      for (const p of cs) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+    }
+    const gw = Math.max(10, maxX - minX);
+    const gh = Math.max(10, maxY - minY);
+    const gx = (minX + maxX) / 2;
+    const gy = (minY + maxY) / 2;
+    const gid = nextId("group");
+
+    const before = cloneModel(model);
+    const groupNode: any = {
+      id: gid,
+      type: "group",
+      space: "world",
+      transform: { x: gx, y: gy, w: gw, h: gh, anchor: "centerCenter", rotationDeg: 0 }
+    };
+    model.nodes.push(groupNode);
+
+    const viewId = getActiveViewId();
+    const view = model.views.find((v) => v.id === viewId) ?? model.views[0];
+    if (view && !view.show.includes(gid)) view.show.unshift(gid);
+
+    for (const n of nodes) {
+      const t = n.transform ?? {};
+      n.parentId = gid;
+      n.transform = {
+        ...t,
+        x: (Number(t.x ?? 0) - gx) / gh,
+        y: (Number(t.y ?? 0) - gy) / gh,
+        w: Number(t.w ?? 1) / gh,
+        h: Number(t.h ?? 1) / gh
+      };
+      delete n.fontPx;
+    }
+
+    engine.setModel(cloneModel(model));
+    selected.clear();
+    selected.add(gid);
+    applySelection();
+    await commit(before);
+  };
+
+  stage.addEventListener("contextmenu", (ev) => {
+    const mode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
+    if (mode !== "edit") return;
+    ev.preventDefault();
+
+    activeViewId = getActiveViewId();
+
+    const r = stage.getBoundingClientRect();
+    const cam = engine.getCamera();
+    const scr = engine.getScreen();
+    lastContextWorld = screenToWorld({ x: ev.clientX - r.left, y: ev.clientY - r.top }, cam as any, scr as any);
+
+    const target = ev.target as HTMLElement;
+    const nodeEl = target.closest<HTMLElement>(".node");
+    if (nodeEl?.dataset.nodeId) {
+      const id = resolveSelectableId(nodeEl.dataset.nodeId);
+      if (!selected.has(id)) {
+        selected.clear();
+        selected.add(id);
+        applySelection();
+      }
+    }
+
+    menu.replaceChildren();
+    const mkItem = (label: string, enabled: boolean, onClick: () => Promise<void> | void) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.style.width = "100%";
+      b.style.textAlign = "left";
+      b.style.padding = "10px 10px";
+      b.style.border = "0";
+      b.style.borderRadius = "8px";
+      b.style.background = enabled ? "transparent" : "rgba(255,255,255,0.06)";
+      b.style.color = enabled ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.40)";
+      b.style.cursor = enabled ? "pointer" : "not-allowed";
+      b.addEventListener("click", async () => {
+        if (!enabled) return;
+        hideMenu();
+        await onClick();
+      });
+      b.addEventListener("pointerenter", () => {
+        if (!enabled) return;
+        b.style.background = "rgba(255,255,255,0.08)";
+      });
+      b.addEventListener("pointerleave", () => {
+        b.style.background = enabled ? "transparent" : "rgba(255,255,255,0.06)";
+      });
+      return b;
+    };
+
+    menu.append(
+      mkItem("Add text", !!lastContextWorld, () => addTextAt(lastContextWorld || { x: 0, y: 0 })),
+      mkItem("Group selection", selected.size >= 2, () => groupSelection())
+    );
+
+    menu.style.left = `${ev.clientX}px`;
+    menu.style.top = `${ev.clientY}px`;
+    menu.style.display = "block";
+  });
 
   let dragMode: DragMode = "none";
   let activeHandle: string | null = null;
@@ -501,6 +1056,19 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   let startAngleRad = 0;
   let startRotationDeg = 0;
 
+  const cursorForHandle = (h: string | null) => {
+    if (!h) return "";
+    if (h === "rot" || h.startsWith("rot-")) return "grab";
+    if (h === "n" || h === "s") return "ns-resize";
+    if (h === "e" || h === "w") return "ew-resize";
+    if (h === "nw" || h === "se") return "nwse-resize";
+    if (h === "ne" || h === "sw") return "nesw-resize";
+    return "";
+  };
+  const setBodyCursor = (c: string) => {
+    document.documentElement.style.cursor = c || "";
+  };
+
   const applySelection = () => {
     const model = engine.getModel();
     if (!model) return;
@@ -509,7 +1077,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (!el) continue;
       const isSel = selected.has(n.id);
       el.classList.toggle("is-selected", isSel);
-      if (isSel && selected.size === 1) ensureHandles(el);
+      if (isSel && selected.size === 1) {
+        // While editing a composite (timer), never show handles for the composite itself.
+        if (compositeEditTimerId && n.id === compositeEditTimerId) el.querySelector(".handles")?.remove();
+        else ensureHandles(el);
+      }
       if (!isSel || selected.size !== 1) el.querySelector(".handles")?.remove();
     }
   };
@@ -637,6 +1209,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           f.innerHTML = `<label>Text (use $$...$$ for KaTeX)</label>`;
           const ta = document.createElement("textarea");
           ta.value = state.text ?? "";
+          ta.style.fontSize = "18px";
+          ta.style.lineHeight = "1.35";
           const prev = document.createElement("div");
           prev.className = "preview";
           prev.innerHTML = renderTextWithKatexToHtml(ta.value).replaceAll("\n", "<br/>");
@@ -932,6 +1506,16 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
   // Composite edit mode (timer): allow editing sub-elements (labels/arrows) without opening the regular modal.
   let compositeEditTimerId: string | null = null;
+  let compositeHiddenEls: HTMLElement[] = [];
+  let compositeSelectedSubId: string | null = null;
+  let compositeSelectedSubEl: HTMLElement | null = null;
+  let compositeDragMode: "none" | "move" | "resize" | "rotate" = "none";
+  let compositeActiveHandle: string | null = null;
+  let compositeStart = { x: 0, y: 0 };
+  let compositeStartGeom: any = null;
+  let compositeGrabOff = { x: 0, y: 0 };
+  let compositeStartAngleRad = 0;
+  let compositeStartRotationDeg = 0;
   let compositeDrag:
     | null
     | {
@@ -943,41 +1527,6 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         box: DOMRect;
       } = null;
 
-  const ensureTimerSubElements = (timerEl: HTMLElement) => {
-    let layer = timerEl.querySelector<HTMLElement>(":scope .timer-sub-layer");
-    if (!layer) {
-      layer = document.createElement("div");
-      layer.className = "timer-sub-layer";
-      layer.style.position = "absolute";
-      layer.style.inset = "0";
-      layer.style.pointerEvents = "auto";
-
-      const mk = (id: string, text: string, leftPct: number, topPct: number) => {
-        const d = document.createElement("div");
-        d.className = "timer-sub timer-sub-text";
-        d.dataset.subId = id;
-        d.textContent = text;
-        d.style.position = "absolute";
-        d.style.left = `${leftPct}%`;
-        d.style.top = `${topPct}%`;
-        d.style.transform = "translate(-50%, -50%)";
-        d.style.padding = "6px 8px";
-        d.style.borderRadius = "10px";
-        d.style.border = "1px solid rgba(255,255,255,0.14)";
-        d.style.background = "rgba(0,0,0,0.22)";
-        d.style.color = "rgba(255,255,255,0.92)";
-        d.style.cursor = "grab";
-        d.style.userSelect = "none";
-        d.style.pointerEvents = "auto";
-        return d;
-      };
-
-      layer.append(mk("x_label", "Time (s)", 52, 92), mk("y_label", "Procentage (%)", 10, 45));
-      timerEl.append(layer);
-    }
-    return layer;
-  };
-
   const enterTimerCompositeEdit = (timerId: string) => {
     compositeEditTimerId = timerId;
     clearSelection();
@@ -985,19 +1534,187 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (!el) return;
     // Remove regular selection handles while in composite editing.
     el.querySelector(".handles")?.remove();
-    ensureTimerSubElements(el).style.display = "block";
+    // Hide the faint overlay entirely so sub-elements appear clean (as if directly on the canvas).
+    const ov = el.querySelector<HTMLElement>(".timer-overlay");
+    if (ov) ov.style.display = "none";
+    // Keep timer buttons visible in composite edit mode.
+
+    // Isolate: dim all other nodes in the scene.
+    compositeHiddenEls = [];
+    const model = engine.getModel();
+    for (const n of model?.nodes ?? []) {
+      if (n.id === timerId) continue;
+      const e2 = engine.getNodeElement(n.id);
+      if (!e2) continue;
+      e2.classList.add("ip-dim-node");
+      compositeHiddenEls.push(e2);
+    }
+    const layer = ensureTimerCompositeLayer(engine, timerId);
+    if (layer) layer.style.pointerEvents = "auto";
+    for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".timer-sub") ?? [])) {
+      sub.style.pointerEvents = "auto";
+      sub.style.cursor = "grab";
+      // Keep clean while editing (no frames).
+      sub.style.border = "none";
+      sub.style.background = "transparent";
+      sub.style.borderRadius = "0";
+      sub.style.padding = "0";
+    }
+
+    // Update mode button label while editing a group.
+    const modeBtn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+    if (modeBtn) modeBtn.textContent = "Exit group edit";
+    (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
+    (window as any).__ip_compositeEditing = true;
   };
 
   const exitTimerCompositeEdit = () => {
     if (!compositeEditTimerId) return;
     const el = engine.getNodeElement(compositeEditTimerId);
-    el?.querySelector<HTMLElement>(".timer-sub-layer")?.setAttribute("style", "display:none");
+    const ov = el?.querySelector<HTMLElement>(".timer-overlay");
+    if (ov) ov.style.display = "block";
+    const layer = el?.querySelector<HTMLElement>(".timer-sub-layer");
+    if (layer) layer.style.pointerEvents = "none";
+    for (const e2 of compositeHiddenEls) e2.classList.remove("ip-dim-node");
+    compositeHiddenEls = [];
     compositeEditTimerId = null;
     compositeDrag = null;
+    compositeDragMode = "none";
+    compositeActiveHandle = null;
+    compositeSelectedSubId = null;
+    compositeSelectedSubEl = null;
+    // Restore mode button label (based on dataset.mode)
+    const wrap = document.querySelector<HTMLElement>(".mode-toggle");
+    const mode = (wrap?.dataset.mode ?? "edit").toLowerCase();
+    const btn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+    if (btn) btn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
+    delete (window as any).__ip_exitCompositeEdit;
+    delete (window as any).__ip_compositeEditing;
+  };
+
+  const openCompositeTextEditor = (timerId: string, subEl: HTMLElement) => {
+    const layer = engine.getNodeElement(timerId)?.querySelector<HTMLElement>(".timer-sub-layer");
+    if (!layer) return;
+    const subId = subEl.dataset.subId ?? "";
+    if (!subId) return;
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.style.width = "min(820px, calc(100vw - 40px))";
+    modal.style.height = "min(520px, calc(100vh - 40px))";
+
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    header.innerHTML = `<div class="modal-title">Edit text: <code>${subId}</code></div>`;
+    const body = document.createElement("div");
+    body.style.padding = "14px";
+    body.style.display = "grid";
+    body.style.gridTemplateRows = "auto 1fr";
+    body.style.gap = "12px";
+
+    const taWrap = document.createElement("div");
+    taWrap.className = "field";
+    taWrap.innerHTML = `<label>Text</label>`;
+    const ta = document.createElement("textarea");
+    ta.value = subEl.dataset.template ?? "";
+    ta.style.width = "100%";
+    ta.style.height = "120px";
+    ta.style.resize = "vertical";
+    taWrap.append(ta);
+
+    const preview = document.createElement("div");
+    preview.className = "field";
+    preview.innerHTML = `<label>Preview</label>`;
+    const pv = document.createElement("div");
+    pv.style.border = "1px solid rgba(255,255,255,0.12)";
+    pv.style.borderRadius = "12px";
+    pv.style.padding = "12px";
+    pv.style.minHeight = "120px";
+    pv.style.background = "rgba(255,255,255,0.04)";
+    pv.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+    pv.style.fontWeight = "400";
+    preview.append(pv);
+
+    const renderPreview = () => {
+      // In previews, substitute {{name}} with the parent/composite id.
+      const templ = applyDataBindings(ta.value, { name: timerId, mean: "-", sigma: "-", count: "-" });
+      pv.innerHTML = renderTextWithKatexToHtml(templ).replaceAll("\n", "<br/>");
+    };
+    ta.addEventListener("input", renderPreview);
+    renderPreview();
+
+    const footer = document.createElement("div");
+    footer.style.display = "flex";
+    footer.style.justifyContent = "flex-end";
+    footer.style.gap = "10px";
+    footer.style.padding = "12px 14px";
+    footer.style.borderTop = "1px solid rgba(255,255,255,0.12)";
+    const btnCancel = document.createElement("button");
+    btnCancel.className = "btn";
+    btnCancel.textContent = "Cancel";
+    const btnSave = document.createElement("button");
+    btnSave.className = "btn primary";
+    btnSave.textContent = "Save";
+    footer.append(btnCancel, btnSave);
+
+    modal.append(header, body, footer);
+    body.append(taWrap, preview);
+    backdrop.append(modal);
+    document.body.append(backdrop);
+
+    const close = () => backdrop.remove();
+    btnCancel.addEventListener("click", close);
+    modal.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+    backdrop.addEventListener("pointerdown", (ev) => {
+      if (ev.target === backdrop) close();
+    });
+
+    btnSave.addEventListener("click", () => {
+      const newText = ta.value.replaceAll("\r\n", "\n");
+      subEl.dataset.template = newText;
+
+      // Update the stored elements.txt (single-line text syntax).
+      const src = String((layer as any).__elementsText ?? "");
+      const lines = src.split(/\r?\n/);
+      const out: string[] = [];
+      const re = new RegExp(`^\\s*text\\[name=${subId.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\]\\s*:\\s*(.*)$`);
+      let replaced = false;
+      for (const ln of lines) {
+        if (!replaced && re.test(ln)) {
+          out.push(`text[name=${subId}]: ${newText.replaceAll("\n", " ")}`);
+          replaced = true;
+        } else {
+          out.push(ln);
+        }
+      }
+      const nextText = out.join("\n");
+      (layer as any).__elementsText = nextText;
+
+      // Persist elementsText (and current geoms) to backend.
+      const geoms: any = (layer as any).__textGeoms ?? {};
+      void fetch(`${BACKEND}/api/timer/composite/save`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ compositeDir: timerId, geoms, elementsText: nextText })
+      });
+      close();
+    });
   };
 
   stage.addEventListener("dblclick", async (ev) => {
     const target = ev.target as HTMLElement;
+    // In composite edit mode, double-clicking a sub-text should open the text editor (not re-enter composite mode).
+    if (compositeEditTimerId) {
+      const sub = target.closest<HTMLElement>(".timer-sub-text");
+      if (sub) {
+        openCompositeTextEditor(compositeEditTimerId, sub);
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+    }
     const nodeEl = target.closest<HTMLElement>(".node");
     const id = nodeEl?.dataset.nodeId;
     if (!id) return;
@@ -1018,41 +1735,190 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (!sub) return;
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
+    const subId = sub.dataset.subId ?? "";
+    compositeSelectedSubId = subId;
+    compositeSelectedSubEl = sub;
+    for (const e of Array.from(timerEl.querySelectorAll<HTMLElement>(".timer-sub"))) e.classList.remove("is-selected");
+    sub.classList.add("is-selected");
+    ensureHandles(sub);
+
     const box = timerEl.getBoundingClientRect();
+    const layer = timerEl.querySelector<HTMLElement>(".timer-sub-layer");
+    const geoms: Record<string, any> = (layer as any)?.__textGeoms ?? {};
+    const g0 = geoms[subId] ?? {};
     const r = sub.getBoundingClientRect();
-    compositeDrag = {
-      subId: sub.dataset.subId ?? "",
-      startX: ev.clientX,
-      startY: ev.clientY,
-      startL: (r.left + r.width / 2 - box.left) / box.width,
-      startT: (r.top + r.height / 2 - box.top) / box.height,
-      box
+    const handleEl = t.closest<HTMLElement>(".handle");
+    const anchorEl = t.closest<HTMLElement>(".anchor-dot");
+    if (anchorEl?.dataset.anchor) {
+      // Re-anchor without snapping (keep top-left fixed)
+      const newAnchor = anchorEl.dataset.anchor;
+      const startAnchor = sub.dataset.anchor ?? "centerCenter";
+      const x = Number(sub.style.left.replace("%", "")) / 100;
+      const y = Number(sub.style.top.replace("%", "")) / 100;
+      const w = Number(sub.style.width.replace("%", "")) / 100;
+      const h = Number(sub.style.height.replace("%", "")) / 100;
+      const topLeft = anchorToTopLeftWorld({ x, y, w, h, anchor: startAnchor } as any);
+      const newPos = topLeftToAnchorWorld({ x: topLeft.x, y: topLeft.y, w, h }, newAnchor);
+      sub.dataset.anchor = newAnchor;
+      sub.style.left = `${newPos.x * 100}%`;
+      sub.style.top = `${newPos.y * 100}%`;
+      ensureHandles(sub);
+      (ev as any).stopImmediatePropagation?.();
+      ev.preventDefault();
+      return;
+    }
+
+    compositeStart = { x: ev.clientX, y: ev.clientY };
+    compositeStartGeom = {
+      // Source of truth is the stored geom (prevents jitter from DOM rect measurement).
+      x: Number(g0.x ?? (r.left + r.width / 2 - box.left) / box.width),
+      y: Number(g0.y ?? (r.top + r.height / 2 - box.top) / box.height),
+      w: Number(g0.w ?? r.width / box.width),
+      h: Number(g0.h ?? r.height / box.height),
+      rotationDeg: Number(g0.rotationDeg ?? (Number((sub.style.rotate || "0deg").replace("deg", "")) || 0)),
+      anchor: String(g0.anchor ?? sub.dataset.anchor ?? "centerCenter"),
+      align: String(g0.align ?? (sub.style.textAlign || "center"))
     };
-    sub.style.cursor = "grabbing";
+    // Preserve cursor-to-anchor offset to avoid the “jump” on drag start.
+    const px = (ev.clientX - box.left) / box.width;
+    const py = (ev.clientY - box.top) / box.height;
+    compositeGrabOff = { x: px - compositeStartGeom.x, y: py - compositeStartGeom.y };
+
+    if (handleEl?.dataset.handle) {
+      compositeActiveHandle = handleEl.dataset.handle;
+      compositeDragMode = compositeActiveHandle === "rot" ? "rotate" : "resize";
+      setBodyCursor(cursorForHandle(compositeActiveHandle));
+      if (compositeDragMode === "rotate") {
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        compositeStartAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+        compositeStartRotationDeg = compositeStartGeom.rotationDeg;
+      }
+    } else {
+      compositeDragMode = "move";
+      sub.style.cursor = "grabbing";
+    }
     (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+    // Prevent the normal selection/rotate handler from selecting the timer node while we're editing sub-elements.
+    (ev as any).stopImmediatePropagation?.();
     ev.preventDefault();
   });
 
   stage.addEventListener("pointermove", (ev) => {
-    if (!compositeDrag || !compositeEditTimerId) return;
+    if (!compositeEditTimerId || compositeDragMode === "none" || !compositeSelectedSubEl || !compositeStartGeom) return;
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
-    const sub = timerEl.querySelector<HTMLElement>(`.timer-sub[data-sub-id="${compositeDrag.subId}"]`);
-    if (!sub) return;
-    const dx = (ev.clientX - compositeDrag.startX) / compositeDrag.box.width;
-    const dy = (ev.clientY - compositeDrag.startY) / compositeDrag.box.height;
-    const nx = Math.max(0, Math.min(1, compositeDrag.startL + dx));
-    const ny = Math.max(0, Math.min(1, compositeDrag.startT + dy));
-    sub.style.left = `${nx * 100}%`;
-    sub.style.top = `${ny * 100}%`;
+    const sub = compositeSelectedSubEl;
+    const box = timerEl.getBoundingClientRect();
+    const layer = timerEl.querySelector<HTMLElement>(".timer-sub-layer");
+    const geoms: Record<string, any> = (layer as any)?.__textGeoms ?? {};
+    const sid = sub.dataset.subId ?? "";
+    const dx = (ev.clientX - compositeStart.x) / box.width;
+    const dy = (ev.clientY - compositeStart.y) / box.height;
+
+    if (compositeDragMode === "move") {
+      const px = (ev.clientX - box.left) / box.width;
+      const py = (ev.clientY - box.top) / box.height;
+      const nx = px - compositeGrabOff.x;
+      const ny = py - compositeGrabOff.y;
+      sub.style.left = `${nx * 100}%`;
+      sub.style.top = `${ny * 100}%`;
+      if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), x: nx, y: ny };
+      if (layer) (layer as any).__textGeoms = geoms;
+      return;
+    }
+
+    if (compositeDragMode === "rotate") {
+      const r = sub.getBoundingClientRect();
+      const cx = r.left + r.width / 2;
+      const cy = r.top + r.height / 2;
+      const a1 = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+      const ddeg = (a1 - compositeStartAngleRad) * (180 / Math.PI);
+      let rot = compositeStartRotationDeg + ddeg;
+      if (ev.shiftKey) rot = Math.round(rot / 15) * 15;
+      sub.style.rotate = `${rot}deg`;
+      if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), rotationDeg: rot };
+      if (layer) (layer as any).__textGeoms = geoms;
+      return;
+    }
+
+    if (compositeDragMode === "resize" && compositeActiveHandle) {
+      // Resize in normalized timer coords (ignoring rotation, like the main editor).
+      let rect = { x: compositeStartGeom.x, y: compositeStartGeom.y, w: compositeStartGeom.w, h: compositeStartGeom.h };
+      const min = 0.01;
+      const hnd = compositeActiveHandle;
+      const isCorner = hnd === "nw" || hnd === "ne" || hnd === "sw" || hnd === "se";
+
+      // Convert anchor-point rect -> top-left rect for resizing math
+      const tl = anchorToTopLeftWorld({ ...rect, anchor: compositeStartGeom.anchor } as any);
+      let tlr = { x: tl.x, y: tl.y, w: rect.w, h: rect.h };
+
+      if (isCorner) {
+        // Uniform scale for bottom corners (equal aspect ratio)
+        const sx = hnd.includes("w") ? -dx : dx;
+        const sy = hnd.includes("n") ? -dy : dy;
+        const w1 = Math.max(min, rect.w + sx);
+        const h1 = Math.max(min, rect.h + sy);
+        const s = Math.max(w1 / Math.max(1e-9, rect.w), h1 / Math.max(1e-9, rect.h));
+        tlr.w = Math.max(min, rect.w * s);
+        tlr.h = Math.max(min, rect.h * s);
+        if (hnd.includes("w")) tlr.x = tl.x + (rect.w - tlr.w);
+        if (hnd.includes("n")) tlr.y = tl.y + (rect.h - tlr.h);
+      } else {
+        // Free edge resize (aspect ratio can change)
+        if (hnd.includes("w")) {
+          tlr.x += dx;
+          tlr.w -= dx;
+        }
+        if (hnd.includes("e")) {
+          tlr.w += dx;
+        }
+        if (hnd.includes("n")) {
+          tlr.y += dy;
+          tlr.h -= dy;
+        }
+        if (hnd.includes("s")) {
+          tlr.h += dy;
+        }
+      }
+      tlr.w = Math.max(min, tlr.w);
+      tlr.h = Math.max(min, tlr.h);
+
+      // Back to anchor point
+      const ap = topLeftToAnchorWorld(tlr, compositeStartGeom.anchor);
+      rect = { x: ap.x, y: ap.y, w: tlr.w, h: tlr.h };
+
+      sub.style.left = `${rect.x * 100}%`;
+      sub.style.top = `${rect.y * 100}%`;
+      sub.style.width = `${rect.w * 100}%`;
+      sub.style.height = `${rect.h * 100}%`;
+      if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+      if (layer) (layer as any).__textGeoms = geoms;
+      return;
+    }
   });
 
   stage.addEventListener("pointerup", () => {
-    if (!compositeDrag) return;
-    const timerEl = compositeEditTimerId ? engine.getNodeElement(compositeEditTimerId) : null;
-    const sub = timerEl?.querySelector<HTMLElement>(`.timer-sub[data-sub-id="${compositeDrag.subId}"]`);
-    if (sub) sub.style.cursor = "grab";
-    compositeDrag = null;
+    if (!compositeEditTimerId) return;
+    const timerEl = engine.getNodeElement(compositeEditTimerId);
+    if (!timerEl) return;
+    if (compositeSelectedSubEl) compositeSelectedSubEl.style.cursor = "grab";
+
+    // Persist composite geometries from the in-memory model (no DOM-rect measuring -> no jitter / size drift).
+    const layer = timerEl.querySelector<HTMLElement>(".timer-sub-layer");
+    const geoms: any = (layer as any)?.__textGeoms ?? {};
+    void fetch(`${BACKEND}/api/timer/composite/save`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ compositeDir: compositeEditTimerId, geoms })
+    });
+    // Keep the in-memory layout in sync immediately (avoid snapping back until reload).
+    if (layer) (layer as any).__textGeoms = geoms;
+
+    compositeDragMode = "none";
+    compositeActiveHandle = null;
+    compositeStartGeom = null;
+    setBodyCursor("");
   });
 
   window.addEventListener("keydown", (ev) => {
@@ -1066,7 +1932,14 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const nodeEl = target.closest<HTMLElement>(".node");
 
     if (nodeEl?.dataset.nodeId) {
-      const id = nodeEl.dataset.nodeId;
+      const id = resolveSelectableId(nodeEl.dataset.nodeId);
+
+      // In composite edit mode, never allow selecting/rotating the composite timer itself.
+      if (compositeEditTimerId && id === compositeEditTimerId) {
+        nodeEl.querySelector(".handles")?.remove();
+        ev.preventDefault();
+        return;
+      }
 
       // Anchor-dot should be a single click action (no extra click needed).
       // Do this BEFORE selection toggling (which may recreate handles).
@@ -1123,7 +1996,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
       if (handleEl?.dataset.handle && selected.size === 1) {
         activeHandle = handleEl.dataset.handle;
-        dragMode = activeHandle === "rot" ? "rotate" : "resize";
+        dragMode = activeHandle === "rot" || activeHandle.startsWith("rot-") ? "rotate" : "resize";
+        setBodyCursor(cursorForHandle(activeHandle));
         if (dragMode === "rotate") {
           const r = nodeEl.getBoundingClientRect();
           const cx = r.left + r.width / 2;
@@ -1202,6 +2076,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const isCorner =
         activeHandle === "nw" || activeHandle === "ne" || activeHandle === "sw" || activeHandle === "se";
 
+      const curModel = engine.getModel();
+      const curNode: any = curModel?.nodes.find((n) => n.id === onlyId);
+      const isText = curNode?.type === "text";
+      // IMPORTANT: base font must come from the drag start snapshot to avoid inversion/jitter.
+      const startFontPx =
+        isText && startNode != null ? Number((startNode as any).fontPx ?? (t0.h ?? 40) * 0.6) : null;
+
       if (isCorner) {
         const sx = activeHandle.includes("w") ? -ddx : ddx;
         const sy = activeHandle.includes("n") ? -ddy : ddy;
@@ -1212,6 +2093,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         rect.h = Math.max(min, t0.h * s);
         if (activeHandle.includes("w")) rect.x = tl0.x + (t0.w - rect.w);
         if (activeHandle.includes("n")) rect.y = tl0.y + (t0.h - rect.h);
+
+        // Corner scaling should scale text font size along with the box.
+        if (isText) {
+          engine.updateNode(onlyId, { fontPx: Math.max(1, (startFontPx ?? 28) * s) } as any);
+        }
       } else {
         // Edge handles: free resize
         if (activeHandle.includes("e")) rect.w = Math.max(min, t0.w + ddx);
@@ -1224,15 +2110,26 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           rect.y = tl0.y + ddy;
           rect.h = Math.max(min, t0.h - ddy);
         }
+
+        // Edge resizing should NOT scale text font; initialize fontPx if missing so it stays stable.
+        if (isText && curNode?.fontPx == null) {
+          engine.updateNode(onlyId, { fontPx: Math.max(1, startFontPx ?? 28) } as any);
+        }
       }
       const anchored = topLeftToAnchorWorld(rect, t0.anchor);
-      engine.updateNode(onlyId, { transform: { ...t0, x: anchored.x, y: anchored.y, w: rect.w, h: rect.h } as any } as any);
+      engine.updateNode(
+        onlyId,
+        {
+          transform: { ...t0, x: anchored.x, y: anchored.y, w: rect.w, h: rect.h } as any
+        } as any
+      );
     }
   });
 
   stage.addEventListener("pointerup", async () => {
     dragMode = "none";
     activeHandle = null;
+    setBodyCursor("");
     startNodesById = null;
     await commit(startSnapshot);
     startSnapshot = null;
@@ -1271,6 +2168,9 @@ async function main() {
     const v = viewsInOrder[viewIdx];
     const prevView = viewsInOrder[prevIdx];
     if (!v) return;
+    // Expose current view to the editor layer (context menu uses this).
+    stage.dataset.viewId = v.id;
+    stage.dataset.viewIdx = String(viewIdx);
     if (camTweenTimer != null) window.clearTimeout(camTweenTimer);
     camTweenTimer = null;
 
@@ -1339,6 +2239,7 @@ async function main() {
 
   const applyMode = () => {
     localStorage.setItem("ip_mode", mode);
+    modeWrap.dataset.mode = mode;
     modeBtn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
     modeHint.textContent =
       mode === "live" ? "Live: left/right step, up/down view • editing disabled" : "Edit: drag/resize/rotate • double-click edit";
@@ -1349,10 +2250,8 @@ async function main() {
     if (mode === "edit") {
       engine.setPanZoomEnabled(true);
       engine.setAnimationsEnabled(false);
-      // In edit, show everything in current view immediately.
-      const v = viewsInOrder[viewIdx];
-      const show = new Set(v?.show ?? []);
-      for (const n of model.nodes) n.visible = show.has(n.id);
+      // In edit, show EVERYTHING (across all views) on the infinite surface.
+      for (const n of model.nodes) n.visible = true;
       engine.setModel(model);
       void hydrateQrImages(engine, model).then(() => hydrateTextMath(engine, model));
       ensureTimerPolling(engine, model, stage);
@@ -1363,6 +2262,8 @@ async function main() {
     // Live mode:
     engine.setPanZoomEnabled(false);
     engine.setAnimationsEnabled(true);
+    // Snap to the current view camera when switching into Live (no smooth transition).
+    setView(viewIdx, false);
 
     const allCues = (model as any).animationCues as Array<{ id: string; when: "enter" | "exit" }> | undefined;
     let showSet = new Set<string>();
@@ -1374,6 +2275,21 @@ async function main() {
       cues = (allCues ?? []).filter((c) => showSet.has(c.id));
     };
     rebuildForCurrentView();
+
+    // Debug (always-on but minimal): help diagnose missing join QR.
+    try {
+      const vcur = viewsInOrder[viewIdx];
+      const hasJoin = showSet.has("join_qr");
+      const hasCue = cues.some((c) => c.id === "join_qr" && c.when === "enter");
+      if (hasJoin && !hasCue) {
+        // eslint-disable-next-line no-console
+        console.warn("[ip] join_qr is in view but has no enter cue; it will not animate in", { view: vcur?.id });
+      }
+      if (!hasJoin) {
+        // eslint-disable-next-line no-console
+        console.warn("[ip] join_qr is not part of the current view; it will not appear here", { view: vcur?.id });
+      }
+    } catch {}
     let cueIdx = 0;
     const pendingHide = new Map<string, number>();
 
@@ -1429,20 +2345,36 @@ async function main() {
       }
     };
 
-    const applyBaseline = () => {
+    const applyBaseline = (preserveExisting: boolean) => {
       rebuildForCurrentView();
       // Baseline: anything WITHOUT an enter cue is visible immediately.
       const enterIds = new Set(cues.filter((c) => c.when === "enter").map((c) => c.id));
       // Safety: if a node has appear spec (from animations.csv) but cue list is missing for any reason,
       // still treat it as an "enter-controlled" node.
       const m = engine.getModel();
+      const visibleNow = new Set<string>();
+      for (const n of m?.nodes ?? []) if (n.visible !== false) visibleNow.add(n.id);
       for (const n of m?.nodes ?? []) {
         const ap: any = (n as any).appear;
         if (showSet.has(n.id) && ap && ap.kind && ap.kind !== "none") enterIds.add(n.id);
       }
 
+      // Live semantics:
+      // - Never hide previously shown nodes when navigating views unless an explicit EXIT cue hides them.
+      // - When preserveExisting=true (view change), only manage nodes in this view:
+      //   - non-enter nodes become visible
+      //   - enter nodes become hidden ONLY if not already visible (i.e. not shown before)
       for (const id of showSet) {
-        engine.updateNode(id, { visible: !enterIds.has(id) } as any);
+        const enterControlled = enterIds.has(id);
+        const alreadyVisible = visibleNow.has(id);
+        if (!enterControlled) {
+          engine.updateNode(id, { visible: true } as any);
+        } else if (!alreadyVisible) {
+          engine.updateNode(id, { visible: false } as any);
+        } else if (!preserveExisting) {
+          // At Live start, allow baseline to hide enter-controlled items (fresh run).
+          engine.updateNode(id, { visible: false } as any);
+        }
       }
       const m2 = engine.getModel();
       if (m2) void hydrateQrImages(engine, m2).then(() => hydrateTextMath(engine, m2));
@@ -1455,6 +2387,18 @@ async function main() {
       dlog("cue forward", cueIdx - 1, cue);
       if (cue.when === "enter") {
         showWithOptionalEnter(cue.id, true);
+        if (cue.id === "join_qr") {
+          const el = engine.getNodeElement("join_qr");
+          const img = el?.querySelector<HTMLImageElement>("img.image");
+          // eslint-disable-next-line no-console
+          console.log("[ip] join_qr enter", {
+            view: viewsInOrder[viewIdx]?.id,
+            visible: (engine.getModel() as any)?.nodes?.find((n: any) => n.id === "join_qr")?.visible,
+            src: img?.src,
+            complete: img?.complete,
+            natural: img ? [img.naturalWidth, img.naturalHeight] : null
+          });
+        }
       } else {
         hideWithOptionalExit(cue.id);
       }
@@ -1477,7 +2421,7 @@ async function main() {
 
     // Start at baseline; cues then drive changes.
     cueIdx = 0;
-    applyBaseline();
+    applyBaseline(false);
 
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
     const onMouseDown = (e: MouseEvent) => {
@@ -1500,12 +2444,12 @@ async function main() {
         setView(viewIdx + 1, true);
         // reset baseline+cue index for the new view
         cueIdx = 0;
-        applyBaseline();
+        applyBaseline(true);
       } else if (e.key === "ArrowUp") {
         dlog("nav up", { from: viewsInOrder[viewIdx]?.id, to: viewsInOrder[Math.max(0, viewIdx - 1)]?.id });
         setView(viewIdx - 1, true);
         cueIdx = 0;
-        applyBaseline();
+        applyBaseline(true);
       }
     };
 
@@ -1520,6 +2464,13 @@ async function main() {
   };
 
   modeBtn.addEventListener("click", () => {
+    // If we're editing a composite group, this button acts as "Exit group edit".
+    if ((window as any).__ip_exitCompositeEdit) {
+      try {
+        (window as any).__ip_exitCompositeEdit();
+      } catch {}
+      return;
+    }
     mode = mode === "edit" ? "live" : "edit";
     applyMode();
   });

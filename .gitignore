@@ -43,4 +43,8 @@ pnpm-debug.log*
 # QR is generated at runtime from the active tunnel URL.
 presentations/**/media/join_qr.png
 
+# ---- Runtime-generated composites (timer/groups) ----
+# These are generated on-demand from presentation.txt when missing.
+presentations/**/groups/**
+
 

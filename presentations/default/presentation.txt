@@ -10,4 +10,4 @@ view[name=view2,refView=home,loc=right]:
 text[name=v2_note]:
 Hur bra är vi på att estimera 30 sekunder tror ni?
 
-timer[name=timer1,showTime=1,barColor=orange,stat=gaussian,lineColor=green,min=20,max=40,binSize=0.5]
+timer[name=timer1,barColor=orange,binSize=1,lineColor=green,max=40,min=20,showTime=1,stat=gaussian]

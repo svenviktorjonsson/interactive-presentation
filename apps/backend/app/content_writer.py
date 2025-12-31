@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from pathlib import Path
 from typing import Any
 
@@ -10,13 +11,39 @@ def _safe_str(s: str) -> str:
     return s.replace('"', "'")
 
 
+def _fmt_param_value(v: Any) -> str:
+    """
+    Format a DSL parameter value.
+    - numbers/bools are emitted raw
+    - simple tokens are emitted raw
+    - everything else is quoted
+    """
+    if v is None:
+        return '""'
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, float)):
+        # Keep it compact
+        try:
+            fv = float(v)
+            if abs(fv - round(fv)) < 1e-12:
+                return str(int(round(fv)))
+            return f"{fv:g}"
+        except Exception:
+            return _safe_str(str(v))
+    s = str(v)
+    if re.match(r"^[a-zA-Z0-9_.\-]+$", s):
+        return _safe_str(s)
+    return f'"{_safe_str(s)}"'
+
+
 def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
     """
     geometries.csv v1 (view-relative):
     id,view,x,y,w,h,rotationDeg,anchor,align
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align"]
+    fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align", "fontH", "parent"]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -36,15 +63,30 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
 
         for n in nodes:
             t = n.get("transform") or {}
-            # Convert world pixels -> view-relative normalized coords.
-            # We use the "design viewport" height as 1.0 unit.
             design_h = float(defaults.get("designHeight", 1080.0) or 1080.0)
             view_id = node_to_view.get(str(n.get("id", "")), "home")
             cx, cy = view_center.get(view_id, (0.0, 0.0))
-            xn = (float(t.get("x", 0.0) or 0.0) - cx) / design_h
-            yn = (float(t.get("y", 0.0) or 0.0) - cy) / design_h
-            wn = float(t.get("w", 100.0) or 100.0) / design_h
-            hn = float(t.get("h", 50.0) or 50.0) / design_h
+            parent_id = str(n.get("parentId") or "").strip()
+            if parent_id:
+                # Parent-relative normalized by parent.h; store as-is.
+                xn = float(t.get("x", 0.0) or 0.0)
+                yn = float(t.get("y", 0.0) or 0.0)
+                wn = float(t.get("w", 0.1) or 0.1)
+                hn = float(t.get("h", 0.05) or 0.05)
+            else:
+                # Root node: convert world pixels -> view-relative normalized coords.
+                # We use the "design viewport" height as 1.0 unit.
+                xn = (float(t.get("x", 0.0) or 0.0) - cx) / design_h
+                yn = (float(t.get("y", 0.0) or 0.0) - cy) / design_h
+                wn = float(t.get("w", 100.0) or 100.0) / design_h
+                hn = float(t.get("h", 50.0) or 50.0) / design_h
+            font_px = n.get("fontPx", None)
+            font_h = ""
+            try:
+                if font_px is not None:
+                    font_h = float(font_px) / design_h
+            except Exception:
+                font_h = ""
             w.writerow(
                 {
                     "id": n.get("id", ""),
@@ -56,6 +98,8 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
                     "rotationDeg": t.get("rotationDeg", ""),
                     "anchor": t.get("anchor", "topLeft"),
                     "align": n.get("align", ""),
+                    "fontH": font_h,
+                    "parent": parent_id,
                 }
             )
 
@@ -197,6 +241,42 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                     lines.append(_safe_str(delim.join([str(c) for c in row])))
                 lines.append("")
                 continue
+
+            if t == "group":
+                lines.append(f"group[name={node_id}]")
+                continue
+
+            if t == "timer":
+                # Timer composite node. Persist its args so it can regenerate its composite folder.
+                params = [f"name={node_id}"]
+                # Prefer explicit args map (parsed from timer[...] in presentation.txt)
+                args = n.get("args") if isinstance(n.get("args"), dict) else {}
+                # Add canonical fields if present but missing from args.
+                # (Backend loader stores min/max/binSize as minS/maxS/binSizeS in seconds.)
+                if "showTime" not in args and "showTime" in n:
+                    args["showTime"] = 1 if bool(n.get("showTime")) else 0
+                if "barColor" not in args and n.get("barColor"):
+                    args["barColor"] = n.get("barColor")
+                if "lineColor" not in args and n.get("lineColor"):
+                    args["lineColor"] = n.get("lineColor")
+                if "stat" not in args and n.get("stat"):
+                    args["stat"] = n.get("stat")
+                if "min" not in args and isinstance(n.get("minS"), (int, float)):
+                    args["min"] = n.get("minS")
+                if "max" not in args and isinstance(n.get("maxS"), (int, float)):
+                    args["max"] = n.get("maxS")
+                if "binSize" not in args and isinstance(n.get("binSizeS"), (int, float)):
+                    args["binSize"] = n.get("binSizeS")
+
+                # Emit args (stable order, skip name)
+                for k in sorted([k for k in args.keys() if k != "name"]):
+                    params.append(f"{_safe_str(str(k))}={_fmt_param_value(args.get(k))}")
+                lines.append(f"timer[{','.join(params)}]")
+                continue
+
+            # If we reach here, we have a node type we don't know how to serialize yet.
+            # Fail loudly instead of silently dropping nodes from presentation.txt.
+            raise ValueError(f"write_presentation_txt: unsupported node type {t!r} (id={node_id!r})")
 
         lines.append("")  # spacer between views
 

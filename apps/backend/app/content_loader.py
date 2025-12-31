@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -37,12 +38,29 @@ def _load_defaults(pres_dir: Path) -> dict[str, Any]:
         return {"designWidth": 1920, "designHeight": 1080, "viewTransitionMs": 4000, "pixelateSteps": 20}
 
 
-def _ensure_timer_composite_defaults(pres_dir: Path) -> None:
+def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None:
     """
     If the user deletes the timer folder, we regenerate a default composite.
     (This is groundwork; runtime expansion/editing comes next.)
     """
-    timer_dir = pres_dir / "timer"
+    # composite_dir is folder name under presentations/<pres>/groups/ (e.g. "timer1", "timer_fast").
+    # Keep it safe.
+    if not re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_\-]{0,63}$", composite_dir):
+        raise ValueError(f"Invalid composite folder name: {composite_dir!r}")
+
+    groups_dir = pres_dir / "groups"
+    groups_dir.mkdir(parents=True, exist_ok=True)
+
+    # Auto-migrate legacy layout: presentations/<pres>/<name>/ -> presentations/<pres>/groups/<name>/
+    legacy_dir = pres_dir / composite_dir
+    timer_dir = groups_dir / composite_dir
+    if legacy_dir.exists() and not timer_dir.exists():
+        try:
+            shutil.move(str(legacy_dir), str(timer_dir))
+        except Exception:
+            # If move fails, fall back to using the new dir and regenerate defaults.
+            pass
+
     timer_dir.mkdir(parents=True, exist_ok=True)
 
     # Regenerate defaults if folder (or any required file) is missing.
@@ -54,22 +72,32 @@ def _ensure_timer_composite_defaults(pres_dir: Path) -> None:
 
     elements_path.write_text(
         "# timer composite elements (draft)\n"
-        "# Delete the whole `timer/` folder to regenerate defaults.\n"
+        "# Delete the whole `groups/<name>/` folder to regenerate defaults.\n"
         "# Args passed to timer[...] can be used as {arg} placeholders here.\n"
         "\n"
         "# Default labels (editable in composite mode):\n"
         "text[name=x_label]: Time (s)\n"
         "text[name=y_label]: Procentage (%)\n"
         "\n"
+        "# Stats label (auto-updated via {{...}} binding, editable/positionable):\n"
+        # Use KaTeX commands (\mu/\sigma) instead of unicode glyphs. Placeholders use {{...}}.
+        "text[name=stats]: $\\mu={{mean}}\\,\\mathrm{s}\\quad \\sigma={{sigma}}\\,\\mathrm{s}\\quad \\mathrm{count}={{count}}$\n"
+        "\n"
         "# Default arrows (editable in composite mode):\n"
-        "arrow[name=x_axis,from=(0.08,0.90),to=(0.92,0.90),color=white]\n"
-        "arrow[name=y_axis,from=(0.08,0.90),to=(0.08,0.10),color=white]\n",
+        # Extend axes slightly beyond the data rect (5%) and make them thinner by default.
+        # NOTE: The renderer treats these as "data-rect coords" mapped to the plot region.
+        # Origin is bottom-left of the data rect.
+        "arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]\n"
+        "arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]\n",
         encoding="utf-8",
     )
     geometries_path.write_text(
         "id,view,x,y,w,h,rotationDeg,anchor,align\n"
-        "x_label,timer,0.50,0.98,0.80,0.10,0,topCenter,center\n"
-        "y_label,timer,0.02,0.50,0.10,0.80,0,centerLeft,left\n"
+        # Labels are allowed outside 0..1 (composite supports it). Keep them small.
+        "x_label,timer,0.50,1.06,0.50,0.08,0,topCenter,center\n"
+        # Match the current timer1 layout used in the presentation.
+        "y_label,timer,-0.15627517456611062,0.05482153612994739,0.40,0.08,-90,centerRight,center\n"
+        "stats,timer,0.5028738858079436,0.055646919385237144,0.70,0.08,0,topCenter,center\n"
         "x_axis,timer,0,0,1,1,0,topLeft,\n"
         "y_axis,timer,0,0,1,1,0,topLeft,\n",
         encoding="utf-8",
@@ -386,6 +414,11 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
 
         if kw == "timer":
             # Interactive timer / histogram node (rendered by the frontend; data via backend APIs).
+            # Ensure the composite defaults exist only if a timer is actually used in the presentation.
+            try:
+                _ensure_timer_composite_defaults(path.parent, name)
+            except Exception:
+                pass
             show_time = (params.get("showTime") or "0").strip()
             bar_color = (params.get("barColor") or "orange").strip()
             line_color = (params.get("lineColor") or "green").strip()
@@ -423,7 +456,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "minS": min_s,
                 "maxS": max_s,
                 "binSizeS": bin_s,
-                "compositeDir": "timer",
+                "compositeDir": name,
                 # Preserve raw args for templating
                 "args": {k: v for k, v in params.items() if k != "name"},
             }
@@ -431,7 +464,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             # Expand composite template text (for the next "composite expansion" step).
             try:
                 pres_dir = path.parent
-                timer_dir = pres_dir / "timer"
+                timer_dir = pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name)
                 tpl_path = timer_dir / "elements.txt"
                 if tpl_path.exists():
                     tpl = tpl_path.read_text(encoding="utf-8")
@@ -449,6 +482,34 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                         }
                     )
                     nodes_by_id[name]["elementsText"] = _expand_placeholders(tpl, args_for_tpl)
+            except Exception:
+                pass
+
+            # Load composite-local geometries for editable sub-elements.
+            try:
+                pres_dir = path.parent
+                g_path = (pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name) / "geometries.csv")
+                if g_path.exists():
+                    geoms: dict[str, Any] = {}
+                    with g_path.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            sid = (row.get("id") or "").strip()
+                            if not sid or sid.startswith("#"):
+                                continue
+                            try:
+                                geoms[sid] = {
+                                    "x": float((row.get("x") or "0").strip() or 0),
+                                    "y": float((row.get("y") or "0").strip() or 0),
+                                    "w": float((row.get("w") or "0.2").strip() or 0.2),
+                                    "h": float((row.get("h") or "0.1").strip() or 0.1),
+                                    "rotationDeg": float((row.get("rotationDeg") or "0").strip() or 0),
+                                    "anchor": (row.get("anchor") or "topLeft").strip() or "topLeft",
+                                    "align": (row.get("align") or "").strip(),
+                                }
+                            except Exception:
+                                continue
+                    nodes_by_id[name]["compositeGeometries"] = geoms
             except Exception:
                 pass
 
@@ -488,6 +549,12 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             current_view["show"].append(name)
             continue
 
+        if kw == "group":
+            # Pure grouping node. Geometry and parent/children are handled by geometries.csv (parentId).
+            nodes_by_id[name] = {"id": name, "type": "group", "space": "world"}
+            current_view["show"].append(name)
+            continue
+
         raise ValueError(f"Unknown keyword: {kw}")
 
     if not views:
@@ -512,8 +579,11 @@ def _parse_geometries_csv(
     design_h: float,
 ) -> dict[str, dict[str, Any]]:
     """
-    geometries.csv v1 columns (view-relative):
-    id,view,x,y,w,h,rotationDeg,anchor,align
+    geometries.csv v2 columns:
+    - Root nodes (no parent): view-relative
+      id,view,x,y,w,h,rotationDeg,anchor,align,fontH,parent
+    - Child nodes (parent set): parent-relative normalized by parent.h
+      (x/y/w/h are stored as-is; conversion to world is done client-side via parent transform)
 
     Semantics:
     - x/y are in "view-height units" relative to the view center:
@@ -537,26 +607,36 @@ def _parse_geometries_csv(
                 continue
 
             view_id = (row.get("view") or "").strip() or node_view_hint.get(node_id) or "home"
+            parent_id = (row.get("parent") or "").strip()
             view = views_by_id.get(view_id) or views_by_id.get("home") or {"camera": {"cx": 0.0, "cy": 0.0, "zoom": 1.0}}
             cam = view.get("camera") or {"cx": 0.0, "cy": 0.0, "zoom": 1.0}
             vcx = float(cam.get("cx", 0.0) or 0.0)
             vcy = float(cam.get("cy", 0.0) or 0.0)
 
-            # Convert view-relative -> world pixels (design pixel world).
             xn = num("x", 0.0, row)
             yn = num("y", 0.0, row)
             wn = num("w", 0.2, row)
             hn = num("h", 0.1, row)
-            xw = vcx + xn * design_h
-            yw = vcy + yn * design_h
-            ww = wn * design_h
-            hw = hn * design_h
+            font_h = num("fontH", -1.0, row)
+            if parent_id:
+                # Parent-relative: store as-is (normalized units).
+                xw, yw, ww, hw = xn, yn, wn, hn
+            else:
+                # Convert view-relative -> world pixels (design pixel world).
+                xw = vcx + xn * design_h
+                yw = vcy + yn * design_h
+                ww = wn * design_h
+                hw = hn * design_h
 
             g: dict[str, Any] = {
                 "space": "world",
                 "view": view_id,
                 "transform": {"x": xw, "y": yw, "w": ww, "h": hw},
             }
+            if parent_id:
+                g["parentId"] = parent_id
+            if font_h >= 0:
+                g["fontPx"] = float(font_h) * design_h
 
             rot = (row.get("rotationDeg") or "").strip()
             if rot:
@@ -641,7 +721,6 @@ def _parse_animations_csv(path: Path) -> tuple[dict[str, dict[str, Any]], list[d
 def load_presentation(presentation_dir: Path | None = None) -> Presentation:
     root = _repo_root()
     pres_dir = presentation_dir or (root / "presentations" / "default")
-    _ensure_timer_composite_defaults(pres_dir)
     defaults = _load_defaults(pres_dir)
     meta = _parse_presentation_txt(pres_dir / "presentation.txt", design_w=float(defaults["designWidth"]), design_h=float(defaults["designHeight"]))
     geometries_path = pres_dir / "geometries.csv"
@@ -672,8 +751,12 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
         if g:
             node["space"] = g.get("space", node.get("space", "world"))
             node["transform"] = g.get("transform", node.get("transform"))
+            if "parentId" in g:
+                node["parentId"] = g.get("parentId")
             if "align" in g:
                 node["align"] = g.get("align")
+            if "fontPx" in g:
+                node["fontPx"] = g.get("fontPx")
         else:
             # Sensible defaults if geometry is missing
             if node["type"] == "text":
