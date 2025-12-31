@@ -257,10 +257,11 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     // Buttons should live outside the timer "data rect" overlay. Place them above.
     header.style.left = "0";
     header.style.right = "0";
-    header.style.top = "-44px";
-    header.style.padding = "0 10px";
+    // Scale header offsets with the timer's pixel size (set via --timer-scale).
+    header.style.top = "calc(-44px * var(--timer-scale, 1))";
+    header.style.padding = "0 calc(10px * var(--timer-scale, 1))";
     header.style.display = "flex";
-    header.style.gap = "10px";
+    header.style.gap = "calc(10px * var(--timer-scale, 1))";
     header.style.alignItems = "center";
     header.style.pointerEvents = "auto";
 
@@ -276,7 +277,13 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     resetBtn.textContent = "Reset";
     resetBtn.dataset.action = "timer-reset";
 
-    header.append(startBtn, resetBtn);
+    const testBtn = document.createElement("button");
+    testBtn.className = "timer-btn";
+    testBtn.type = "button";
+    testBtn.textContent = "Test";
+    testBtn.dataset.action = "timer-test";
+
+    header.append(startBtn, resetBtn, testBtn);
 
     const canvas = document.createElement("canvas");
     canvas.className = "timer-canvas";
@@ -490,6 +497,23 @@ export function layoutDomNodes(args: {
     // Logical visibility: if false, always hide (independent of culling).
     if (node.visible === false) {
       handle.el.style.display = "none";
+      // IMPORTANT: still track visibility edges even when hidden, otherwise enter animations
+      // may fail to reset state when a node is shown again.
+      handle.el.dataset.prevVisible = "0";
+      // Reset pixelate internal state + ensure inner media isn't left fully transparent.
+      delete (handle.el.dataset as any).animInStartMs;
+      delete (handle.el.dataset as any).pixAnimStartMs;
+      delete (handle.el.dataset as any).pixAnimDone;
+      delete (handle.el.dataset as any).pixPending;
+      const canvas = handle.el.querySelector<HTMLCanvasElement>("canvas.qr-canvas, canvas.image-canvas");
+      const img = handle.el.querySelector<HTMLImageElement>("img.qr-img, img.image");
+      if (canvas) {
+        canvas.style.display = "none";
+        canvas.style.opacity = "0";
+      }
+      if (img) {
+        img.style.opacity = "1";
+      }
       handle.update(node);
       continue;
     }
@@ -509,6 +533,21 @@ export function layoutDomNodes(args: {
       px = { x: nodeLayout.transform.x, y: nodeLayout.transform.y, w: nodeLayout.transform.w, h: nodeLayout.transform.h };
     }
 
+    if (node.id === "join_qr") {
+      const prev = handle.el.dataset.joinQrDbgPx;
+      const cur = `${Math.round(px.x)},${Math.round(px.y)},${Math.round(px.w)},${Math.round(px.h)}`;
+      if (prev !== cur) {
+        handle.el.dataset.joinQrDbgPx = cur;
+        // eslint-disable-next-line no-console
+        console.log("[ip] join_qr layout", {
+          px: { x: Math.round(px.x), y: Math.round(px.y), w: Math.round(px.w), h: Math.round(px.h) },
+          cam: { cx: Math.round(camera.cx), cy: Math.round(camera.cy), zoom: Number(camera.zoom.toFixed(3)) },
+          screen,
+          connected: handle.el.isConnected
+        });
+      }
+    }
+
     // Cull if < 1 px on either dimension.
     if (px.w < 1 || px.h < 1) {
       handle.el.style.display = "none";
@@ -525,7 +564,26 @@ export function layoutDomNodes(args: {
       px.y > screen.h + marginPx;
     if (off) {
       handle.el.style.display = "none";
+      if (node.id === "join_qr" && handle.el.dataset.joinQrDbgOff !== "1") {
+        handle.el.dataset.joinQrDbgOff = "1";
+        // eslint-disable-next-line no-console
+        console.log("[ip] join_qr culled (offscreen)", { px, screen });
+      }
       continue;
+    }
+    if (node.id === "join_qr" && handle.el.dataset.joinQrDbgOff === "1") {
+      handle.el.dataset.joinQrDbgOff = "0";
+      // eslint-disable-next-line no-console
+      console.log("[ip] join_qr back onscreen");
+    }
+
+    // Expose timer pixel size and scale for composite children/layout.
+    if (nodeLayout.type === "timer") {
+      const baseH = Math.max(1e-6, Number(nodeLayout.transform.h ?? 1));
+      const uiScale = px.h / baseH;
+      handle.el.style.setProperty("--timer-scale", String(uiScale));
+      handle.el.dataset.timerWpx = String(px.w);
+      handle.el.dataset.timerHpx = String(px.h);
     }
 
     if (!handle.el.isConnected) overlayEl.appendChild(handle.el);
@@ -537,7 +595,9 @@ export function layoutDomNodes(args: {
     // - `fontPx` (world/design px) is the persisted base size.
     // - camera zoom scales it into screen pixels.
     if (nodeLayout.type === "text") {
-      const z = nodeLayout.space === "world" ? camera.zoom : 1;
+      // Use px.h/localH to get effective zoom for world nodes; keeps text stable in groups.
+      const localH = Math.max(1e-9, Number(nodeLayout.transform.h ?? 0) || 0);
+      const z = nodeLayout.space === "world" ? px.h / localH : 1;
       const baseFontPx = Math.max(1, Number((nodeLayout as any).fontPx ?? (nodeLayout.transform.h ?? 40) * 0.6));
       handle.el.style.fontSize = `${Math.max(1, baseFontPx * z)}px`;
     }
@@ -569,7 +629,7 @@ export function layoutDomNodes(args: {
         const t = dur > 0 ? (timeMs - (exitStart + delay)) / dur : 1;
         const p = Math.max(0, Math.min(1, t));
 
-        if (disappear.kind === "direct") {
+        if (disappear.kind === "sudden") {
           // No visual effect; controller will hide immediately.
         } else if (disappear.kind === "fade") {
           const from = String(disappear.from ?? "all");
@@ -632,7 +692,7 @@ export function layoutDomNodes(args: {
       const delay = Number(appear.delayMs ?? 0);
       if (appear.kind === "pixelate" && dur <= 0) dur = 800;
       if (appear.kind === "fade" && dur <= 0) dur = 800;
-      if (appear.kind === "direct") {
+      if (appear.kind === "sudden") {
         handle.el.style.opacity = "1";
         (handle.el.style as any).maskImage = "";
         (handle.el.style as any).webkitMaskImage = "";
@@ -726,6 +786,25 @@ export function layoutDomNodes(args: {
           const stepP = stepIdx / steps;
 
           setPixelate(handle.el, px.w, px.h, stepP, steps);
+          // Minimal always-on diagnostics for join_qr (helps when it "never appears").
+          if (node.id === "join_qr") {
+            const last = Number(handle.el.dataset.pixDbgStep ?? "-1");
+            if (last !== stepIdx) {
+              handle.el.dataset.pixDbgStep = String(stepIdx);
+              const c = handle.el.querySelector<HTMLCanvasElement>("canvas.image-canvas");
+              const i = handle.el.querySelector<HTMLImageElement>("img.image");
+              // eslint-disable-next-line no-console
+              console.log("[ip] join_qr pixelate", {
+                stepIdx,
+                steps,
+                stepP: Number(stepP.toFixed(3)),
+                ready,
+                canvasDisp: c ? getComputedStyle(c).display : null,
+                canvasOp: c ? getComputedStyle(c).opacity : null,
+                imgOp: i ? getComputedStyle(i).opacity : null
+              });
+            }
+          }
           if (stepIdx >= steps) {
             delete (handle.el.dataset as any).pixAnimStartMs;
             handle.el.dataset.pixAnimDone = "1";

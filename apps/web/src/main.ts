@@ -55,6 +55,20 @@ async function fetchModel(): Promise<PresentationModel> {
   return (await res.json()) as PresentationModel;
 }
 
+function preloadImageAssets(model: PresentationModel) {
+  // Ensure critical images (e.g. join_qr) are actually loaded before enter animations fire.
+  // Browsers may otherwise defer loading depending on heuristics.
+  for (const n of model.nodes) {
+    if ((n as any).type !== "image") continue;
+    const src = String((n as any).src ?? "");
+    if (!src) continue;
+    const img = new Image();
+    img.decoding = "async";
+    img.loading = "eager";
+    img.src = src;
+  }
+}
+
 async function saveModel(model: PresentationModel) {
   const res = await fetch(`${BACKEND}/api/save`, {
     method: "POST",
@@ -102,6 +116,65 @@ async function fetchTimerState(): Promise<TimerState | null> {
   }
 }
 
+function _randn01() {
+  // Box–Muller transform
+  let u = 0;
+  let v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+}
+
+async function simulateTimerSubmissions(timerEl: HTMLElement, opts?: { users?: number; durationMs?: number }) {
+  const users = Math.max(1, Math.floor(opts?.users ?? 30));
+  const totalMs = Math.max(250, Math.floor(opts?.durationMs ?? 5000));
+
+  // Derive a sensible distribution from the configured domain.
+  const minS = Number(timerEl.dataset.minS ?? "0");
+  const maxS = Number(timerEl.dataset.maxS ?? "40");
+  const span = Math.max(1e-6, maxS - minS);
+  const muS = (minS + maxS) / 2;
+  const sigmaS = span / 6; // ~99.7% within domain
+
+  // Reset + start accepting so we exercise the exact same backend path as real phones.
+  await fetch(`${BACKEND}/api/timer/reset`, { method: "POST" });
+  await fetch(`${BACKEND}/api/timer/start`, { method: "POST" });
+
+  const startedAt = performance.now();
+  const promises: Promise<void>[] = [];
+  for (let i = 0; i < users; i++) {
+    const delay = (i / Math.max(1, users - 1)) * totalMs;
+    const p = new Promise<void>((resolve) => {
+      window.setTimeout(async () => {
+        // Sample, clamp into domain.
+        let s = muS + sigmaS * _randn01();
+        if (!Number.isFinite(s)) s = muS;
+        s = Math.max(minS, Math.min(maxS, s));
+        const ms = s * 1000;
+        try {
+          await fetch(`${BACKEND}/api/timer/submit`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ durationMs: ms }),
+          });
+        } finally {
+          resolve();
+        }
+      }, delay);
+    });
+    promises.push(p);
+  }
+
+  await Promise.all(promises);
+  await fetch(`${BACKEND}/api/timer/stop`, { method: "POST" });
+
+  // Refresh local state once at the end (poll will also pick it up).
+  __timerState = await fetchTimerState();
+
+  // eslint-disable-next-line no-console
+  console.log("[ip] timer simulated", { users, totalMs, tookMs: Math.round(performance.now() - startedAt) });
+}
+
 function drawTimerNode(el: HTMLElement, state: TimerState) {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas.timer-canvas");
   if (!canvas) return;
@@ -139,6 +212,7 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   const n = samples.length;
   const barColor = el.dataset.barColor ?? "orange";
   const lineColor = el.dataset.lineColor ?? "green";
+  const lineWidthPx = Math.max(0.5, Number(el.dataset.lineWidth ?? "2"));
 
   // Domain and binning (seconds)
   const minS = Number(el.dataset.minS ?? "0");
@@ -156,10 +230,15 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   const perc = counts.map((c) => (n > 0 ? c / n : 0));
 
   // Bars
+  // Normalize y so the view shows up to 1.1× the highest bar.
+  const maxBar = Math.max(0, ...perc);
+  const yMax = Math.max(1e-9, maxBar * 1.1);
+  const yScale = yLen / yMax; // (fraction units) -> canvas pixels
+
   ctx.fillStyle = barColor;
   const bw = xLen / bins;
   for (let i = 0; i < bins; i++) {
-    const h = perc[i] * yLen;
+    const h = perc[i] * yScale;
     ctx.globalAlpha = 0.85;
     ctx.fillRect(ox + i * bw + bw * 0.08, oy - h, bw * 0.84, h);
   }
@@ -167,14 +246,16 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
 
   // Ticks + tick labels (KaTeX font) — drawn on the canvas layer.
   ctx.save();
-  // +50% vs the previous 18px baseline
-  ctx.font = `${Math.max(14, Math.round(27 * dpr))}px KaTeX_Main, Times New Roman, serif`;
+  // Scale tick labels with timer height for smooth zoom.
+  const fontCssPx = Math.max(12, Math.min(64, r.height * 0.028));
+  const fontPx = Math.round(fontCssPx * dpr);
+  ctx.font = `${fontPx}px KaTeX_Main, Times New Roman, serif`;
   ctx.fillStyle = "rgba(255,255,255,0.80)";
   ctx.strokeStyle = "rgba(255,255,255,0.32)";
-  ctx.lineWidth = 2.0 * dpr;
+  ctx.lineWidth = lineWidthPx * dpr;
 
   // X ticks at bin edges from min..max using binSize
-  const tickLen = 20 * dpr;
+  const tickLen = Math.max(10 * dpr, Math.round(fontCssPx * 0.7 * dpr));
   const fmt = (v: number) => {
     // Avoid noisy decimals but keep bin edges like 20.5.
     const s = Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(2);
@@ -195,11 +276,22 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
     ctx.fillText(fmt(v), x, oy + tickLen + 8 * dpr);
   }
 
-  // Y ticks: 0,10,20,...,100 (%)
+  // Y ticks: adapt to the visible range (up to yMax).
+  // Keep it simple: choose a "nice" step in percent.
+  const niceStepPct = (maxPct: number) => {
+    const target = Math.max(1, maxPct / 6);
+    const candidates = [1, 2, 5, 10, 20, 25, 50, 100];
+    for (const c of candidates) if (c >= target) return c;
+    return 100;
+  };
+  const maxPct = Math.max(1, yMax * 100);
+  const stepPct = niceStepPct(maxPct);
+
   ctx.textAlign = "right";
   ctx.textBaseline = "middle";
-  for (let p = 0; p <= 100; p += 10) {
-    const y = oy - (p / 100) * yLen;
+  for (let p = 0; p <= maxPct + 1e-9; p += stepPct) {
+    const frac = p / 100;
+    const y = oy - frac * yScale;
     ctx.beginPath();
     ctx.moveTo(ox, y);
     ctx.lineTo(ox - tickLen, y);
@@ -209,20 +301,22 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   ctx.restore();
 
   // Gaussian overlay normalized 0..1
+  // Draw in the SAME units as the bars: expected probability mass per bin.
+  // This makes the curve pass through bar centers when the histogram matches the distribution.
   const mu = (state.stats.meanMs ?? 0) / 1000;
-  const sigma = Math.max(1e-6, (state.stats.sigmaMs ?? 0) / 1000);
-  if (n >= 2 && sigma > 0) {
-    const gauss = (x: number) => Math.exp(-0.5 * ((x - mu) / sigma) ** 2);
-    // normalize to 1
-    const gmax = gauss(mu);
+  const sigma = Math.max(1e-9, (state.stats.sigmaMs ?? 0) / 1000);
+  if (n >= 2 && Number.isFinite(mu) && Number.isFinite(sigma) && sigma > 0) {
+    const inv = 1 / (sigma * Math.sqrt(2 * Math.PI));
+    const pdf = (x: number) => inv * Math.exp(-0.5 * ((x - mu) / sigma) ** 2);
     ctx.strokeStyle = lineColor;
-    ctx.lineWidth = 2 * dpr;
+    ctx.lineWidth = lineWidthPx * dpr;
     ctx.beginPath();
     for (let i = 0; i <= 200; i++) {
       const x = minS + (i / 200) * span;
-      const y = gauss(x) / gmax; // 0..1
+      // Approximate expected mass in a bin of width binSizeS at position x.
+      const y = pdf(x) * binSizeS; // fraction (0..1-ish), comparable to bar heights
       const sx = ox + ((x - minS) / span) * xLen;
-      const sy = oy - y * yLen;
+      const sy = oy - y * yScale;
       if (i === 0) ctx.moveTo(sx, sy);
       else ctx.lineTo(sx, sy);
     }
@@ -245,6 +339,7 @@ function attachTimerNodeHandlers(stage: HTMLElement) {
     if (!btn) return;
     const action = btn.dataset.action;
     if (!action) return;
+    const timerEl = btn.closest<HTMLElement>(".node-timer") ?? undefined;
     if (action === "timer-startstop") {
       // toggle using last known state
       const accepting = !!__timerState?.accepting;
@@ -256,6 +351,17 @@ function attachTimerNodeHandlers(stage: HTMLElement) {
     if (action === "timer-reset") {
       await fetch(`${BACKEND}/api/timer/reset`, { method: "POST" });
       __timerState = await fetchTimerState();
+      ev.preventDefault();
+      return;
+    }
+    if (action === "timer-test") {
+      if (!timerEl) return;
+      btn.disabled = true;
+      try {
+        await simulateTimerSubmissions(timerEl, { users: 30, durationMs: 5000 });
+      } finally {
+        btn.disabled = false;
+      }
       ev.preventDefault();
       return;
     }
@@ -390,6 +496,13 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
 function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
   const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
   const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .timer-sub-text"));
+  // Prefer engine-provided pixel size to avoid reflow jitter; fall back to DOM rect.
+  const hPx = Number(timerEl.dataset.timerHpx ?? "0");
+  const wPx = Number(timerEl.dataset.timerWpx ?? "0");
+  const timerBox =
+    hPx > 0 && wPx > 0
+      ? { width: wPx, height: hPx }
+      : timerEl.getBoundingClientRect();
   for (const t of els) {
     const sid = t.dataset.subId ?? "";
     const g = geoms[sid] ?? {};
@@ -407,16 +520,41 @@ function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, dat
     t.style.rotate = `${Number(g.rotationDeg ?? 0)}deg`;
     t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
 
-    // Font size scales with the element height on screen.
-    const fontPx = Math.max(16, Math.round(timerEl.offsetHeight * h * 0.85));
+    // Font size scales with the element height on screen (use fractional rect height to avoid jitter).
+    const fontPx = Math.max(16, timerBox.height * h * 0.85);
     t.style.fontSize = `${fontPx}px`;
+    t.style.lineHeight = `${fontPx}px`;
 
     const tpl = t.dataset.template ?? "";
     const resolved = applyDataBindings(tpl, data);
-    t.dataset.rawText = resolved;
-    // Render KaTeX inline/display same as normal text nodes.
-    const contentEl = t.querySelector<HTMLElement>(":scope .timer-sub-content");
-    if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+    const prev = t.dataset.rawText ?? "";
+    if (prev !== resolved) {
+      t.dataset.rawText = resolved;
+      // Render KaTeX inline/display same as normal text nodes.
+      const contentEl = t.querySelector<HTMLElement>(":scope .timer-sub-content");
+      if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+    }
+  }
+}
+
+function layoutTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement) {
+  // Layout-only: keep composite text scaling smooth during pan/zoom without re-rendering content.
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .timer-sub-text"));
+  const hPx = Number(timerEl.dataset.timerHpx ?? "0");
+  const wPx = Number(timerEl.dataset.timerWpx ?? "0");
+  const timerBox =
+    hPx > 0 && wPx > 0
+      ? { width: wPx, height: hPx }
+      : timerEl.getBoundingClientRect();
+  for (const t of els) {
+    const sid = t.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const h = Number(g.h ?? 0.1);
+    // Keep font sizing in sync with on-screen timer rect continuously (fractional px, no rounding).
+    const fontPx = Math.max(16, timerBox.height * h * 0.85);
+    t.style.fontSize = `${fontPx}px`;
+    t.style.lineHeight = `${fontPx}px`;
   }
 }
 
@@ -429,9 +567,41 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
     return;
   }
 
-  // Use offsetWidth/offsetHeight so rotation (CSS transform) does NOT change the arrow scaling/length.
-  const w = Math.max(1, timerEl.offsetWidth);
-  const h = Math.max(1, timerEl.offsetHeight);
+  // Prefer cached timer size from engine; if unavailable or absurd, skip this frame.
+  const cachedW = Number(timerEl.dataset.timerWpx ?? "0");
+  const cachedH = Number(timerEl.dataset.timerHpx ?? "0");
+  if (!(cachedW > 1 && cachedH > 1)) return;
+
+  const doc = timerEl.ownerDocument?.documentElement;
+  const scrW = Math.max(1, doc?.clientWidth ?? window.innerWidth ?? cachedW);
+  const scrH = Math.max(1, doc?.clientHeight ?? window.innerHeight ?? cachedH);
+
+  // If reported size is larger than the viewport by a lot, wait for a sane frame.
+  if (cachedW > scrW * 1.2 || cachedH > scrH * 1.2) return;
+
+  let w = Math.max(1, cachedW);
+  let h = Math.max(1, cachedH);
+
+  const prevW = Number(layer.dataset.stableW || "0");
+  const prevH = Number(layer.dataset.stableH || "0");
+
+  if (prevW > 0 && prevH > 0) {
+    const jump = Math.max(w / prevW, prevW / w, h / prevH, prevH / h);
+    if (!Number.isFinite(jump) || jump > 1.2) {
+      w = prevW;
+      h = prevH;
+    }
+  }
+
+  const MAX_DIM = 4096;
+  if (w > MAX_DIM || h > MAX_DIM) {
+    const scale = MAX_DIM / Math.max(w, h);
+    w = Math.max(1, Math.round(w * scale));
+    h = Math.max(1, Math.round(h * scale));
+  }
+  layer.dataset.stableW = String(w);
+  layer.dataset.stableH = String(h);
+
   svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
 
   const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
@@ -452,9 +622,12 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
   const mapX = (u: number) => ox + u * xLen;
   const mapY = (vUp: number) => oy - vUp * yLen;
 
+  const dataMin = Math.max(1, Math.min(xLen, yLen));
+
   for (const a of specs) {
     const relW = typeof a.width === "number" && isFinite(a.width) ? a.width : 0.006;
-    const lwPx = Math.max(1, Math.min(18, relW * Math.min(w, h)));
+    // Scale with data rect to keep proportions; clamp to avoid extremes.
+    const lwPx = Math.max(0.5, Math.min(16, relW * dataMin));
     const headWPx = 3 * lwPx;
     const headLPx = 5 * lwPx;
 
@@ -500,6 +673,52 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
   if (__timerPollStarted) return;
   __timerPollStarted = true;
   attachTimerNodeHandlers(stage);
+
+  // Keep timer composite text sizing smooth while panning/zooming.
+  // Polling updates content; this RAF loop updates only layout (font sizing) every frame.
+  let __timerCompositeRafStarted = false;
+  const startCompositeLayoutRaf = () => {
+    if (__timerCompositeRafStarted) return;
+    __timerCompositeRafStarted = true;
+    const rafTick = () => {
+      const cur = engine.getModel();
+      if (cur) {
+        for (const n of cur.nodes) {
+          if (n.type !== "timer") continue;
+          const el = engine.getNodeElement(n.id);
+          if (!el) continue;
+          const layer = el.querySelector<HTMLElement>(":scope .timer-frame .timer-sub-layer");
+          if (layer) layoutTimerCompositeTexts(el, layer);
+        }
+      }
+      window.requestAnimationFrame(rafTick);
+    };
+    window.requestAnimationFrame(rafTick);
+  };
+  startCompositeLayoutRaf();
+
+  // Keep canvas-based ticks/buttons in sync every frame using cached timer size.
+  let __timerDrawRafStarted = false;
+  const startTimerDrawRaf = () => {
+    if (__timerDrawRafStarted) return;
+    __timerDrawRafStarted = true;
+    const rafDraw = () => {
+      const st = __timerState;
+      if (st) {
+        const cur = engine.getModel();
+        if (cur) {
+          for (const n of cur.nodes) {
+            if (n.type !== "timer") continue;
+            const el = engine.getNodeElement(n.id);
+            if (el) drawTimerNode(el, st);
+          }
+        }
+      }
+      window.requestAnimationFrame(rafDraw);
+    };
+    window.requestAnimationFrame(rafDraw);
+  };
+  startTimerDrawRaf();
 
   const tick = async () => {
     const st = await fetchTimerState();
@@ -1321,7 +1540,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           const a = (state[key] ??= { kind: "none" });
 
           const typeS = document.createElement("select");
-          for (const k of ["none", "direct", "fade", "pixelate", "appear"]) {
+          for (const k of ["none", "sudden", "fade", "pixelate", "appear"]) {
             const o = document.createElement("option");
             o.value = k;
             o.textContent = k;
@@ -1331,7 +1550,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           typeS.addEventListener("change", () => {
             const v = typeS.value;
             if (v === "none") state[key] = { kind: "none" };
-            else if (v === "direct") state[key] = { kind: "direct" };
+            else if (v === "sudden") state[key] = { kind: "sudden" };
             else if (v === "fade") state[key] = { kind: "fade", durationMs: 800, from: "all", borderFrac: 0.2, delayMs: 0 };
             else if (v === "pixelate") state[key] = { kind: "pixelate", durationMs: 800, delayMs: 0 };
             else if (v === "appear") state[key] = { kind: "appear", durationMs: 0 };
@@ -2144,6 +2363,7 @@ async function main() {
   if (DEBUG_ANIM) dlog("debugAnim=1 enabled");
 
   const model = await fetchModel();
+  preloadImageAssets(model);
   engine.setModel(model);
   dlog("loaded model", {
     views: model.views?.map((v) => ({ id: v.id, show: v.show?.slice?.(0, 50) })),
@@ -2390,13 +2610,23 @@ async function main() {
         if (cue.id === "join_qr") {
           const el = engine.getNodeElement("join_qr");
           const img = el?.querySelector<HTMLImageElement>("img.image");
+          const canvas = el?.querySelector<HTMLCanvasElement>("canvas.image-canvas");
           // eslint-disable-next-line no-console
           console.log("[ip] join_qr enter", {
             view: viewsInOrder[viewIdx]?.id,
             visible: (engine.getModel() as any)?.nodes?.find((n: any) => n.id === "join_qr")?.visible,
             src: img?.src,
             complete: img?.complete,
-            natural: img ? [img.naturalWidth, img.naturalHeight] : null
+            natural: img ? [img.naturalWidth, img.naturalHeight] : null,
+            rect: el ? (() => {
+              const r = el.getBoundingClientRect();
+              return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) };
+            })() : null,
+            display: el ? getComputedStyle(el).display : null,
+            opacity: el ? getComputedStyle(el).opacity : null,
+            canvasDisp: canvas ? getComputedStyle(canvas).display : null,
+            canvasOp: canvas ? getComputedStyle(canvas).opacity : null,
+            imgOp: img ? getComputedStyle(img).opacity : null
           });
         }
       } else {

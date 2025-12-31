@@ -422,6 +422,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             show_time = (params.get("showTime") or "0").strip()
             bar_color = (params.get("barColor") or "orange").strip()
             line_color = (params.get("lineColor") or "green").strip()
+            line_w_raw = (params.get("lineWidth") or "").strip()
             stat = (params.get("stat") or "gaussian").strip()
             min_s_raw = (params.get("min") or "").strip()
             max_s_raw = (params.get("max") or "").strip()
@@ -438,6 +439,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             min_s = fnum(min_s_raw, None)
             max_s = fnum(max_s_raw, None)
             bin_s = fnum(bin_s_raw, None)
+            line_w = fnum(line_w_raw, None)
             if min_s is not None and max_s is not None and bin_s is not None and bin_s > 0:
                 span = max_s - min_s
                 # Must be compatible (divides evenly) within a small tolerance.
@@ -452,6 +454,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "showTime": show_time == "1" or show_time.lower() in {"true", "yes", "on"},
                 "barColor": bar_color,
                 "lineColor": line_color,
+                "lineWidth": line_w,
                 "stat": stat,
                 "minS": min_s,
                 "maxS": max_s,
@@ -475,6 +478,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                             "showTime": int(nodes_by_id[name]["showTime"]),
                             "barColor": bar_color,
                             "lineColor": line_color,
+                            "lineWidth": line_w,
                             "stat": stat,
                             "min": min_s,
                             "max": max_s,
@@ -680,7 +684,15 @@ def _parse_animations_csv(path: Path) -> tuple[dict[str, dict[str, Any]], list[d
             if how == "none" or when not in {"enter", "exit"}:
                 continue
 
-            # `type` is the animation type (direct|fade|pixelate|scale|appear|...).
+            # No back-compat: `direct` was renamed to `sudden`.
+            if how == "direct":
+                raise ValueError(f"{path}: animations.csv uses how=direct which is no longer supported; use how=sudden (id={node_id})")
+
+            allowed = {"sudden", "fade", "pixelate", "appear"}
+            if how not in allowed:
+                raise ValueError(f"{path}: animations.csv has unsupported how={how!r} (id={node_id}); allowed: {sorted(allowed)}")
+
+            # `how` is the animation type (sudden|fade|pixelate|appear).
             # `kind` is whether it is an enter or exit animation.
             a: dict[str, Any] = {"kind": how}
             dur = (row.get("durationMs") or "").strip()

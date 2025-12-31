@@ -259,6 +259,8 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                     args["barColor"] = n.get("barColor")
                 if "lineColor" not in args and n.get("lineColor"):
                     args["lineColor"] = n.get("lineColor")
+                if "lineWidth" not in args and isinstance(n.get("lineWidth"), (int, float)):
+                    args["lineWidth"] = n.get("lineWidth")
                 if "stat" not in args and n.get("stat"):
                     args["stat"] = n.get("stat")
                 if "min" not in args and isinstance(n.get("minS"), (int, float)):

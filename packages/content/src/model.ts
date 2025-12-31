@@ -22,7 +22,7 @@ export type Easing = "linear" | "easeInOut" | "easeOut" | "easeIn";
 
 export type AnimSpec =
   | { kind: "none" }
-  | { kind: "direct"; delayMs?: number }
+  | { kind: "sudden"; delayMs?: number }
   | {
       kind: "fade";
       durationMs: number;
@@ -101,6 +101,8 @@ export interface TimerNodeModel extends BaseNodeModel {
   showTime?: boolean;
   barColor?: string;
   lineColor?: string;
+  /** Canvas stroke width in CSS pixels (used for gaussian + ticks). */
+  lineWidth?: number;
   stat?: "gaussian";
   /** Histogram bin size in seconds (must divide (maxS-minS)). */
   binSizeS?: number;

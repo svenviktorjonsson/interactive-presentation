@@ -143,8 +143,16 @@ def phone_timer():
       const submitBtn = $("submitBtn");
 
       function fmt(ms) { return (ms/1000).toFixed(2); }
+      function forceStandby() {
+        // Force the phone UI back into standby (no partial/paused state left behind).
+        running = false;
+        cancelAnimationFrame(raf);
+        lastMs = null;
+        timeEl.textContent = '0.00';
+        submitBtn.disabled = true;
+      }
       function setStatus() {
-        statusEl.innerHTML = accepting ? '<span class="badge">Ready</span>' : '<span class="badge">Stopped</span>';
+        statusEl.innerHTML = accepting ? '<span class="badge">Ready</span>' : '<span class="badge">Stand by…</span>';
         tapEl.style.opacity = accepting ? '1' : '0.5';
       }
       async function poll() {
@@ -152,7 +160,7 @@ def phone_timer():
           const r = await fetch('/api/timer/state', { cache: 'no-store' });
           const j = await r.json();
           accepting = !!j.accepting;
-          if (!accepting && running) { running=false; cancelAnimationFrame(raf); }
+          if (!accepting) { forceStandby(); }
           setStatus();
         } catch {}
       }
