@@ -8,6 +8,30 @@ export interface DomNodeHandle {
   destroy: () => void;
 }
 
+type ControlButtonSpec = { label: string; action: string; primary?: boolean };
+
+function createControlBar(opts: { className: string; buttonClass: string; buttons: ControlButtonSpec[] }) {
+  const bar = document.createElement("div");
+  bar.className = opts.className;
+  bar.style.position = "absolute";
+  bar.style.left = "0";
+  bar.style.right = "0";
+  bar.style.display = "flex";
+  bar.style.alignItems = "center";
+  bar.style.pointerEvents = "auto";
+  const buttons: Record<string, HTMLButtonElement> = {};
+  for (const b of opts.buttons) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = `${opts.buttonClass}${b.primary ? " primary" : ""}`;
+    btn.dataset.action = b.action;
+    btn.textContent = b.label;
+    bar.appendChild(btn);
+    buttons[b.action] = btn;
+  }
+  return { bar, buttons };
+}
+
 function setCommonStyles(el: HTMLElement, node: NodeModel) {
   el.style.position = "absolute";
   el.style.pointerEvents = "auto";
@@ -17,7 +41,59 @@ function setCommonStyles(el: HTMLElement, node: NodeModel) {
   el.dataset.nodeId = node.id;
   el.dataset.nodeType = node.type;
   el.dataset.anchor = node.transform.anchor ?? "";
+  const bg = (node as any).bgColor;
+  const bgAlpha = (node as any).bgAlpha;
+  if (bg) {
+    el.style.background = normalizeBg(bg, bgAlpha);
+  } else {
+    el.style.background = "transparent";
+  }
+  if ((node as any).borderRadius != null) {
+    const br = Number((node as any).borderRadius);
+    if (Number.isFinite(br)) el.style.borderRadius = `${br}px`;
+  } else {
+    el.style.borderRadius = "";
+  }
   el.classList.add("node");
+}
+
+function normalizeBg(bg: string, alpha?: number | null) {
+  const a = typeof alpha === "number" && Number.isFinite(alpha) ? Math.min(1, Math.max(0, alpha)) : null;
+  const hex = bg.trim();
+  if (hex.startsWith("#")) {
+    // Support #RRGGBB or #RRGGBBAA
+    if (hex.length === 7) {
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      const finalA = a ?? 1;
+      return `rgba(${r}, ${g}, ${b}, ${finalA})`;
+    }
+    if (hex.length === 9) {
+      const r = parseInt(hex.slice(1, 3), 16);
+      const g = parseInt(hex.slice(3, 5), 16);
+      const b = parseInt(hex.slice(5, 7), 16);
+      const aa = parseInt(hex.slice(7, 9), 16) / 255;
+      const finalA = a ?? aa;
+      return `rgba(${r}, ${g}, ${b}, ${finalA})`;
+    }
+    return hex;
+  }
+  // Support tuple "r,g,b" or "r,g,b,a"
+  const tuple = hex.split(",").map((t) => t.trim());
+  if (tuple.length === 3 || tuple.length === 4) {
+    const [r, g, b, a0] = tuple;
+    const r1 = Number(r);
+    const g1 = Number(g);
+    const b1 = Number(b);
+    const a1 = tuple.length === 4 ? Number(a0) : null;
+    if ([r1, g1, b1].every((v) => Number.isFinite(v))) {
+      const finalA = a ?? (Number.isFinite(a1) ? a1 : 1);
+      return `rgba(${r1}, ${g1}, ${b1}, ${finalA})`;
+    }
+  }
+  // Fallback: let CSS parse it (e.g., named colors or rgba()).
+  return a != null ? `color-mix(in srgb, ${bg} ${a * 100}%, transparent)` : bg;
 }
 
 function applyTransform(el: HTMLElement, node: NodeModel, px: { x: number; y: number; w: number; h: number }) {
@@ -47,6 +123,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
   }
   if (node.type === "text") {
     const el = document.createElement("div");
+    el.classList.add("node-text");
     el.style.whiteSpace = "pre-wrap";
     el.style.color = "rgba(255,255,255,0.92)";
     el.style.fontSize = "28px";
@@ -54,13 +131,27 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     el.style.fontWeight = "400";
     el.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
     el.style.boxSizing = "border-box";
+    // Support vertical alignment inside the text box without requiring app-layer wrappers.
+    el.style.display = "flex";
+    el.style.flexDirection = "column";
+
+    // Keep a stable content child so app-layer KaTeX hydration can safely set innerHTML.
+    const content = document.createElement("div");
+    content.className = "node-text-content";
+    content.style.width = "100%";
+    el.appendChild(content);
     setCommonStyles(el, node);
 
     const update = (n: NodeModel) => {
       if (n.type !== "text") return;
       setCommonStyles(el, n);
+      // Override setCommonStyles display=block so we can use flex for vertical alignment.
+      el.style.display = n.visible === false ? "none" : "flex";
       const align = (n as any).align;
       el.style.textAlign = align === "right" ? "right" : align === "center" ? "center" : "left";
+
+      const vAlign = String((n as any).vAlign ?? "top").toLowerCase();
+      el.style.justifyContent = vAlign === "bottom" ? "flex-end" : vAlign === "center" ? "center" : "flex-start";
       // IMPORTANT:
       // The app layer may render KaTeX by setting el.innerHTML. Since this renderer runs every frame,
       // we must not overwrite innerHTML unless the raw text actually changed.
@@ -68,8 +159,74 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       if (el.dataset.rawText !== raw) {
         el.dataset.rawText = raw;
         // Provide a plain-text fallback until the app layer re-hydrates math.
-        el.textContent = raw;
+        content.textContent = raw;
       }
+    };
+
+    update(node);
+    return { id: node.id, el, update, destroy: () => el.remove() };
+  }
+
+  if (node.type === "bullets") {
+    const el = document.createElement("div");
+    el.classList.add("node-bullets");
+    setCommonStyles(el, node);
+
+    const list = document.createElement("div");
+    list.className = "bullets-list";
+    el.appendChild(list);
+
+    const markerFor = (idx: number, style: string) => {
+      const i = idx + 1;
+      switch (style) {
+        case "a":
+          return String.fromCharCode(96 + i) + ".";
+        case "A":
+          return String.fromCharCode(64 + i) + ".";
+        case "1":
+          return `${i}.`;
+        case "X": {
+          const romans = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV", "XV", "XVI", "XVII", "XVIII", "XIX", "XX"];
+          return (romans[i - 1] ?? String(i)) + ".";
+        }
+        case "i": {
+          const romans = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x", "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx"];
+          return (romans[i - 1] ?? String(i)).toString() + ".";
+        }
+        case ".":
+          return "•";
+        case "-":
+          return "–";
+        default:
+          return "•";
+      }
+    };
+
+    const renderItems = (items: string[], style: string) => {
+      const fontPx = typeof (node as any).fontPx === "number" ? (node as any).fontPx : 22;
+      el.style.fontSize = `${fontPx}px`;
+      list.innerHTML = "";
+      items.forEach((item, idx) => {
+        const row = document.createElement("div");
+        row.className = "bullet-row";
+        const marker = document.createElement("span");
+        marker.className = "bullet-marker";
+        marker.textContent = markerFor(idx, style);
+        const body = document.createElement("span");
+        body.className = "bullet-body";
+        body.textContent = item ?? "";
+        row.append(marker, body);
+        list.appendChild(row);
+      });
+    };
+
+    const update = (n: NodeModel) => {
+      setCommonStyles(el, n);
+      if (n.type !== "bullets") return;
+      const style = (n as any).bullets ?? "A";
+      const fontPx = typeof (n as any).fontPx === "number" ? (n as any).fontPx : 22;
+      el.style.fontSize = `${fontPx}px`;
+      renderItems((n as any).items ?? [], style);
     };
 
     update(node);
@@ -213,6 +370,189 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     return { id: node.id, el, update, destroy: () => el.remove() };
   }
 
+  if (node.type === "choices") {
+    const el = document.createElement("div");
+    el.classList.add("node-choices");
+    el.style.boxSizing = "border-box";
+
+    const frame = document.createElement("div");
+    frame.className = "choices-frame";
+    frame.style.position = "absolute";
+    frame.style.inset = "0";
+    frame.style.overflow = "visible";
+
+    const layer = document.createElement("div");
+    layer.className = "choices-sub-layer";
+    layer.style.position = "absolute";
+    layer.style.inset = "0";
+    layer.style.overflow = "visible";
+    layer.style.pointerEvents = "none";
+
+    // Root composite children are GROUPS (folder nesting governs):
+    // - groups/<id>/geometries.csv defines "bullets" + "wheel" groups (relative to root)
+    // - groups/<id>/bullets/geometries.csv defines children within bullets group
+    // - groups/<id>/wheel/geometries.csv defines children within wheel group
+
+    const bulletsGroup = document.createElement("div");
+    bulletsGroup.className = "choices-sub comp-sub comp-group choices-bullets-group";
+    bulletsGroup.dataset.subId = "bullets";
+    bulletsGroup.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
+    bulletsGroup.dataset.groupPath = `${node.id}/bullets`; // children stored in groups/<id>/bullets/
+    bulletsGroup.style.position = "absolute";
+    bulletsGroup.style.position = "absolute";
+    bulletsGroup.style.position = "absolute";
+    bulletsGroup.style.overflow = "visible";
+    bulletsGroup.style.pointerEvents = "auto";
+
+    const wheelGroup = document.createElement("div");
+    wheelGroup.className = "choices-sub comp-sub comp-group choices-wheel-group";
+    wheelGroup.dataset.subId = "wheel";
+    wheelGroup.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
+    wheelGroup.dataset.groupPath = `${node.id}/wheel`; // children stored in groups/<id>/wheel/
+    wheelGroup.style.position = "absolute";
+    wheelGroup.style.overflow = "visible";
+    wheelGroup.style.pointerEvents = "auto";
+    wheelGroup.style.display = "none"; // results hidden by default; app layer toggles
+
+    // --- bullets group children (stored under <id>/bullets) ---
+    const subButtons = document.createElement("div");
+    subButtons.className = "choices-sub comp-sub";
+    subButtons.dataset.subId = "buttons";
+    subButtons.dataset.compPath = `${node.id}/bullets`;
+    subButtons.style.position = "absolute";
+    subButtons.style.pointerEvents = "auto";
+
+    const { bar: controlsBar } = createControlBar({
+      className: "choices-headerbar",
+      buttonClass: "choices-btn",
+      buttons: [
+        { label: "Start", action: "choices-startstop", primary: true },
+        { label: "Show results", action: "choices-showResults" },
+        { label: "Reset", action: "choices-reset" },
+        { label: "Test", action: "choices-test" }
+      ]
+    });
+    controlsBar.style.position = "relative";
+    controlsBar.style.left = "";
+    controlsBar.style.right = "";
+    controlsBar.style.top = "";
+    subButtons.appendChild(controlsBar);
+
+    const subBullets = document.createElement("div");
+    subBullets.className = "choices-sub comp-sub";
+    subBullets.dataset.subId = "bullets";
+    subBullets.dataset.compPath = `${node.id}/bullets`;
+    subBullets.style.position = "absolute";
+    subBullets.style.pointerEvents = "auto";
+    subBullets.style.display = "flex";
+    subBullets.style.flexDirection = "column";
+    subBullets.style.gap = "10px";
+
+    const title = document.createElement("div");
+    title.className = "choices-question";
+    title.textContent = "Poll";
+    const list = document.createElement("div");
+    list.className = "choices-list";
+    subBullets.append(title, list);
+
+    bulletsGroup.append(subButtons, subBullets);
+
+    // --- wheel group children (stored under <id>/wheel) ---
+    const pie = document.createElement("div");
+    pie.className = "choices-sub comp-sub choices-wheel";
+    pie.dataset.subId = "pie";
+    pie.dataset.compPath = `${node.id}/wheel`;
+    pie.style.position = "absolute";
+    pie.style.pointerEvents = "auto";
+    const canvas = document.createElement("canvas");
+    canvas.className = "choices-chart-canvas";
+    pie.appendChild(canvas);
+    wheelGroup.appendChild(pie);
+
+    layer.append(bulletsGroup, wheelGroup);
+    frame.append(layer);
+    el.append(frame);
+    setCommonStyles(el, node);
+
+    const update = (n: NodeModel) => {
+      setCommonStyles(el, n);
+      if (n.type !== "choices") return;
+      el.dataset.bullets = (n as any).bullets ?? "A";
+      el.dataset.chart = (n as any).chart ?? "pie";
+      el.dataset.minPct = String((n as any).minPct ?? (n as any).min ?? "");
+      el.dataset.minInsidePct = String((n as any).minInsidePct ?? (n as any).minInside ?? "");
+      el.dataset.otherLabel = String((n as any).otherLabel ?? "");
+      title.textContent = (n as any).question ?? "Poll";
+      // default hidden until Show results is pressed (app layer controls actual rendering)
+      if (!el.dataset.resultsVisible) el.dataset.resultsVisible = "0";
+
+      // Apply folder-nested composite geometries if provided.
+      const byPath: any = (n as any).compositeGeometriesByPath ?? {};
+      const rootGeoms = byPath[""] ?? {};
+      const bulletsGeoms = byPath["bullets"] ?? {};
+      const wheelGeoms = byPath["wheel"] ?? {};
+
+      const apply = (sub: HTMLElement, gAny: any, fallback: any) => {
+        const g = gAny ?? fallback;
+        const x = Number(g.x ?? 0);
+        const y = Number(g.y ?? 0);
+        const w = Number(g.w ?? 1);
+        const h = Number(g.h ?? 1);
+        const rot = Number(g.rotationDeg ?? 0);
+        sub.style.left = `${x * 100}%`;
+        sub.style.top = `${y * 100}%`;
+        sub.style.width = `${w * 100}%`;
+        sub.style.height = `${h * 100}%`;
+        sub.style.rotate = `${rot}deg`;
+        const anchor = String(g.anchor ?? "topLeft");
+        sub.dataset.anchor = anchor;
+        // Anchor transform (so x/y are anchor coordinates).
+        const tx =
+          anchor.endsWith("Right") ? "-100%" : anchor.endsWith("Center") ? "-50%" : "0%";
+        const ty =
+          anchor.startsWith("Bottom") ? "-100%" : anchor.startsWith("Center") ? "-50%" : "0%";
+        sub.style.transform = `translate(${tx}, ${ty})`;
+      };
+
+      apply(bulletsGroup, rootGeoms["bullets"], { x: 0.0, y: 0.0, w: 0.46, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
+      apply(wheelGroup, rootGeoms["wheel"], { x: 0.52, y: 0.0, w: 0.48, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
+
+      // Children are RELATIVE to their parent folder/group box.
+      // Make group containers the positioning context.
+      bulletsGroup.style.position = "absolute";
+      bulletsGroup.style.contain = "layout style";
+      (bulletsGroup.style as any).containerType = "size";
+      bulletsGroup.style.pointerEvents = "auto";
+      bulletsGroup.style.overflow = "visible";
+      bulletsGroup.style.transformOrigin = "0 0";
+      (bulletsGroup.style as any).position = "absolute";
+      bulletsGroup.style.position = "absolute";
+
+      wheelGroup.style.position = "absolute";
+      wheelGroup.style.contain = "layout style";
+      (wheelGroup.style as any).containerType = "size";
+      wheelGroup.style.pointerEvents = "auto";
+      wheelGroup.style.overflow = "visible";
+
+      // Ensure children are positioned relative to the group (not the root layer).
+      bulletsGroup.style.position = "absolute";
+      wheelGroup.style.position = "absolute";
+      bulletsGroup.style.setProperty("position", "absolute");
+      wheelGroup.style.setProperty("position", "absolute");
+      // Make them positioning contexts:
+      bulletsGroup.style.setProperty("position", "absolute");
+      wheelGroup.style.setProperty("position", "absolute");
+      // (positioned children already use absolute)
+
+      apply(subButtons, bulletsGeoms["buttons"], { x: 0.5, y: -0.10, w: 1.0, h: 0.18, anchor: "topCenter", rotationDeg: 0 });
+      apply(subBullets, bulletsGeoms["bullets"], { x: 0.0, y: 0.0, w: 1.0, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
+      apply(pie, wheelGeoms["pie"], { x: 0.5, y: 0.5, w: 1.0, h: 1.0, anchor: "centerCenter", rotationDeg: 0 });
+    };
+
+    update(node);
+    return { id: node.id, el, update, destroy: () => el.remove() };
+  }
+
   if (node.type === "timer") {
     const el = document.createElement("div");
     el.classList.add("node-timer");
@@ -251,39 +591,20 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     overlayBg.style.pointerEvents = "none";
     overlay.append(overlayBg);
 
-    const header = document.createElement("div");
-    header.className = "timer-header";
-    header.style.position = "absolute";
+    const { bar: header } = createControlBar({
+      className: "timer-header",
+      buttonClass: "timer-btn",
+      buttons: [
+        { label: "Start", action: "timer-startstop", primary: true },
+        { label: "Reset", action: "timer-reset" },
+        { label: "Test", action: "timer-test" }
+      ]
+    });
     // Buttons should live outside the timer "data rect" overlay. Place them above.
-    header.style.left = "0";
-    header.style.right = "0";
-    // Scale header offsets with the timer's pixel size (set via --timer-scale).
-    header.style.top = "calc(-44px * var(--timer-scale, 1))";
-    header.style.padding = "0 calc(10px * var(--timer-scale, 1))";
-    header.style.display = "flex";
-    header.style.gap = "calc(10px * var(--timer-scale, 1))";
-    header.style.alignItems = "center";
-    header.style.pointerEvents = "auto";
-
-    const startBtn = document.createElement("button");
-    startBtn.className = "timer-btn primary";
-    startBtn.type = "button";
-    startBtn.textContent = "Start";
-    startBtn.dataset.action = "timer-startstop";
-
-    const resetBtn = document.createElement("button");
-    resetBtn.className = "timer-btn";
-    resetBtn.type = "button";
-    resetBtn.textContent = "Reset";
-    resetBtn.dataset.action = "timer-reset";
-
-    const testBtn = document.createElement("button");
-    testBtn.className = "timer-btn";
-    testBtn.type = "button";
-    testBtn.textContent = "Test";
-    testBtn.dataset.action = "timer-test";
-
-    header.append(startBtn, resetBtn, testBtn);
+    // Scale header offsets with the timer's pixel size (set via --timer-scale / --ui-scale).
+    header.style.top = "calc(-44px * var(--ui-scale, var(--timer-scale, 1)))";
+    header.style.padding = "0 calc(10px * var(--ui-scale, var(--timer-scale, 1)))";
+    (header.style as any).gap = "calc(10px * var(--ui-scale, var(--timer-scale, 1)))";
 
     const canvas = document.createElement("canvas");
     canvas.className = "timer-canvas";
@@ -533,20 +854,7 @@ export function layoutDomNodes(args: {
       px = { x: nodeLayout.transform.x, y: nodeLayout.transform.y, w: nodeLayout.transform.w, h: nodeLayout.transform.h };
     }
 
-    if (node.id === "join_qr") {
-      const prev = handle.el.dataset.joinQrDbgPx;
-      const cur = `${Math.round(px.x)},${Math.round(px.y)},${Math.round(px.w)},${Math.round(px.h)}`;
-      if (prev !== cur) {
-        handle.el.dataset.joinQrDbgPx = cur;
-        // eslint-disable-next-line no-console
-        console.log("[ip] join_qr layout", {
-          px: { x: Math.round(px.x), y: Math.round(px.y), w: Math.round(px.w), h: Math.round(px.h) },
-          cam: { cx: Math.round(camera.cx), cy: Math.round(camera.cy), zoom: Number(camera.zoom.toFixed(3)) },
-          screen,
-          connected: handle.el.isConnected
-        });
-      }
-    }
+    // (removed) noisy join_qr layout diagnostics
 
     // Cull if < 1 px on either dimension.
     if (px.w < 1 || px.h < 1) {
@@ -564,26 +872,23 @@ export function layoutDomNodes(args: {
       px.y > screen.h + marginPx;
     if (off) {
       handle.el.style.display = "none";
-      if (node.id === "join_qr" && handle.el.dataset.joinQrDbgOff !== "1") {
-        handle.el.dataset.joinQrDbgOff = "1";
-        // eslint-disable-next-line no-console
-        console.log("[ip] join_qr culled (offscreen)", { px, screen });
-      }
       continue;
     }
-    if (node.id === "join_qr" && handle.el.dataset.joinQrDbgOff === "1") {
-      handle.el.dataset.joinQrDbgOff = "0";
-      // eslint-disable-next-line no-console
-      console.log("[ip] join_qr back onscreen");
-    }
+    // (removed) noisy join_qr offscreen/onscreen diagnostics
 
     // Expose timer pixel size and scale for composite children/layout.
     if (nodeLayout.type === "timer") {
       const baseH = Math.max(1e-6, Number(nodeLayout.transform.h ?? 1));
       const uiScale = px.h / baseH;
       handle.el.style.setProperty("--timer-scale", String(uiScale));
+      handle.el.style.setProperty("--ui-scale", String(uiScale));
       handle.el.dataset.timerWpx = String(px.w);
       handle.el.dataset.timerHpx = String(px.h);
+    }
+    if (nodeLayout.type === "choices") {
+      const baseH = Math.max(1e-6, Number(nodeLayout.transform.h ?? 1));
+      const uiScale = px.h / baseH;
+      handle.el.style.setProperty("--ui-scale", String(uiScale));
     }
 
     if (!handle.el.isConnected) overlayEl.appendChild(handle.el);
@@ -786,25 +1091,7 @@ export function layoutDomNodes(args: {
           const stepP = stepIdx / steps;
 
           setPixelate(handle.el, px.w, px.h, stepP, steps);
-          // Minimal always-on diagnostics for join_qr (helps when it "never appears").
-          if (node.id === "join_qr") {
-            const last = Number(handle.el.dataset.pixDbgStep ?? "-1");
-            if (last !== stepIdx) {
-              handle.el.dataset.pixDbgStep = String(stepIdx);
-              const c = handle.el.querySelector<HTMLCanvasElement>("canvas.image-canvas");
-              const i = handle.el.querySelector<HTMLImageElement>("img.image");
-              // eslint-disable-next-line no-console
-              console.log("[ip] join_qr pixelate", {
-                stepIdx,
-                steps,
-                stepP: Number(stepP.toFixed(3)),
-                ready,
-                canvasDisp: c ? getComputedStyle(c).display : null,
-                canvasOp: c ? getComputedStyle(c).opacity : null,
-                imgOp: i ? getComputedStyle(i).opacity : null
-              });
-            }
-          }
+          // (removed) noisy join_qr pixelate diagnostics
           if (stepIdx >= steps) {
             delete (handle.el.dataset as any).pixAnimStartMs;
             handle.el.dataset.pixAnimDone = "1";

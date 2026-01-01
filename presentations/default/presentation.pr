@@ -1,0 +1,27 @@
+# presentation.txt v1 (canonical)
+
+screen[name=main]:
+
+image[name=EOES_logo,bgColor=white]
+text[name=place_date]:
+NRM, 24 Jan 2026
+
+text[name=author]:
+Presented by Viktor Jonsson
+
+
+view[name=home]:
+text[name=title]:
+Welcome to my presentation
+
+image[name=join_qr]
+
+view[name=view2,refView=home,loc=right]:
+text[name=v2_note]:
+Hur bra är vi på att estimera 30 sekunder tror ni?
+
+timer[name=timer1,barColor=orange,binSize=1,lineColor=green,lineWidth=2,max=40,min=20,showTime=0,stat=gaussian]
+
+view[name=view3,refView=view2,loc=right]:
+choices[name=fav_subjects,type=pie,bullets=A,choices={Biologi:green,Kemi:red,Fysik:blue,Matematik:magenta,Övrigt:cyan}]:
+Vilket ämne tycker ni är roligast i skolan?

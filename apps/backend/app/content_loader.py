@@ -108,6 +108,63 @@ def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None
     )
 
 
+def _ensure_choices_composite_defaults(pres_dir: Path, composite_dir: str) -> None:
+    """
+    Create a default composite folder for choices nodes.
+    This lets the presenter edit internal layout (buttons/bullets/wheel) without opening the modal.
+    """
+    if not re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_\-]{0,63}$", composite_dir):
+        raise ValueError(f"Invalid composite folder name: {composite_dir!r}")
+
+    groups_dir = pres_dir / "groups"
+    groups_dir.mkdir(parents=True, exist_ok=True)
+    comp_dir = groups_dir / composite_dir
+    comp_dir.mkdir(parents=True, exist_ok=True)
+
+    elements_path = comp_dir / "elements.txt"
+    geometries_path = comp_dir / "geometries.csv"
+    # Keep a minimal elements.txt for future expansion (wheel labels/arrows etc).
+    if not elements_path.exists():
+        elements_path.write_text(
+            "# choices composite elements (draft)\n"
+            "# This composite controls the internal layout of the choices node.\n"
+            "# Sub-ids used by the frontend: buttons, bullets, wheel\n",
+            encoding="utf-8",
+        )
+
+    # Folder nesting governs hierarchy:
+    # groups/<pollId>/geometries.csv defines top-level child groups.
+    # groups/<pollId>/bullets/geometries.csv defines bullets+buttons layout within that group.
+    # groups/<pollId>/wheel/geometries.csv defines wheel layout within that group.
+    bullets_dir = comp_dir / "bullets"
+    wheel_dir = comp_dir / "wheel"
+    bullets_dir.mkdir(parents=True, exist_ok=True)
+    wheel_dir.mkdir(parents=True, exist_ok=True)
+
+    if not geometries_path.exists():
+        geometries_path.write_text(
+            "id,view,x,y,w,h,rotationDeg,anchor,align,parent\n"
+            # Two top-level groups side-by-side by default.
+            "bullets,composite,0.00,0.00,0.46,1.00,0,topLeft,left,\n"
+            "wheel,composite,0.52,0.00,0.48,1.00,0,topLeft,center,\n",
+            encoding="utf-8",
+        )
+    if not (bullets_dir / "geometries.csv").exists():
+        (bullets_dir / "geometries.csv").write_text(
+            "id,view,x,y,w,h,rotationDeg,anchor,align,parent\n"
+            # Allow y < 0 for button bar above bullets group.
+            "buttons,composite,0.50,-0.10,1.00,0.18,0,topCenter,center,\n"
+            "bullets,composite,0.00,0.00,1.00,1.00,0,topLeft,left,\n",
+            encoding="utf-8",
+        )
+    if not (wheel_dir / "geometries.csv").exists():
+        (wheel_dir / "geometries.csv").write_text(
+            "id,view,x,y,w,h,rotationDeg,anchor,align,parent\n"
+            "pie,composite,0.50,0.50,1.00,1.00,0,centerCenter,center,\n",
+            encoding="utf-8",
+        )
+
+
 def _expand_placeholders(template: str, args: dict[str, Any]) -> str:
     """
     Replace {key} with args[key] for simple template expansion.
@@ -152,20 +209,38 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
     if not path.exists():
         return {"id": presentation_id, "initialViewId": "home", "views": views, "nodes": []}
 
-    header_re = re.compile(r"^(?P<kw>[a-zA-Z_]\w*)\[(?P<params>[^\]]+)\]\s*:?\s*$")
+    header_re = re.compile(r"^(?P<kw>[a-zA-Z_]\w*)\[(?P<params>[^\]]+)\]\s*:?(?P<inline>.*)$")
 
     def parse_params(s: str) -> dict[str, str]:
-        # Very small parser: split on commas not inside quotes.
+        # Split on commas, but NOT inside quotes or balanced bracket groups.
+        # This is required for e.g. choices={A:red,B:blue,...} which contains commas.
         out: dict[str, str] = {}
         buf = ""
         in_quotes = False
+        brace_depth = 0   # {...}
+        bracket_depth = 0 # [...]
+        paren_depth = 0   # (...)
         parts: list[str] = []
         for ch in s:
             if ch == '"':
                 in_quotes = not in_quotes
                 buf += ch
                 continue
-            if ch == "," and not in_quotes:
+            if not in_quotes:
+                if ch == "{":
+                    brace_depth += 1
+                elif ch == "}":
+                    brace_depth = max(0, brace_depth - 1)
+                elif ch == "[":
+                    bracket_depth += 1
+                elif ch == "]":
+                    bracket_depth = max(0, bracket_depth - 1)
+                elif ch == "(":
+                    paren_depth += 1
+                elif ch == ")":
+                    paren_depth = max(0, paren_depth - 1)
+
+            if ch == "," and not in_quotes and brace_depth == 0 and bracket_depth == 0 and paren_depth == 0:
                 parts.append(buf.strip())
                 buf = ""
                 continue
@@ -184,9 +259,85 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             out[k] = v
         return out
 
+    def parse_choice_options(raw: str | None) -> list[dict[str, str]]:
+        if not raw:
+            return []
+        s = raw.strip()
+        # Strip surrounding braces/brackets generously (handles {{...}}, {...}, [...])
+        while s and s[0] in "{[" and s[-1] in "}]":
+            s = s[1:-1].strip()
+
+        # Split on commas not inside quotes.
+        parts: list[str] = []
+        buf = ""
+        in_quotes = False
+        for ch in s:
+            if ch == '"':
+                in_quotes = not in_quotes
+                buf += ch
+                continue
+            if ch == "," and not in_quotes:
+                parts.append(buf.strip())
+                buf = ""
+                continue
+            buf += ch
+        if buf.strip():
+            parts.append(buf.strip())
+
+        palette = ["#4caf50", "#e53935", "#1e88e5", "#ab47bc", "#00bcd4", "#fdd835", "#8d6e63"]
+        opts: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+
+        def slug(label: str) -> str:
+            s1 = re.sub(r"\s+", "_", label.strip())
+            s1 = re.sub(r"[^a-zA-Z0-9_]", "", s1)
+            return s1 or "option"
+
+        for idx, part in enumerate(parts):
+            if not part:
+                continue
+            if ":" in part:
+                lab_raw, col_raw = part.split(":", 1)
+            else:
+                lab_raw, col_raw = part, ""
+            label = lab_raw.strip()
+            color = col_raw.strip() or palette[idx % len(palette)]
+            if not label:
+                continue
+            opt_id = slug(label)
+            # Ensure stable uniqueness even if labels repeat.
+            base = opt_id
+            n = 2
+            while opt_id in seen_ids:
+                opt_id = f"{base}{n}"
+                n += 1
+            seen_ids.add(opt_id)
+            opts.append({"id": opt_id, "label": label, "color": color})
+        return opts
+
     lines = path.read_text(encoding="utf-8").splitlines()
     i = 0
     current_view: dict[str, Any] | None = None
+    screen_mode = False
+    screen_nodes: set[str] = set()
+    screen_counter = 0
+
+    def _apply_style_params(node: dict[str, Any], params: dict[str, str]) -> None:
+        bg = (params.get("bgColor") or params.get("bg") or "").strip()
+        if bg:
+            node["bgColor"] = bg
+        ba_raw = (params.get("bgAlpha") or "").strip()
+        if ba_raw:
+            try:
+                node["bgAlpha"] = float(ba_raw)
+            except ValueError:
+                pass
+        br_raw = (params.get("borderRadius") or params.get("rounded") or "").strip()
+        if br_raw:
+            try:
+                node["borderRadius"] = float(br_raw)
+            except ValueError:
+                pass
 
     def _half_extents(cam: dict[str, float]) -> tuple[float, float]:
         z = float(cam.get("zoom", 1.0) or 1.0)
@@ -330,9 +481,26 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
         if not name:
             raise ValueError(f"Missing required name= in: {raw}")
 
-        has_colon = stripped.endswith(":")
+        inline_after = (m.group("inline") or "").strip()
+        has_colon = stripped.endswith(":") and not inline_after
+
+        if kw == "screen":
+            # Start a new screen segment; treated like a view but for screen-space nodes.
+            screen_mode = True
+            screen_counter += 1
+            current_view = {"id": name or f"screen_{screen_counter}", "screen": True, "show": []}
+            views.append(current_view)
+            continue
 
         if kw == "view":
+            screen_mode = False
+            # Allow reusing an existing view name to jump back without redefining camera.
+            existing = next((v for v in views if v.get("id") == name), None)
+            if existing:
+                current_view = existing
+                prev_cam = view_cameras_by_id.get(name, prev_cam)
+                continue
+
             if initial_view_id is None:
                 # First view is the base view: no camera params allowed.
                 extra = {k: v for k, v in params.items() if k != "name" and str(v).strip()}
@@ -365,11 +533,14 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             prev_cam = cam
             continue
 
-        if current_view is None:
+        if current_view is None and not screen_mode:
             raise ValueError(f"Block outside of any view: {raw}")
 
         if kw == "text":
             content_lines: list[str] = []
+            inline = (m.group("inline") or "").strip()
+            if inline:
+                content_lines.append(inline)
             if has_colon:
                 # Read until next header
                 while i < len(lines):
@@ -385,8 +556,12 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
 
             text = "\n".join([ln for ln in content_lines]).strip("\n")
             # View elements are world/data coordinates by default.
-            nodes_by_id[name] = {"id": name, "type": "text", "space": "world", "text": text}
-            current_view["show"].append(name)
+            nodes_by_id[name] = {"id": name, "type": "text", "space": "screen" if screen_mode else "world", "text": text}
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
             continue
 
         if kw == "qr":
@@ -400,16 +575,25 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
         if kw == "image":
             # Media by name: default to /media/<name>.png
             src = params.get("src") or params.get("file") or f"/media/{name}.png"
-            nodes_by_id[name] = {"id": name, "type": "image", "space": "world", "src": src}
-            current_view["show"].append(name)
+            space = (params.get("space") or "world").strip() or "world"
+            nodes_by_id[name] = {"id": name, "type": "image", "space": space if not screen_mode else "screen", "src": src}
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
             continue
 
         if kw == "iframe":
             src = params.get("src")
             if not src:
                 raise ValueError(f"iframe requires src= in: {raw}")
-            nodes_by_id[name] = {"id": name, "type": "htmlFrame", "space": "world", "src": src}
-            current_view["show"].append(name)
+            nodes_by_id[name] = {"id": name, "type": "htmlFrame", "space": "screen" if screen_mode else "world", "src": src}
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
             continue
 
         if kw == "timer":
@@ -520,6 +704,79 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             current_view["show"].append(name)
             continue
 
+        if kw == "choices":
+            # Ensure the choices composite defaults exist only if a choices node is actually used.
+            try:
+                _ensure_choices_composite_defaults(path.parent, name)
+            except Exception:
+                pass
+            content_lines: list[str] = []
+            if has_colon:
+                while i < len(lines):
+                    peek = lines[i].strip()
+                    if not peek or peek.startswith("#"):
+                        content_lines.append(lines[i].rstrip("\n"))
+                        i += 1
+                        continue
+                    if header_re.match(peek):
+                        break
+                    content_lines.append(lines[i].rstrip("\n"))
+                    i += 1
+
+            question = "\n".join([ln for ln in content_lines]).strip("\n")
+            chart_raw = (params.get("type") or params.get("chart") or "pieChart").strip()
+            chart = "pie" if "pie" in chart_raw.lower() else "pie"
+            bullet_style = (params.get("bullets") or "A").strip() or "A"
+            options = parse_choice_options(params.get("choices"))
+            nodes_by_id[name] = {
+                "id": name,
+                "type": "choices",
+                "space": "world",
+                "question": question,
+                "chart": chart,
+                "bullets": bullet_style,
+                "options": options,
+            }
+            # Load composite-local geometries for editable sub-elements (folder-nested).
+            try:
+                pres_dir = path.parent
+                base = pres_dir / "groups" / str(name)
+
+                def load_geoms(csv_path: Path) -> dict[str, Any]:
+                    if not csv_path.exists():
+                        return {}
+                    out: dict[str, Any] = {}
+                    with csv_path.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            sid = (row.get("id") or "").strip()
+                            if not sid or sid.startswith("#"):
+                                continue
+                            try:
+                                out[sid] = {
+                                    "x": float((row.get("x") or "0").strip() or 0),
+                                    "y": float((row.get("y") or "0").strip() or 0),
+                                    "w": float((row.get("w") or "1").strip() or 1),
+                                    "h": float((row.get("h") or "1").strip() or 1),
+                                    "rotationDeg": float((row.get("rotationDeg") or "0").strip() or 0),
+                                    "anchor": (row.get("anchor") or "topLeft").strip() or "topLeft",
+                                    "align": (row.get("align") or "").strip(),
+                                    "parent": (row.get("parent") or "").strip(),
+                                }
+                            except Exception:
+                                continue
+                    return out
+
+                nodes_by_id[name]["compositeGeometriesByPath"] = {
+                    "": load_geoms(base / "geometries.csv"),
+                    "bullets": load_geoms(base / "bullets" / "geometries.csv"),
+                    "wheel": load_geoms(base / "wheel" / "geometries.csv"),
+                }
+            except Exception:
+                pass
+            current_view["show"].append(name)
+            continue
+
         if kw == "bullets":
             items: list[str] = []
             if has_colon:
@@ -530,10 +787,21 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                         continue
                     if header_re.match(peek):
                         break
-                    items.append(lines[i].strip())
+                    raw_item = lines[i].strip()
+                    # Strip leading common markers ("- ", "* ", etc.)
+                    raw_item = re.sub(r"^[-*+]\s+", "", raw_item)
+                    items.append(raw_item)
                     i += 1
-            nodes_by_id[name] = {"id": name, "type": "bullets", "space": "world", "items": items}
-            current_view["show"].append(name)
+            bullet_style = (params.get("type") or params.get("bullets") or "A").strip() or "A"
+            # Normalize roman choice to "X" to distinguish from numeric "1".
+            if bullet_style == "I":
+                bullet_style = "X"
+            nodes_by_id[name] = {"id": name, "type": "bullets", "space": "screen" if screen_mode else "world", "items": items, "bullets": bullet_style}
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
             continue
 
         if kw == "table":
@@ -549,14 +817,22 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                         break
                     rows.append([cell.strip() for cell in lines[i].split(delim)])
                     i += 1
-            nodes_by_id[name] = {"id": name, "type": "table", "space": "world", "rows": rows, "delimiter": delim}
-            current_view["show"].append(name)
+            nodes_by_id[name] = {"id": name, "type": "table", "space": "screen" if screen_mode else "world", "rows": rows, "delimiter": delim}
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
             continue
 
         if kw == "group":
             # Pure grouping node. Geometry and parent/children are handled by geometries.csv (parentId).
-            nodes_by_id[name] = {"id": name, "type": "group", "space": "world"}
-            current_view["show"].append(name)
+            nodes_by_id[name] = {"id": name, "type": "group", "space": "screen" if screen_mode else "world"}
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
             continue
 
         raise ValueError(f"Unknown keyword: {kw}")
@@ -632,8 +908,10 @@ def _parse_geometries_csv(
                 ww = wn * design_h
                 hw = hn * design_h
 
+            # Determine space from view: if view is a screen view, this is screen-space
+            is_screen_view = view.get("screen", False)
             g: dict[str, Any] = {
-                "space": "world",
+                "space": "screen" if is_screen_view else "world",
                 "view": view_id,
                 "transform": {"x": xw, "y": yw, "w": ww, "h": hw},
             }
@@ -653,6 +931,10 @@ def _parse_geometries_csv(
             align = (row.get("align") or "").strip()
             if align:
                 g["align"] = align
+
+            v_align = (row.get("vAlign") or row.get("valign") or "").strip()
+            if v_align:
+                g["vAlign"] = v_align
 
             out[node_id] = g
 
@@ -734,7 +1016,10 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
     root = _repo_root()
     pres_dir = presentation_dir or (root / "presentations" / "default")
     defaults = _load_defaults(pres_dir)
-    meta = _parse_presentation_txt(pres_dir / "presentation.txt", design_w=float(defaults["designWidth"]), design_h=float(defaults["designHeight"]))
+    pres_path = pres_dir / "presentation.pr"
+    if not pres_path.exists():
+        pres_path = pres_dir / "presentation.txt"
+    meta = _parse_presentation_txt(pres_path, design_w=float(defaults["designWidth"]), design_h=float(defaults["designHeight"]))
     geometries_path = pres_dir / "geometries.csv"
     animations_path = pres_dir / "animations.csv"
     if not geometries_path.exists():
@@ -757,6 +1042,7 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
     animations, animation_cues = _parse_animations_csv(animations_path)
 
     nodes: list[dict[str, Any]] = []
+    # Ensure screen-space nodes are only in their screen views; do not auto-add to other views.
     for node in meta["nodes"]:
         g = geometries.get(node["id"])
         a = animations.get(node["id"])
@@ -767,11 +1053,15 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
                 node["parentId"] = g.get("parentId")
             if "align" in g:
                 node["align"] = g.get("align")
+            if "vAlign" in g:
+                node["vAlign"] = g.get("vAlign")
             if "fontPx" in g:
                 node["fontPx"] = g.get("fontPx")
         else:
             # Sensible defaults if geometry is missing
-            if node["type"] == "text":
+            if node.get("space") == "screen":
+                node["transform"] = {"x": 16.0, "y": 16.0, "w": 220.0, "h": 90.0, "anchor": "topLeft"}
+            elif node["type"] == "text":
                 node["transform"] = {"x": 24.0, "y": 18.0, "w": 900.0, "h": 60.0, "anchor": "topLeft"}
             elif node["type"] == "qr":
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 280.0, "h": 280.0, "anchor": "center"}
@@ -785,6 +1075,12 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
                 node["disappear"] = a.get("disappear")
             # Allow overriding type from representation only if meta didn't set it (meta is source of truth)
 
+        if "borderRadius" not in node and "borderRadius" in defaults:
+            try:
+                node["borderRadius"] = float(defaults.get("borderRadius"))
+            except Exception:
+                pass
+
         nodes.append(node)
 
     # Apply initial view visibility
@@ -792,7 +1088,12 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
     initial_view = next((v for v in meta["views"] if v["id"] == initial_view_id), None)
     show = set(initial_view["show"]) if initial_view else set()
     for n in nodes:
-        n["visible"] = n["id"] in show
+        # Screen-space nodes should behave like an overlay layer: visible regardless of the active world view.
+        # They are managed by `screen[...]` sections (screen views), which are not part of the initial world view's `show` list.
+        if n.get("space") == "screen":
+            n["visible"] = True
+        else:
+            n["visible"] = n["id"] in show
 
     payload = {
         "id": meta["id"],

@@ -116,6 +116,211 @@ body {
   border-radius: 12px;
 }
 
+.node-choices {
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+  --ui-scale: 1;
+}
+
+.node-choices .choices-frame {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+}
+
+.node-choices .choices-sub-layer {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+}
+
+.node-choices .choices-sub {
+  box-sizing: border-box;
+}
+
+.node-choices .choices-wheel canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.node-choices .choices-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.node-choices .choices-question {
+  font-weight: 800;
+  font-size: 22px;
+  line-height: 1.25;
+}
+
+.node-choices .choices-status {
+  font-size: 13px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.node-choices .choices-status[data-state="open"] {
+  border-color: rgba(110, 168, 255, 0.4);
+  background: rgba(110, 168, 255, 0.2);
+}
+
+.node-choices .choices-body {
+  display: grid;
+  grid-template-columns: 1fr 0.9fr;
+  gap: 10px;
+  align-items: center;
+}
+
+@media (max-width: 700px) {
+  .node-choices .choices-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.node-choices .choices-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.node-choices .choices-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.node-choices .choices-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.node-choices .choices-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  border: 2px solid rgba(255, 255, 255, 0.25);
+  display: inline-block;
+}
+
+.node-choices .choices-meta {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.node-choices .choices-chart {
+  display: grid;
+  place-items: center;
+}
+
+.node-choices .choices-chart canvas {
+  width: 100%;
+  max-width: 220px;
+  aspect-ratio: 1;
+  height: auto;
+}
+
+.node-choices .choices-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.node-choices .choices-total {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.node-choices .choices-controls {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.node-choices .choices-headerbar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(-44px * var(--ui-scale, 1));
+  padding: 0 calc(10px * var(--ui-scale, 1));
+  display: flex;
+  gap: calc(10px * var(--ui-scale, 1));
+  align-items: center;
+  pointer-events: auto;
+}
+
+.node-choices .choices-btn {
+  padding: calc(12px * var(--ui-scale, 1)) calc(14px * var(--ui-scale, 1));
+  border-radius: calc(10px * var(--ui-scale, 1));
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  font-weight: 800;
+  cursor: pointer;
+  font-size: calc(16px * var(--ui-scale, 1));
+}
+
+.node-choices .choices-btn.primary {
+  border-color: rgba(110, 168, 255, 0.34);
+  background: rgba(110, 168, 255, 0.22);
+}
+
+.node-bullets {
+  padding: 0;
+  background: transparent;
+  border: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+}
+
+.node-bullets .bullets-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.node-bullets .bullet-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: inherit;
+}
+
+.node-bullets .bullet-marker {
+  color: var(--muted);
+  min-width: 28px;
+  text-align: right;
+}
+
+.node-bullets .bullet-body {
+  flex: 1;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
 .node-timer {
   --timer-scale: 1;
 }
@@ -319,8 +524,9 @@ body {
 }
 
 .field label {
-  font-size: 12px;
+  font-size: 14px;
   color: var(--muted);
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 .field input,
@@ -332,12 +538,17 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(255, 255, 255, 0.06);
   color: var(--text);
-  padding: 10px 10px;
-  font-family: inherit;
+  padding: 10px 12px;
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 17px;
+  line-height: 1.3;
 }
 
 .field select {
   color-scheme: dark;
+  height: auto;
+  padding-top: 8px;
+  padding-bottom: 8px;
 }
 
 /* Windows can still render option lists with a light background unless we set it */
@@ -349,7 +560,7 @@ body {
 .field textarea {
   min-height: 180px;
   resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
 }
 
 .preview {

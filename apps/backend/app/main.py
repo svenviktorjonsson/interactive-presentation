@@ -5,12 +5,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi import Body
+from fastapi import UploadFile, File
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import math
 import time
 import csv
+import random
 
 from .content_loader import load_presentation
 from .content_writer import write_animations_csv, write_geometries_csv, write_presentation_txt
@@ -49,6 +51,109 @@ def media(media_path: str):
     return FileResponse(p, headers={"Cache-Control": "no-store"})
 
 
+@app.post("/api/media/upload")
+async def upload_media(file: UploadFile = File(...)):
+    """
+    Upload an image into presentations/default/media and return its served src.
+    """
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    ct = (file.content_type or "").lower()
+    if not ct.startswith("image/"):
+        return Response(status_code=400, content="Only image/* is allowed", media_type="text/plain")
+
+    # Basic filename sanitization + uniqueness.
+    name = (file.filename or "image").strip()
+    # Keep only simple characters.
+    safe = "".join(ch for ch in name if ch.isalnum() or ch in ("-", "_", ".", " ")).strip().replace(" ", "_")
+    if not safe or safe.startswith("."):
+        safe = "image"
+    if "." not in safe:
+        # Default extension based on content-type when missing.
+        ext = ct.split("/", 1)[1].split(";", 1)[0].strip()
+        if ext in {"jpeg"}:
+            ext = "jpg"
+        safe = f"{safe}.{ext or 'png'}"
+
+    base = safe.rsplit(".", 1)[0]
+    ext = safe.rsplit(".", 1)[1]
+    out = (MEDIA_DIR / safe).resolve()
+    if not str(out).startswith(str(MEDIA_DIR.resolve())):
+        return Response(status_code=400, content="Invalid filename", media_type="text/plain")
+    i = 2
+    while out.exists():
+        out = (MEDIA_DIR / f"{base}_{i}.{ext}").resolve()
+        i += 1
+
+    data = await file.read()
+    if data is None:
+        data = b""
+    # 25MB limit
+    if len(data) > 25 * 1024 * 1024:
+        return Response(status_code=413, content="File too large", media_type="text/plain")
+
+    out.write_bytes(data)
+    return {"ok": True, "src": f"/media/{out.name}", "filename": out.name, "contentType": ct}
+
+
+@app.post("/api/composite/save")
+def composite_save(payload: dict = Body(...)):
+    """
+    Generic composite save for any node that has a `groups/<compositeDir>/` folder.
+
+    Payload:
+      { "compositeDir": "<name>", "geoms": { "<id>": {x,y,w,h,rotationDeg,anchor,align,parent?...} }, "elementsText"?: "..." }
+    """
+    # Support nested composite folders:
+    # - compositePath: "choices1/wheel" (preferred)
+    # - compositeDir:  "timer1" (back-compat)
+    composite_path = str(payload.get("compositePath") or payload.get("compositeDir") or "").strip()
+    geoms = payload.get("geoms")
+    elements_text = payload.get("elementsText")
+    if not composite_path:
+        return Response(status_code=400, content="Missing compositePath", media_type="text/plain")
+    # Validate each path segment (folder nesting governs hierarchy on disk).
+    parts = [p for p in composite_path.replace("\\", "/").split("/") if p.strip()]
+    if not parts:
+        return Response(status_code=400, content="Invalid compositePath", media_type="text/plain")
+    for part in parts:
+        if not part.replace("_", "").replace("-", "").isalnum():
+            return Response(status_code=400, content="Invalid compositePath segment", media_type="text/plain")
+    if not isinstance(geoms, dict):
+        return Response(status_code=400, content="Missing geoms", media_type="text/plain")
+
+    comp_dir = PRESENTATION_DIR / "groups"
+    for part in parts:
+        comp_dir = comp_dir / part
+    comp_dir.mkdir(parents=True, exist_ok=True)
+    if isinstance(elements_text, str):
+        (comp_dir / "elements.txt").write_text(elements_text, encoding="utf-8")
+
+    out_path = comp_dir / "geometries.csv"
+    # Include parent for hierarchical composite groups.
+    fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align", "parent"]
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for gid, g in geoms.items():
+            if not isinstance(g, dict):
+                continue
+            w.writerow(
+                {
+                    "id": gid,
+                    "view": "composite",
+                    "x": g.get("x", ""),
+                    "y": g.get("y", ""),
+                    "w": g.get("w", ""),
+                    "h": g.get("h", ""),
+                    "rotationDeg": g.get("rotationDeg", ""),
+                    "anchor": g.get("anchor", ""),
+                    "align": g.get("align", ""),
+                    "parent": g.get("parent", ""),
+                }
+            )
+    return {"ok": True, "compositePath": "/".join(parts)}
+
+
 @app.get("/api/presentation")
 def get_presentation(request: Request):
     pres = load_presentation()
@@ -74,6 +179,9 @@ _JOINED: list[dict] = []
 _TIMER_ACCEPTING = False
 _TIMER_SAMPLES_MS: list[float] = []
 
+# ---- Multiple-choice polls (pie chart) ----
+_CHOICES_STATE: dict[str, dict] = {}
+
 
 def _timer_stats():
     n = len(_TIMER_SAMPLES_MS)
@@ -84,6 +192,38 @@ def _timer_stats():
         return {"n": n, "meanMs": mean, "sigmaMs": 0.0}
     var = sum((x - mean) ** 2 for x in _TIMER_SAMPLES_MS) / (n - 1)
     return {"n": n, "meanMs": mean, "sigmaMs": math.sqrt(max(0.0, var))}
+
+
+def _load_choice_node(poll_id: str) -> dict | None:
+    try:
+        pres = load_presentation()
+    except Exception:
+        return None
+    for n in pres.payload.get("nodes", []):
+        if n.get("id") == poll_id and n.get("type") == "choices":
+            return n
+    return None
+
+
+def _ensure_choice_state(poll_id: str) -> tuple[dict | None, dict | None]:
+    meta = _load_choice_node(poll_id)
+    if not meta:
+        return None, None
+    opts = meta.get("options") or []
+    state = _CHOICES_STATE.setdefault(
+        poll_id, {"accepting": False, "votes": {}, "question": meta.get("question", ""), "bullets": meta.get("bullets")}
+    )
+    votes = state.get("votes") if isinstance(state.get("votes"), dict) else {}
+    cleaned: dict[str, int] = {}
+    for opt in opts:
+        oid = str(opt.get("id") or "").strip()
+        if not oid:
+            continue
+        cleaned[oid] = int(votes.get(oid, 0))
+    state["votes"] = cleaned
+    state["question"] = meta.get("question", state.get("question", ""))
+    state["bullets"] = meta.get("bullets", state.get("bullets"))
+    return state, meta
 
 
 @app.get("/phone/timer")
@@ -223,6 +363,148 @@ def phone_timer():
     return Response(content=html, media_type="text/html")
 
 
+@app.get("/phone/choices")
+def phone_choices():
+    html = """<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1"/>
+    <title>Poll</title>
+    <style>
+      :root { color-scheme: dark; }
+      body { margin:0; background:#0b1020; color:rgba(255,255,255,0.92); font-family:system-ui,Segoe UI,Roboto,Arial; }
+      .wrap { min-height:100vh; display:grid; place-items:center; padding:20px; }
+      .card { width:min(560px, 100%); border:1px solid rgba(255,255,255,0.14); border-radius:16px; background:rgba(255,255,255,0.06); padding:16px; box-sizing:border-box; }
+      h1 { font-size:20px; margin:0 0 10px; flex: 1 1 auto; min-width: 0; overflow-wrap:anywhere; }
+      p { margin:0 0 10px; color:rgba(255,255,255,0.7); }
+      .badge { display:inline-block; padding:6px 10px; border-radius:999px; border:1px solid rgba(255,255,255,0.16); background:rgba(255,255,255,0.06); font-size:12px; white-space:nowrap; }
+      .badge.open { border-color: rgba(110,168,255,0.34); background: rgba(110,168,255,0.22); color: rgba(255,255,255,0.95); }
+      .opt { display:flex; flex-direction:column; gap:6px; margin-top:10px; }
+      .opt button { width:100%; text-align:left; padding:12px; border-radius:12px; border:1px solid rgba(255,255,255,0.14); background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.92); font-weight:800; cursor:pointer; }
+      .opt button:disabled { opacity:0.6; cursor:not-allowed; }
+      .opt .meta { font-size:13px; color:rgba(255,255,255,0.7); padding-left:4px; }
+      .muted { color:rgba(255,255,255,0.7); font-size:13px; margin-top:8px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px; flex-wrap:wrap;">
+          <h1 id="question">Poll</h1>
+          <span class="badge" id="status">Stand by…</span>
+        </div>
+        <div class="muted" id="total">0 votes</div>
+        <div id="options"></div>
+        <div class="muted" id="hint">Waiting for poll…</div>
+      </div>
+    </div>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      let pollId = params.get('pollId') || '';
+      const questionEl = document.getElementById('question');
+      const statusEl = document.getElementById('status');
+      const optsEl = document.getElementById('options');
+      const totalEl = document.getElementById('total');
+      const hintEl = document.getElementById('hint');
+
+      function bullet(idx, style) {
+        const i = idx + 1;
+        if (style === 'a') return String.fromCharCode(96 + i) + '.';
+        if (style === 'A') return String.fromCharCode(64 + i) + '.';
+        if (style === 'I') {
+          const romans = ['I','II','III','IV','V','VI','VII','VIII','IX','X','XI','XII','XIII','XIV','XV','XVI','XVII','XVIII','XIX','XX'];
+          return (romans[i-1] || i) + '.';
+        }
+        return i + '.';
+      }
+
+      async function fetchActivePollId() {
+        try {
+          const r = await fetch('/api/choices/active', { cache:'no-store' });
+          if (!r.ok) return '';
+          const j = await r.json();
+          return j && j.pollId ? j.pollId : '';
+        } catch { return ''; }
+      }
+
+      async function fetchState() {
+        if (!pollId) pollId = await fetchActivePollId();
+        if (!pollId) return null;
+        try {
+          const res = await fetch('/api/choices/state?pollId=' + encodeURIComponent(pollId), { cache:'no-store' });
+          if (!res.ok) return null;
+          return await res.json();
+        } catch { return null; }
+      }
+
+      async function vote(optionId) {
+        if (!pollId) return;
+        try {
+          await fetch('/api/choices/vote', {
+            method:'POST',
+            headers:{'content-type':'application/json'},
+            body: JSON.stringify({ pollId, optionId })
+          });
+        } catch {}
+        await refresh();
+      }
+
+      function render(state) {
+        if (!state) {
+          statusEl.textContent = 'Stand by…';
+          statusEl.classList.remove('open');
+          questionEl.textContent = 'Poll';
+          hintEl.textContent = 'Waiting for poll…';
+          optsEl.innerHTML = '';
+          totalEl.textContent = '';
+          return;
+        }
+        questionEl.textContent = state.question || 'Poll';
+        const accepting = !!state.accepting;
+        statusEl.textContent = accepting ? 'Open' : 'Closed';
+        statusEl.classList.toggle('open', accepting);
+        totalEl.textContent = `${state.totalVotes ?? 0} vote${(state.totalVotes||0) === 1 ? '' : 's'}`;
+        hintEl.textContent = accepting ? 'Tap an option to vote' : 'Poll is closed';
+        optsEl.innerHTML = '';
+        const style = (state.bullets || 'A').toString();
+        (state.options || []).forEach((opt, idx) => {
+          const row = document.createElement('div');
+          row.className = 'opt';
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const label = String(opt.label || ('Option ' + (idx + 1)));
+          btn.textContent = `${bullet(idx, style)} ${label}`;
+          const color = String(opt.color || '').trim();
+          if (color) {
+            btn.style.borderColor = color;
+            btn.style.background = color;
+            btn.style.color = '#000';
+          }
+          btn.disabled = !accepting;
+          btn.addEventListener('click', () => vote(opt.id));
+          const meta = document.createElement('div');
+          meta.className = 'meta';
+          const pct = Math.round(opt.percent ?? 0);
+          meta.textContent = `${opt.votes ?? 0} vote${(opt.votes||0) === 1 ? '' : 's'} · ${pct}%`;
+          row.append(btn, meta);
+          optsEl.appendChild(row);
+        });
+      }
+
+      async function refresh() {
+        const st = await fetchState();
+        render(st);
+        setTimeout(refresh, 900);
+      }
+      refresh();
+    </script>
+  </body>
+</html>
+"""
+    return Response(content=html, media_type="text/html")
+
+
 @app.get("/api/timer/state")
 def timer_state():
     return {"accepting": _TIMER_ACCEPTING, "samplesMs": _TIMER_SAMPLES_MS[-500:], "stats": _timer_stats(), "serverTimeMs": int(time.time() * 1000)}
@@ -261,6 +543,173 @@ def timer_submit(payload: dict = Body(...)):
         return Response(status_code=400, content="Out of range", media_type="text/plain")
     _TIMER_SAMPLES_MS.append(ms)
     return {"ok": True}
+
+
+@app.get("/api/choices/state")
+def choices_state(pollId: str):
+    poll_id = (pollId or "").strip()
+    state, meta = _ensure_choice_state(poll_id)
+    if not state or not meta:
+        return Response(status_code=404, content="Unknown pollId", media_type="text/plain")
+    votes = state.get("votes", {}) if isinstance(state.get("votes"), dict) else {}
+    opts = meta.get("options") or []
+    total = 0
+    for v in votes.values():
+        try:
+            total += int(v)
+        except Exception:
+            continue
+    out_opts = []
+    for opt in opts:
+        oid = str(opt.get("id") or "").strip()
+        if not oid:
+            continue
+        count = int(votes.get(oid, 0))
+        pct = (count / total * 100.0) if total > 0 else 0.0
+        out_opts.append(
+            {
+                "id": oid,
+                "label": opt.get("label", ""),
+                "color": opt.get("color"),
+                "votes": count,
+                "percent": pct,
+            }
+        )
+    return {
+        "pollId": poll_id,
+        "question": meta.get("question", ""),
+        "bullets": meta.get("bullets"),
+        "chart": meta.get("chart") or "pie",
+        "options": out_opts,
+        "accepting": bool(state.get("accepting")),
+        "totalVotes": total,
+    }
+
+
+@app.get("/api/choices/active")
+def choices_active():
+    # Return the first poll that is currently accepting votes.
+    for pid, st in _CHOICES_STATE.items():
+        if st.get("accepting"):
+            _, meta = _ensure_choice_state(pid)
+            if not meta:
+                continue
+            return {
+                "pollId": pid,
+                "question": meta.get("question", ""),
+                "bullets": meta.get("bullets"),
+                "chart": meta.get("chart") or "pie",
+                "options": meta.get("options") or [],
+            }
+    return {}
+
+
+@app.post("/api/choices/start")
+def choices_start(payload: dict = Body(...)):
+    poll_id = str(payload.get("pollId") or "").strip()
+    reset_votes = bool(payload.get("reset", False))
+    state, meta = _ensure_choice_state(poll_id)
+    if not state or not meta:
+        return Response(status_code=404, content="Unknown pollId", media_type="text/plain")
+    if reset_votes:
+        votes: dict[str, int] = {}
+        for opt in meta.get("options") or []:
+            oid = str(opt.get("id") or "").strip()
+            if not oid:
+                continue
+            votes[oid] = 0
+        state["votes"] = votes
+    state["accepting"] = True
+    return {"ok": True, "pollId": poll_id}
+
+
+@app.post("/api/choices/stop")
+def choices_stop(payload: dict = Body(...)):
+    poll_id = str(payload.get("pollId") or "").strip()
+    state, meta = _ensure_choice_state(poll_id)
+    if not state or not meta:
+        return Response(status_code=404, content="Unknown pollId", media_type="text/plain")
+    state["accepting"] = False
+    return {"ok": True, "pollId": poll_id}
+
+
+@app.post("/api/choices/reset")
+def choices_reset(payload: dict = Body(...)):
+    poll_id = str(payload.get("pollId") or "").strip()
+    state, meta = _ensure_choice_state(poll_id)
+    if not state or not meta:
+        return Response(status_code=404, content="Unknown pollId", media_type="text/plain")
+    votes: dict[str, int] = {}
+    for opt in meta.get("options") or []:
+        oid = str(opt.get("id") or "").strip()
+        if not oid:
+            continue
+        votes[oid] = 0
+    state["votes"] = votes
+    return {"ok": True, "pollId": poll_id}
+
+
+@app.post("/api/choices/simulate")
+def choices_simulate(payload: dict = Body(...)):
+    """
+    Simulate votes WITHOUT opening the poll.
+    This is used by the presenter "Test" button and must not affect phone standby.
+    """
+    poll_id = str(payload.get("pollId") or "").strip()
+    users = payload.get("users", 30)
+    reset_votes = bool(payload.get("reset", True))
+    try:
+        users_i = int(users)
+    except Exception:
+        users_i = 30
+    users_i = max(0, min(2000, users_i))
+
+    state, meta = _ensure_choice_state(poll_id)
+    if not state or not meta:
+        return Response(status_code=404, content="Unknown pollId", media_type="text/plain")
+
+    opts = meta.get("options") or []
+    ids: list[str] = []
+    for opt in opts:
+        oid = str(opt.get("id") or "").strip()
+        if oid:
+            ids.append(oid)
+    if not ids:
+        return Response(status_code=400, content="No options", media_type="text/plain")
+
+    # Always keep accepting unchanged (do NOT start/stop).
+    votes: dict[str, int] = state.get("votes") if isinstance(state.get("votes"), dict) else {}
+    if reset_votes:
+        votes = {oid: 0 for oid in ids}
+    else:
+        # Ensure all ids exist.
+        for oid in ids:
+            votes.setdefault(oid, 0)
+
+    # Random votes
+    for _ in range(users_i):
+        oid = random.choice(ids)
+        votes[oid] = int(votes.get(oid, 0)) + 1
+
+    state["votes"] = votes
+    return {"ok": True, "pollId": poll_id, "users": users_i}
+
+
+@app.post("/api/choices/vote")
+def choices_vote(payload: dict = Body(...)):
+    poll_id = str(payload.get("pollId") or "").strip()
+    option_id = str(payload.get("optionId") or "").strip()
+    state, meta = _ensure_choice_state(poll_id)
+    if not state or not meta:
+        return Response(status_code=404, content="Unknown pollId", media_type="text/plain")
+    if not state.get("accepting"):
+        return Response(status_code=409, content="Not accepting", media_type="text/plain")
+    votes: dict[str, int] = state.get("votes") if isinstance(state.get("votes"), dict) else {}
+    if option_id not in votes:
+        return Response(status_code=400, content="Unknown optionId", media_type="text/plain")
+    votes[option_id] = int(votes.get(option_id, 0)) + 1
+    state["votes"] = votes
+    return {"ok": True, "pollId": poll_id, "optionId": option_id}
 
 
 @app.post("/api/timer/composite/save")
@@ -365,8 +814,18 @@ def join_page():
         if (res.ok) {
           document.getElementById('formCard').style.display='none';
           document.getElementById('okCard').style.display='block';
-          // If a timer session starts, redirect to the phone timer UI.
+          // If an interactive element starts, redirect to the appropriate phone UI.
           const poll = async () => {
+            try {
+              const pc = await fetch('/api/choices/active', { cache: 'no-store' });
+              if (pc.ok) {
+                const jc = await pc.json();
+                if (jc && jc.pollId) {
+                  window.location.href = '/phone/choices?pollId=' + encodeURIComponent(jc.pollId);
+                  return;
+                }
+              }
+            } catch {}
             try {
               const r = await fetch('/api/timer/state', { cache: 'no-store' });
               if (r.ok) {
@@ -411,7 +870,19 @@ def save_presentation(payload: dict = Body(...)):
     if not isinstance(nodes, list):
         return Response(status_code=400, content="Invalid nodes", media_type="text/plain")
 
-    write_presentation_txt(pres_dir / "presentation.txt", payload)
+    # Debug: print choices nodes to see what we're receiving
+    for n in nodes:
+        if n.get("type") == "choices":
+            print(f"[DEBUG] Choices node: {n.get('id')}")
+            print(f"[DEBUG]   options type: {type(n.get('options'))}")
+            opts = n.get('options')
+            print(f"[DEBUG]   options value: {opts}")
+            if isinstance(opts, list):
+                print(f"[DEBUG]   options count: {len(opts)}")
+                for i, opt in enumerate(opts):
+                    print(f"[DEBUG]     opt[{i}] type={type(opt)}: {opt}")
+
+    write_presentation_txt(pres_dir / "presentation.pr", payload)
     write_geometries_csv(pres_dir / "geometries.csv", payload)
     write_animations_csv(pres_dir / "animations.csv", nodes)
     return {"ok": True}

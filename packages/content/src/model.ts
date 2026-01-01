@@ -1,6 +1,15 @@
 export type Space = "world" | "screen";
 
-export type NodeType = "text" | "image" | "qr" | "htmlFrame" | "group" | "bullets" | "table" | "timer";
+export type NodeType =
+  | "text"
+  | "image"
+  | "qr"
+  | "htmlFrame"
+  | "group"
+  | "bullets"
+  | "table"
+  | "timer"
+  | "choices";
 
 export type Anchor =
   | "topLeft"
@@ -52,6 +61,12 @@ export interface BaseNodeModel {
   id: string;
   type: NodeType;
   space: Space;
+  /** Optional background fill color (CSS color or hex/rgba tuple). */
+  bgColor?: string;
+  /** Optional background alpha (0..1) when bg provided without alpha. */
+  bgAlpha?: number;
+  /** Optional border radius in CSS pixels. */
+  borderRadius?: number;
   zIndex?: number;
   transform: Transform2D;
   /** Optional hierarchical parent (used by `group`). If set, transform is interpreted in parent-local coords. */
@@ -66,6 +81,7 @@ export interface TextNodeModel extends BaseNodeModel {
   type: "text";
   text: string;
   align?: "left" | "center" | "right";
+  vAlign?: "top" | "center" | "bottom";
   /** Font size in world/design pixels (scaled by camera zoom at render time). */
   fontPx?: number;
 }
@@ -88,6 +104,7 @@ export interface HtmlFrameNodeModel extends BaseNodeModel {
 export interface BulletsNodeModel extends BaseNodeModel {
   type: "bullets";
   items: string[];
+  bullets?: "a" | "A" | "1" | "I" | "X" | "i" | "." | "-";
 }
 
 export interface TableNodeModel extends BaseNodeModel {
@@ -114,6 +131,29 @@ export interface TimerNodeModel extends BaseNodeModel {
   compositeDir?: string;
 }
 
+export interface ChoiceOption {
+  id: string;
+  label: string;
+  color?: string;
+}
+
+export interface ChoicesNodeModel extends BaseNodeModel {
+  type: "choices";
+  question: string;
+  /** Options as defined in presentation.txt (order preserved). */
+  options: ChoiceOption[];
+  /** Rendering style; currently only "pie" is supported. */
+  chart?: "pie";
+  /**
+   * Bullet marker style for the option list:
+   * - "a": a, b, c, ...
+   * - "A": A, B, C, ...
+   * - "1": 1, 2, 3, ...
+   * - "I": I, II, III, ...
+   */
+  bullets?: "a" | "A" | "1" | "I";
+}
+
 export interface GroupNodeModel extends BaseNodeModel {
   type: "group";
 }
@@ -126,6 +166,7 @@ export type NodeModel =
   | BulletsNodeModel
   | TableNodeModel
   | TimerNodeModel
+  | ChoicesNodeModel
   | GroupNodeModel
   | BaseNodeModel;
 

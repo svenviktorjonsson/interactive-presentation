@@ -43,7 +43,7 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
     id,view,x,y,w,h,rotationDeg,anchor,align
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align", "fontH", "parent"]
+    fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align", "vAlign", "fontH", "parent"]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -53,10 +53,13 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
 
         node_to_view: dict[str, str] = {}
         view_center: dict[str, tuple[float, float]] = {}
+        screen_views: set[str] = set()
         for v in views:
             vid = str(v.get("id", "home"))
             cam = v.get("camera") or {}
             view_center[vid] = (float(cam.get("cx", 0.0) or 0.0), float(cam.get("cy", 0.0) or 0.0))
+            if v.get("screen"):
+                screen_views.add(vid)
             for nid in v.get("show", []) or []:
                 if nid not in node_to_view:
                     node_to_view[nid] = vid
@@ -64,7 +67,17 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
         for n in nodes:
             t = n.get("transform") or {}
             design_h = float(defaults.get("designHeight", 1080.0) or 1080.0)
-            view_id = node_to_view.get(str(n.get("id", "")), "home")
+            node_id = str(n.get("id", ""))
+            view_id = node_to_view.get(node_id, "home")
+            is_screen = n.get("space") == "screen"
+            
+            # For screen-space nodes, keep them in their screen view
+            if is_screen and view_id not in screen_views:
+                # Find a screen view for this node
+                for sv in screen_views:
+                    view_id = sv
+                    break
+            
             cx, cy = view_center.get(view_id, (0.0, 0.0))
             parent_id = str(n.get("parentId") or "").strip()
             if parent_id:
@@ -73,6 +86,13 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
                 yn = float(t.get("y", 0.0) or 0.0)
                 wn = float(t.get("w", 0.1) or 0.1)
                 hn = float(t.get("h", 0.05) or 0.05)
+            elif is_screen:
+                # Screen-space nodes: store as normalized screen coordinates (already 0-1 range)
+                # Screen coordinates are stored directly without view offset conversion
+                xn = float(t.get("x", 0.0) or 0.0) / design_h
+                yn = float(t.get("y", 0.0) or 0.0) / design_h
+                wn = float(t.get("w", 100.0) or 100.0) / design_h
+                hn = float(t.get("h", 50.0) or 50.0) / design_h
             else:
                 # Root node: convert world pixels -> view-relative normalized coords.
                 # We use the "design viewport" height as 1.0 unit.
@@ -89,7 +109,7 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
                 font_h = ""
             w.writerow(
                 {
-                    "id": n.get("id", ""),
+                    "id": node_id,
                     "view": view_id,
                     "x": xn,
                     "y": yn,
@@ -98,6 +118,7 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
                     "rotationDeg": t.get("rotationDeg", ""),
                     "anchor": t.get("anchor", "topLeft"),
                     "align": n.get("align", ""),
+                    "vAlign": n.get("vAlign", ""),
                     "fontH": font_h,
                     "parent": parent_id,
                 }
@@ -153,11 +174,9 @@ def write_animations_csv(path: Path, nodes: list[dict[str, Any]]) -> None:
 
 def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
     """
-    Canonical serializer for presentation.txt v1.
-    Writes only what is needed to reconstruct content+views; geometry and animations live in CSV files.
+    Write presentation.pr (v1 canonical DSL format).
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-
+    # New serializer with screen support
     nodes_by_id: dict[str, dict[str, Any]] = {n["id"]: n for n in model.get("nodes", []) if "id" in n}
     views: list[dict[str, Any]] = model.get("views", []) or [{"id": "home", "camera": {"cx": 0, "cy": 0, "zoom": 1}, "show": list(nodes_by_id.keys())}]
 
@@ -165,13 +184,154 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
     lines.append("# presentation.txt v1 (canonical)")
     lines.append("")
 
+    def style_params(node: dict[str, Any]) -> list[str]:
+        params: list[str] = []
+        bg = (node.get("bgColor") or "").strip() if isinstance(node.get("bgColor"), str) else ""
+        if bg:
+            params.append(f"bgColor={_safe_str(bg)}")
+        ba = node.get("bgAlpha")
+        if isinstance(ba, (int, float)):
+            params.append(f"bgAlpha={ba}")
+        br = node.get("borderRadius")
+        if isinstance(br, (int, float)):
+            params.append(f"borderRadius={br}")
+        return params
+
+    def write_node(n: dict[str, Any]) -> None:
+        node_id = n.get("id")
+        t = n.get("type")
+        if t == "text":
+            params = [f"name={node_id}"] + style_params(n)
+            lines.append(f"text[{','.join(params)}]:")
+            content = (n.get("text") or "").rstrip("\n")
+            if content:
+                for ln in content.splitlines():
+                    lines.append(_safe_str(ln))
+            lines.append("")
+            return
+        if t == "qr":
+            url = (n.get("url") or "/join").strip() or "/join"
+            params = [f"name={node_id}"] + style_params(n)
+            if url != "/join":
+                params.append(f'url="{_safe_str(str(url))}"')
+            lines.append(f"qr[{','.join(params)}]")
+            return
+        if t == "htmlFrame":
+            src = n.get("src")
+            params = [f"name={node_id}"] + style_params(n)
+            if src:
+                params.append(f'src="{_safe_str(str(src))}"')
+            lines.append(f"iframe[{','.join(params)}]")
+            return
+        if t == "image":
+            src = n.get("src")
+            params = [f"name={node_id}"] + style_params(n)
+            if src and str(src) != f"/media/{node_id}.png":
+                params.append(f'file="{_safe_str(str(src))}"')
+            lines.append(f"image[{','.join(params)}]")
+            return
+        if t == "bullets":
+            bullet_style = (n.get("bullets") or "").strip()
+            params = [f"name={node_id}"] + style_params(n)
+            if bullet_style:
+                params.append(f"type={_safe_str(str(bullet_style))}")
+            lines.append(f"bullets[{','.join(params)}]:")
+            for item in n.get("items", []) or []:
+                lines.append(_safe_str(str(item)))
+            lines.append("")
+            return
+        if t == "table":
+            delim = n.get("delimiter") or ";"
+            params = [f"name={node_id}", f'delim="{_safe_str(str(delim))}"'] + style_params(n)
+            lines.append(f"table[{','.join(params)}]:")
+            for row in n.get("rows", []) or []:
+                lines.append(_safe_str(delim.join([str(c) for c in row])))
+            lines.append("")
+            return
+        if t == "choices":
+            params = [f"name={node_id}"] + style_params(n)
+            chart = n.get("chart") or "pie"
+            if chart:
+                params.append(f"type={_safe_str(str(chart))}")
+            bullets = (n.get("bullets") or "").strip()
+            if bullets:
+                params.append(f"bullets={_safe_str(str(bullets))}")
+            opts = n.get("options") or []
+            opt_parts: list[str] = []
+            # Handle options as list of dicts (standard format)
+            if isinstance(opts, list):
+                for opt in opts:
+                    if not isinstance(opt, dict):
+                        continue
+                    label = str(opt.get("label") or "").strip()
+                    color = str(opt.get("color") or "").strip()
+                    if not label:
+                        continue
+                    if color:
+                        opt_parts.append(f"{_safe_str(label)}:{_safe_str(color)}")
+                    else:
+                        opt_parts.append(_safe_str(label))
+            if opt_parts:
+                params.append("choices={" + ",".join(opt_parts) + "}")
+            lines.append(f"choices[{','.join(params)}]:")
+            question = (n.get("question") or "").rstrip("\n")
+            if question:
+                for ln in question.splitlines():
+                    lines.append(_safe_str(ln))
+            lines.append("")
+            return
+        if t == "group":
+            params = [f"name={node_id}"] + style_params(n)
+            lines.append(f"group[{','.join(params)}]")
+            return
+        if t == "timer":
+            params = [f"name={node_id}"]
+            args = n.get("args") if isinstance(n.get("args"), dict) else {}
+            if "showTime" not in args and "showTime" in n:
+                args["showTime"] = 1 if bool(n.get("showTime")) else 0
+            if "barColor" not in args and n.get("barColor"):
+                args["barColor"] = n.get("barColor")
+            if "lineColor" not in args and n.get("lineColor"):
+                args["lineColor"] = n.get("lineColor")
+            if "lineWidth" not in args and isinstance(n.get("lineWidth"), (int, float)):
+                args["lineWidth"] = n.get("lineWidth")
+            if "stat" not in args and n.get("stat"):
+                args["stat"] = n.get("stat")
+            if "min" not in args and isinstance(n.get("minS"), (int, float)):
+                args["min"] = n.get("minS")
+            if "max" not in args and isinstance(n.get("maxS"), (int, float)):
+                args["max"] = n.get("maxS")
+            if "binSize" not in args and isinstance(n.get("binSizeS"), (int, float)):
+                args["binSize"] = n.get("binSizeS")
+            for k in sorted([k for k in args.keys() if k != "name"]):
+                params.append(f"{_safe_str(str(k))}={_fmt_param_value(args.get(k))}")
+            lines.append(f"timer[{','.join(params)}]")
+            return
+        raise ValueError(f"write_presentation_txt: unsupported node type {t!r} (id={node_id!r})")
+
+    # Emit screen views first (views marked screen=True), preserving order.
     for v in views:
+        if not v.get("screen"):
+            continue
+        vid = v.get("id", "screen")
+        lines.append(f"screen[name={_safe_str(str(vid))}]:")
+        lines.append("")
+        for node_id in v.get("show", []):
+            n = nodes_by_id.get(node_id)
+            if not n or n.get("space") != "screen":
+                continue
+            write_node(n)
+        lines.append("")
+
+    # Emit normal views.
+    for v in views:
+        if v.get("screen"):
+            continue
         vid = v.get("id", "home")
         view_params = [f"name={vid}"]
 
         cam_spec = v.get("cameraSpec")
         if isinstance(cam_spec, dict) and cam_spec:
-            # Only the new syntax is allowed.
             ref_view = str(cam_spec.get("refView") or "").strip()
             loc = str(cam_spec.get("loc") or "").strip()
             if ref_view:
@@ -187,100 +347,11 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
         show = v.get("show", [])
         for node_id in show:
             n = nodes_by_id.get(node_id)
-            if not n:
+            if not n or n.get("space") == "screen":
                 continue
-            t = n.get("type")
+            write_node(n)
 
-            if t == "text":
-                lines.append(f"text[name={node_id}]:")
-                content = (n.get("text") or "").rstrip("\n")
-                if content:
-                    for ln in content.splitlines():
-                        lines.append(_safe_str(ln))
-                lines.append("")  # spacer
-                continue
-
-            if t == "qr":
-                url = (n.get("url") or "/join").strip() or "/join"
-                params = [f"name={node_id}"]
-                # Do NOT persist the public tunnel URL into presentation.txt.
-                # Treat /join as the default (QR is a special join node).
-                if url != "/join":
-                    params.append(f'url="{_safe_str(str(url))}"')
-                lines.append(f"qr[{','.join(params)}]")
-                continue
-
-            if t == "htmlFrame":
-                src = n.get("src")
-                params = [f"name={node_id}"]
-                if src:
-                    params.append(f'src="{_safe_str(str(src))}"')
-                lines.append(f"iframe[{','.join(params)}]")
-                continue
-
-            if t == "image":
-                # Media-by-name: prefer the implicit /media/<name>.png convention
-                src = n.get("src")
-                params = [f"name={node_id}"]
-                if src and str(src) != f"/media/{node_id}.png":
-                    params.append(f'file="{_safe_str(str(src))}"')
-                lines.append(f"image[{','.join(params)}]")
-                continue
-
-            if t == "bullets":
-                lines.append(f"bullets[name={node_id}]:")
-                for item in n.get("items", []) or []:
-                    lines.append(_safe_str(str(item)))
-                lines.append("")
-                continue
-
-            if t == "table":
-                delim = n.get("delimiter") or ";"
-                lines.append(f"table[name={node_id},delim=\"{_safe_str(str(delim))}\"]:")
-                for row in n.get("rows", []) or []:
-                    lines.append(_safe_str(delim.join([str(c) for c in row])))
-                lines.append("")
-                continue
-
-            if t == "group":
-                lines.append(f"group[name={node_id}]")
-                continue
-
-            if t == "timer":
-                # Timer composite node. Persist its args so it can regenerate its composite folder.
-                params = [f"name={node_id}"]
-                # Prefer explicit args map (parsed from timer[...] in presentation.txt)
-                args = n.get("args") if isinstance(n.get("args"), dict) else {}
-                # Add canonical fields if present but missing from args.
-                # (Backend loader stores min/max/binSize as minS/maxS/binSizeS in seconds.)
-                if "showTime" not in args and "showTime" in n:
-                    args["showTime"] = 1 if bool(n.get("showTime")) else 0
-                if "barColor" not in args and n.get("barColor"):
-                    args["barColor"] = n.get("barColor")
-                if "lineColor" not in args and n.get("lineColor"):
-                    args["lineColor"] = n.get("lineColor")
-                if "lineWidth" not in args and isinstance(n.get("lineWidth"), (int, float)):
-                    args["lineWidth"] = n.get("lineWidth")
-                if "stat" not in args and n.get("stat"):
-                    args["stat"] = n.get("stat")
-                if "min" not in args and isinstance(n.get("minS"), (int, float)):
-                    args["min"] = n.get("minS")
-                if "max" not in args and isinstance(n.get("maxS"), (int, float)):
-                    args["max"] = n.get("maxS")
-                if "binSize" not in args and isinstance(n.get("binSizeS"), (int, float)):
-                    args["binSize"] = n.get("binSizeS")
-
-                # Emit args (stable order, skip name)
-                for k in sorted([k for k in args.keys() if k != "name"]):
-                    params.append(f"{_safe_str(str(k))}={_fmt_param_value(args.get(k))}")
-                lines.append(f"timer[{','.join(params)}]")
-                continue
-
-            # If we reach here, we have a node type we don't know how to serialize yet.
-            # Fail loudly instead of silently dropping nodes from presentation.txt.
-            raise ValueError(f"write_presentation_txt: unsupported node type {t!r} (id={node_id!r})")
-
-        lines.append("")  # spacer between views
+        lines.append("")
 
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
