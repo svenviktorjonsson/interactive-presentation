@@ -10,6 +10,7 @@
     { "include": "#element-bullets" },
     { "include": "#element-choices" },
     { "include": "#element-timer" },
+    { "include": "#element-table" },
     { "include": "#element-generic" },
     { "include": "#content" }
   ],
@@ -89,6 +90,33 @@
         "5": { "name": "punctuation.separator.colon.pr" },
         "6": { "name": "meta.content.pr" }
       }
+    },
+    "element-table": {
+      "name": "meta.element.table.pr",
+      "begin": "^(table)(\\[)([^\\]]*)(\\])(\\s*:)\\s*$",
+      "beginCaptures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" }
+      },
+      "end": "^(?=[a-zA-Z_]\\w*\\[[^\\]]+\\])",
+      "patterns": [
+        { "include": "#comment" },
+        {
+          "name": "punctuation.separator.delimiter.pr",
+          "match": ";"
+        },
+        {
+          "name": "constant.numeric.pr",
+          "match": "\\b-?[0-9]+(?:\\.[0-9]+)?\\b"
+        },
+        {
+          "name": "meta.content.pr",
+          "match": ".+"
+        }
+      ]
     },
     "element-generic": {
       "name": "meta.element.generic.pr",
@@ -267,8 +295,12 @@
             "3": {
               "patterns": [
                 {
+                  "name": "support.constant.known.pr",
+                  "match": "\\b(true|false)\\b"
+                },
+                {
                   "name": "constant.numeric.pr",
-                  "match": "^[0-9]+\\.?[0-9]*$"
+                  "match": "\\b-?[0-9]+\\.?[0-9]*\\b"
                 },
                 {
                   "name": "variable.other.arbitrary.pr",

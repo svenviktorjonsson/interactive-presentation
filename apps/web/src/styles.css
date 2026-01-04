@@ -70,6 +70,16 @@ body {
   outline-offset: 0px;
 }
 
+/* Live mode must stay clean: never show editor transform/selection chrome. */
+html[data-ip-mode="live"] .node.is-selected,
+html[data-ip-mode="live"] .timer-sub.is-selected,
+html[data-ip-mode="live"] .comp-sub.is-selected {
+  outline: none !important;
+}
+html[data-ip-mode="live"] .handles {
+  display: none !important;
+}
+
 .node-qr {
   display: block;
 }
@@ -120,12 +130,31 @@ body {
   border: none;
   border-radius: 0;
   background: transparent;
-  padding: 12px;
+  padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 0;
   box-sizing: border-box;
   --ui-scale: 1;
+}
+
+/* Smooth zoom scaling (avoid "jumping" when --ui-scale changes). */
+.node-choices .choices-headerbar,
+.node-choices .choices-btn,
+.node-choices .choices-question,
+.node-choices .choices-list,
+.node-choices .choices-row,
+.node-choices .choices-label,
+.node-choices .choices-swatch,
+.node-choices .choices-meta {
+  transition:
+    font-size 80ms linear,
+    line-height 80ms linear,
+    padding 80ms linear,
+    gap 80ms linear,
+    top 80ms linear,
+    width 80ms linear,
+    height 80ms linear;
 }
 
 .node-choices .choices-frame {
@@ -144,6 +173,23 @@ body {
   box-sizing: border-box;
 }
 
+/* Smooth, stable zoom scaling for bullets: scale via transform instead of re-rasterizing font sizes. */
+.node-choices .choices-bullets-inner {
+  position: absolute;
+  inset: 0;
+  transform-origin: top left;
+  transform: scale(var(--ui-scale, 1));
+  width: calc(100% / var(--ui-scale, 1));
+  height: calc(100% / var(--ui-scale, 1));
+  padding: 18px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: 12px;
+  /* Let selection handles on the parent stay clickable/visible. */
+  pointer-events: none;
+}
+
 .node-choices .choices-wheel canvas {
   width: 100%;
   height: 100%;
@@ -159,7 +205,7 @@ body {
 
 .node-choices .choices-question {
   font-weight: 800;
-  font-size: 22px;
+  font-size: 28px;
   line-height: 1.25;
 }
 
@@ -192,7 +238,7 @@ body {
 .node-choices .choices-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
 }
 
 .node-choices .choices-row {
@@ -200,23 +246,23 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 10px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  border: none;
 }
 
 .node-choices .choices-label {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
   font-weight: 700;
-  font-size: 18px;
+  font-size: 24px;
 }
 
 .node-choices .choices-swatch {
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 999px;
   border: 2px solid rgba(255, 255, 255, 0.25);
   display: inline-block;
@@ -224,7 +270,7 @@ body {
 
 .node-choices .choices-meta {
   color: var(--muted);
-  font-size: 13px;
+  font-size: 18px;
   white-space: nowrap;
 }
 
@@ -365,6 +411,12 @@ body {
 }
 
 .timer-sub.is-selected {
+  outline: 2px solid rgba(110, 168, 255, 0.9);
+  outline-offset: 0px;
+}
+
+/* Composite sub-elements (choices/timer internal) */
+.comp-sub.is-selected {
   outline: 2px solid rgba(110, 168, 255, 0.9);
   outline-offset: 0px;
 }

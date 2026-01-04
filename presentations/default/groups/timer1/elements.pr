@@ -1,0 +1,14 @@
+# timer composite elements (draft)
+# Delete the whole `groups/<name>/` folder to regenerate defaults.
+# Args passed to timer[...] can be used as {arg} placeholders here.
+
+# Default labels (editable in composite mode):
+text[name=x_label]: Time (s)
+text[name=y_label]: Procentage (%)
+
+# Stats label (auto-updated via {{...}} binding, editable/positionable):
+text[name=stats]: \mu={{mean}}s    \sigma={{sigma}}s    count={{count}}
+
+# Default arrows (editable in composite mode):
+arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]
+arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]

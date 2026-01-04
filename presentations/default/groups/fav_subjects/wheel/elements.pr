@@ -1,0 +1,9 @@
+# wheel elements.pr (v1)
+# text[name=<optionId>]: <template>
+# Use {{label}} {{percent}} {{votes}} {{totalVotes}}
+text[name=Biologi]: Biologi ({{percent}}%)
+text[name=Kemi]: Kemi ({{percent}}%)
+text[name=Fysik]: Fysik ({{percent}}%)
+text[name=Matematik]: Matematik ({{percent}}%)
+text[name=vrigt]: Övrigt ({{percent}}%)
+text[name=other]: Other ({{percent}}%)

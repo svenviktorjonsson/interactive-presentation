@@ -50,4 +50,9 @@ presentations/**/media/join_qr.png
 # These are generated on-demand from presentation.txt when missing.
 presentations/**/groups/**
 
+# Track author-edited composite DSL definitions (but keep generated layouts ignored).
+!presentations/**/groups/
+!presentations/**/groups/**/
+!presentations/**/groups/**/elements.pr
+
 

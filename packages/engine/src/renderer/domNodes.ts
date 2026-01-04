@@ -105,14 +105,26 @@ function applyTransform(el: HTMLElement, node: NodeModel, px: { x: number; y: nu
   el.style.transform = `rotate(${rot}deg)`;
 }
 
+function _stripGlobal(re: RegExp) {
+  // Avoid stateful/global regex behavior in helpers.
+  const flags = re.flags.replaceAll("g", "");
+  return new RegExp(re.source, flags);
+}
+
+function _ensureGlobal(re: RegExp) {
+  return re.flags.includes("g") ? re : new RegExp(re.source, re.flags + "g");
+}
+
 function expandEllipsisStyle(style: string, targetCount: number, alignRe: RegExp) {
   const s = String(style ?? "").trim();
   if (!s || !s.includes("...")) return s;
+  const alignNoG = _stripGlobal(alignRe);
+  const alignG = _ensureGlobal(alignRe);
   const [pre, post] = s.split("...", 2);
   const prefix = pre ?? "";
   const suffix = post ?? "";
 
-  const countAlign = (x: string) => (x.match(alignRe) ?? []).length;
+  const countAlign = (x: string) => (x.match(alignG) ?? []).length;
   const prefixCount = countAlign(prefix);
   const suffixCount = countAlign(suffix);
   const remaining = targetCount - prefixCount - suffixCount;
@@ -120,10 +132,14 @@ function expandEllipsisStyle(style: string, targetCount: number, alignRe: RegExp
 
   // Repeat segment = substring starting at the last alignment letter in the prefix.
   // Example: "b||c|" + "..." + "||" → repeat "c|" as needed.
-  const prefixAlignMatches = [...prefix.matchAll(alignRe)];
-  if (prefixAlignMatches.length === 0) return s.replace("...", "");
-  const last = prefixAlignMatches[prefixAlignMatches.length - 1];
-  const segStart = last.index ?? Math.max(0, prefix.length - 1);
+  let segStart = -1;
+  for (let i = prefix.length - 1; i >= 0; i--) {
+    if (alignNoG.test(prefix[i]!)) {
+      segStart = i;
+      break;
+    }
+  }
+  if (segStart < 0) return s.replace("...", "");
   const repeatSeg = prefix.slice(segStart);
   return prefix + repeatSeg.repeat(remaining) + suffix;
 }
@@ -133,6 +149,7 @@ function parseLineStyle(spec: string, alignRe: RegExp) {
   // - align letters (order preserved)
   // - boundary thicknesses (count of '|' before each align letter, plus trailing bars)
   const s = String(spec ?? "");
+  const alignNoG = _stripGlobal(alignRe);
   const aligns: string[] = [];
   const bounds: number[] = [];
   let bars = 0;
@@ -142,7 +159,7 @@ function parseLineStyle(spec: string, alignRe: RegExp) {
       bars += 1;
       continue;
     }
-    if (alignRe.test(ch)) {
+    if (alignNoG.test(ch)) {
       // Boundary before this align
       if (aligns.length === 0) bounds[0] = bars;
       else bounds[aligns.length] = bars;

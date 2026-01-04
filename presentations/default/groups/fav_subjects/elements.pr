@@ -1,0 +1,8 @@
+# choices composite elements.pr (v1)
+# Sub-elements (editable via group edit + geometries.csv):
+# - bullets: an element (NOT a group) that renders question + options
+# - wheel: a group whose internals live in wheel/elements.pr + wheel/geometries.csv
+#
+# Buttons are UI controls attached to the choices node, not editable elements.
+bullets[name=bullets]
+wheel[name=wheel]
