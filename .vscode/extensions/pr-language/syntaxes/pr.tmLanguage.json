@@ -1,0 +1,327 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Presentation",
+  "scopeName": "source.pr",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#element-screen" },
+    { "include": "#element-view" },
+    { "include": "#element-arrow" },
+    { "include": "#element-bullets" },
+    { "include": "#element-choices" },
+    { "include": "#element-timer" },
+    { "include": "#element-generic" },
+    { "include": "#content" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.pr",
+      "match": "#.*$"
+    },
+    "element-screen": {
+      "name": "meta.element.screen.pr",
+      "match": "^(screen)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "keyword.control.screen.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+    "element-view": {
+      "name": "meta.element.view.pr",
+      "match": "^(view)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "keyword.control.view.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+    "element-arrow": {
+      "name": "meta.element.arrow.pr",
+      "match": "^(arrow)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+    "element-bullets": {
+      "name": "meta.element.bullets.pr",
+      "match": "^(bullets)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-bullets" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+    "element-choices": {
+      "name": "meta.element.choices.pr",
+      "match": "^(choices|poll)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-choices" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+    "element-timer": {
+      "name": "meta.element.timer.pr",
+      "match": "^(timer)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-timer" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+    "element-generic": {
+      "name": "meta.element.generic.pr",
+      "match": "^(text|image|button|input|video|audio|shape|group)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "string.content.pr" }
+      }
+    },
+
+    "attributes-bullets": {
+      "patterns": [
+        {
+          "comment": "type for bullets - valid: A, a, 1, X, i, I, ., -",
+          "match": "(type)(=)(A|a|1|X|i|I|\\.|-)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "type for bullets - invalid",
+          "match": "(type)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.type.pr" }
+          }
+        },
+        { "include": "#attributes-common" }
+      ]
+    },
+
+    "attributes-choices": {
+      "patterns": [
+        {
+          "comment": "type for choices - valid: pie, bar, horizontal, vertical",
+          "match": "(type)(=)(pie|bar|horizontal|vertical)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "type for choices - invalid",
+          "match": "(type)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.type.pr" }
+          }
+        },
+        {
+          "comment": "bullets attr for choices - valid: A, a, 1, i, I",
+          "match": "(bullets)(=)(A|a|1|i|I)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "bullets attr for choices - invalid",
+          "match": "(bullets)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.bullets.pr" }
+          }
+        },
+        { "include": "#attributes-common" }
+      ]
+    },
+
+    "attributes-timer": {
+      "patterns": [
+        {
+          "comment": "stat for timer - valid: gaussian, linear, uniform, normal",
+          "match": "(stat)(=)(gaussian|linear|uniform|normal)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "stat for timer - invalid",
+          "match": "(stat)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.stat.pr" }
+          }
+        },
+        { "include": "#attributes-common" }
+      ]
+    },
+
+    "attributes-common": {
+      "patterns": [
+        {
+          "comment": "color attributes - valid colors",
+          "match": "(bgColor|barColor|lineColor|fgColor|color|fillColor|strokeColor)(=)(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey|transparent)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "color attributes - invalid color",
+          "match": "(bgColor|barColor|lineColor|fgColor|color|fillColor|strokeColor)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.color.pr" }
+          }
+        },
+        {
+          "comment": "loc attribute - valid locations",
+          "match": "(loc)(=)(left|right|up|down|top|bottom|center)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "loc attribute - invalid location",
+          "match": "(loc)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.loc.pr" }
+          }
+        },
+        {
+          "comment": "showTime attribute - valid: 0, 1, true, false",
+          "match": "(showTime)(=)(0|1|true|false)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "showTime attribute - invalid",
+          "match": "(showTime)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.showTime.pr" }
+          }
+        },
+        {
+          "comment": "generic attribute with object value",
+          "match": "([a-zA-Z_][a-zA-Z0-9_]*)(=)(\\{[^}]*\\})",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "patterns": [{ "include": "#object-contents" }] }
+          }
+        },
+        {
+          "comment": "generic attribute with any value",
+          "match": "([a-zA-Z_][a-zA-Z0-9_]*)(=)([^,\\]]*)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": {
+              "patterns": [
+                {
+                  "name": "constant.numeric.pr",
+                  "match": "^[0-9]+\\.?[0-9]*$"
+                },
+                {
+                  "name": "variable.other.arbitrary.pr",
+                  "match": ".+"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "punctuation.separator.comma.pr",
+          "match": ","
+        }
+      ]
+    },
+
+    "object-contents": {
+      "patterns": [
+        {
+          "name": "punctuation.definition.object.begin.pr",
+          "match": "\\{"
+        },
+        {
+          "name": "punctuation.definition.object.end.pr",
+          "match": "\\}"
+        },
+        {
+          "name": "meta.object-entry.pr",
+          "match": "([^:,{}]+)\\s*(:)\\s*([^,{}]+)",
+          "captures": {
+            "1": { "name": "variable.other.object-key.pr" },
+            "2": { "name": "punctuation.separator.colon.pr" },
+            "3": {
+              "patterns": [
+                {
+                  "name": "support.constant.known.pr",
+                  "match": "\\b(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey)\\b"
+                },
+                {
+                  "name": "invalid.illegal.color.pr",
+                  "match": ".+"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+
+    "content": {
+      "name": "string.content.pr",
+      "match": "^(?!#|screen|view|arrow|text|image|bullets|timer|choices|poll|button|input|video|audio|shape|group).+$"
+    }
+  }
+}
+
