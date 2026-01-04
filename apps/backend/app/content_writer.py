@@ -243,6 +243,12 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
         if t == "table":
             delim = n.get("delimiter") or ";"
             params = [f"name={node_id}", f'delim="{_safe_str(str(delim))}"'] + style_params(n)
+            hs = n.get("hstyle")
+            vs = n.get("vstyle")
+            if isinstance(hs, str) and hs.strip():
+                params.append(f"hstyle={_fmt_param_value(hs.strip())}")
+            if isinstance(vs, str) and vs.strip():
+                params.append(f"vstyle={_fmt_param_value(vs.strip())}")
             lines.append(f"table[{','.join(params)}]:")
             for row in n.get("rows", []) or []:
                 lines.append(_safe_str(delim.join([str(c) for c in row])))
@@ -256,6 +262,13 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             bullets = (n.get("bullets") or "").strip()
             if bullets:
                 params.append(f"bullets={_safe_str(str(bullets))}")
+            # Optional pie labeling controls
+            if isinstance(n.get("includeLimit"), (int, float)):
+                params.append(f"includeLimit={_fmt_param_value(n.get('includeLimit'))}")
+            if isinstance(n.get("textInsideLimit"), (int, float)):
+                params.append(f"textInsideLimit={_fmt_param_value(n.get('textInsideLimit'))}")
+            if isinstance(n.get("otherLabel"), str) and n.get("otherLabel"):
+                params.append(f"otherLabel={_fmt_param_value(n.get('otherLabel'))}")
             opts = n.get("options") or []
             opt_parts: list[str] = []
             # Handle options as list of dicts (standard format)

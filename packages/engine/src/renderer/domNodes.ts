@@ -105,6 +105,61 @@ function applyTransform(el: HTMLElement, node: NodeModel, px: { x: number; y: nu
   el.style.transform = `rotate(${rot}deg)`;
 }
 
+function expandEllipsisStyle(style: string, targetCount: number, alignRe: RegExp) {
+  const s = String(style ?? "").trim();
+  if (!s || !s.includes("...")) return s;
+  const [pre, post] = s.split("...", 2);
+  const prefix = pre ?? "";
+  const suffix = post ?? "";
+
+  const countAlign = (x: string) => (x.match(alignRe) ?? []).length;
+  const prefixCount = countAlign(prefix);
+  const suffixCount = countAlign(suffix);
+  const remaining = targetCount - prefixCount - suffixCount;
+  if (remaining <= 0) return s.replace("...", ""); // nothing to expand
+
+  // Repeat segment = substring starting at the last alignment letter in the prefix.
+  // Example: "b||c|" + "..." + "||" → repeat "c|" as needed.
+  const prefixAlignMatches = [...prefix.matchAll(alignRe)];
+  if (prefixAlignMatches.length === 0) return s.replace("...", "");
+  const last = prefixAlignMatches[prefixAlignMatches.length - 1];
+  const segStart = last.index ?? Math.max(0, prefix.length - 1);
+  const repeatSeg = prefix.slice(segStart);
+  return prefix + repeatSeg.repeat(remaining) + suffix;
+}
+
+function parseLineStyle(spec: string, alignRe: RegExp) {
+  // Parse LaTeX-like specs into:
+  // - align letters (order preserved)
+  // - boundary thicknesses (count of '|' before each align letter, plus trailing bars)
+  const s = String(spec ?? "");
+  const aligns: string[] = [];
+  const bounds: number[] = [];
+  let bars = 0;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i]!;
+    if (ch === "|") {
+      bars += 1;
+      continue;
+    }
+    if (alignRe.test(ch)) {
+      // Boundary before this align
+      if (aligns.length === 0) bounds[0] = bars;
+      else bounds[aligns.length] = bars;
+      bars = 0;
+      aligns.push(ch);
+      continue;
+    }
+    // ignore other chars
+  }
+  bounds[aligns.length] = bars;
+  return { aligns, bounds };
+}
+
+function getOrDefault<T>(arr: T[], idx: number, fallback: T) {
+  return idx >= 0 && idx < arr.length ? arr[idx]! : fallback;
+}
+
 export function createDomNode(node: NodeModel): DomNodeHandle | null {
   if (node.type === "group") {
     const el = document.createElement("div");
@@ -155,7 +210,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       // IMPORTANT:
       // The app layer may render KaTeX by setting el.innerHTML. Since this renderer runs every frame,
       // we must not overwrite innerHTML unless the raw text actually changed.
-      const raw = n.text ?? "";
+      const raw = (n as any).text ?? "";
       if (el.dataset.rawText !== raw) {
         el.dataset.rawText = raw;
         // Provide a plain-text fallback until the app layer re-hydrates math.
@@ -233,6 +288,87 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     return { id: node.id, el, update, destroy: () => el.remove() };
   }
 
+  if (node.type === "table") {
+    const el = document.createElement("div");
+    el.classList.add("node-table");
+    el.style.boxSizing = "border-box";
+    el.style.overflow = "hidden";
+    el.style.color = "rgba(255,255,255,0.92)";
+    el.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+    el.style.fontWeight = "400";
+
+    const table = document.createElement("table");
+    table.className = "table-grid";
+    table.style.width = "100%";
+    table.style.height = "100%";
+    table.style.borderCollapse = "collapse";
+    table.style.tableLayout = "fixed";
+    const tbody = document.createElement("tbody");
+    table.appendChild(tbody);
+    el.appendChild(table);
+
+    const render = (n: any) => {
+      const rows: string[][] = Array.isArray(n.rows) ? n.rows : [];
+      const colCount = Math.max(1, ...rows.map((r) => (Array.isArray(r) ? r.length : 0)));
+
+      const hs0 = String(n.hstyle ?? "");
+      const vs0 = String(n.vstyle ?? "");
+      const hs = expandEllipsisStyle(hs0, colCount, /[lcr]/);
+      const vs = expandEllipsisStyle(vs0, rows.length, /[tcb]/);
+
+      const hParsed = parseLineStyle(hs || `|${"c|".repeat(colCount)}`, /[lcr]/);
+      const vParsed = parseLineStyle(vs || `|${"c|".repeat(rows.length)}`, /[tcb]/);
+
+      const colAligns = Array.from({ length: colCount }, (_, i) => getOrDefault(hParsed.aligns, i, "c"));
+      const colBounds = Array.from({ length: colCount + 1 }, (_, i) => getOrDefault(hParsed.bounds, i, 1));
+      const rowAligns = Array.from({ length: rows.length }, (_, i) => getOrDefault(vParsed.aligns, i, "c"));
+      const rowBounds = Array.from({ length: rows.length + 1 }, (_, i) => getOrDefault(vParsed.bounds, i, 0));
+
+      const borderColor = "rgba(255,255,255,0.65)";
+      const borderCss = (w: number) => (w > 0 ? `${Math.min(6, w)}px solid ${borderColor}` : "0px solid transparent");
+
+      tbody.innerHTML = "";
+      rows.forEach((r, ri) => {
+        const tr = document.createElement("tr");
+        for (let ci = 0; ci < colCount; ci++) {
+          const td = document.createElement("td");
+          td.className = "table-cell";
+          const raw = String((Array.isArray(r) ? r[ci] : "") ?? "");
+          td.textContent = raw;
+          td.dataset.raw = raw;
+          td.style.padding = "6px 10px";
+          td.style.overflow = "hidden";
+          td.style.textOverflow = "ellipsis";
+          td.style.whiteSpace = "nowrap";
+          const a = colAligns[ci];
+          td.style.textAlign = a === "l" ? "left" : a === "r" ? "right" : "center";
+          const va = rowAligns[ri];
+          td.style.verticalAlign = va === "t" ? "top" : va === "b" ? "bottom" : "middle";
+          // Borders:
+          td.style.borderLeft = borderCss(colBounds[ci]);
+          td.style.borderTop = borderCss(rowBounds[ri]);
+          if (ci === colCount - 1) td.style.borderRight = borderCss(colBounds[colCount]);
+          if (ri === rows.length - 1) td.style.borderBottom = borderCss(rowBounds[rows.length]);
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      });
+    };
+
+    setCommonStyles(el, node);
+    const update = (n: NodeModel) => {
+      if (n.type !== "table") return;
+      setCommonStyles(el, n);
+      const key = JSON.stringify({ rows: (n as any).rows ?? [], hstyle: (n as any).hstyle ?? "", vstyle: (n as any).vstyle ?? "" });
+      if ((el.dataset as any).tableKey !== key) {
+        (el.dataset as any).tableKey = key;
+        render(n as any);
+      }
+    };
+    update(node);
+    return { id: node.id, el, update, destroy: () => el.remove() };
+  }
+
   if (node.type === "qr") {
     // The actual QR image is generated by the app layer (qrcode lib) for now.
     const el = document.createElement("div");
@@ -271,7 +407,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "qr") return;
-      el.dataset.qrUrl = n.url;
+      el.dataset.qrUrl = (n as any).url;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -311,7 +447,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "htmlFrame") return;
-      iframe.src = n.src;
+      iframe.src = (n as any).src;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -364,7 +500,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "image") return;
-      img.src = n.src;
+      img.src = (n as any).src;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -386,23 +522,21 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     layer.style.position = "absolute";
     layer.style.inset = "0";
     layer.style.overflow = "visible";
-    layer.style.pointerEvents = "none";
+    // Important: allow clicks/dblclicks on bullets area to reach the node (edit mode).
+    // Live mode editing is blocked at the controller layer; buttons still need to be clickable.
+    layer.style.pointerEvents = "auto";
 
-    // Root composite children are GROUPS (folder nesting governs):
-    // - groups/<id>/geometries.csv defines "bullets" + "wheel" groups (relative to root)
-    // - groups/<id>/bullets/geometries.csv defines children within bullets group
-    // - groups/<id>/wheel/geometries.csv defines children within wheel group
-
-    const bulletsGroup = document.createElement("div");
-    bulletsGroup.className = "choices-sub comp-sub comp-group choices-bullets-group";
-    bulletsGroup.dataset.subId = "bullets";
-    bulletsGroup.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
-    bulletsGroup.dataset.groupPath = `${node.id}/bullets`; // children stored in groups/<id>/bullets/
-    bulletsGroup.style.position = "absolute";
-    bulletsGroup.style.position = "absolute";
-    bulletsGroup.style.position = "absolute";
-    bulletsGroup.style.overflow = "visible";
-    bulletsGroup.style.pointerEvents = "auto";
+    // Root composite has exactly two sub-elements:
+    // - bullets (plain element, no folder)
+    // - wheel (group with its own folder)
+    const bullets = document.createElement("div");
+    bullets.className = "choices-sub comp-sub choices-bullets";
+    bullets.dataset.subId = "bullets";
+    bullets.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
+    bullets.style.position = "absolute";
+    bullets.style.overflow = "visible";
+    bullets.style.pointerEvents = "auto";
+    bullets.style.display = "block";
 
     const wheelGroup = document.createElement("div");
     wheelGroup.className = "choices-sub comp-sub comp-group choices-wheel-group";
@@ -414,14 +548,6 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     wheelGroup.style.pointerEvents = "auto";
     wheelGroup.style.display = "none"; // results hidden by default; app layer toggles
 
-    // --- bullets group children (stored under <id>/bullets) ---
-    const subButtons = document.createElement("div");
-    subButtons.className = "choices-sub comp-sub";
-    subButtons.dataset.subId = "buttons";
-    subButtons.dataset.compPath = `${node.id}/bullets`;
-    subButtons.style.position = "absolute";
-    subButtons.style.pointerEvents = "auto";
-
     const { bar: controlsBar } = createControlBar({
       className: "choices-headerbar",
       buttonClass: "choices-btn",
@@ -432,30 +558,20 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
         { label: "Test", action: "choices-test" }
       ]
     });
-    controlsBar.style.position = "relative";
-    controlsBar.style.left = "";
-    controlsBar.style.right = "";
-    controlsBar.style.top = "";
-    subButtons.appendChild(controlsBar);
-
-    const subBullets = document.createElement("div");
-    subBullets.className = "choices-sub comp-sub";
-    subBullets.dataset.subId = "bullets";
-    subBullets.dataset.compPath = `${node.id}/bullets`;
-    subBullets.style.position = "absolute";
-    subBullets.style.pointerEvents = "auto";
-    subBullets.style.display = "flex";
-    subBullets.style.flexDirection = "column";
-    subBullets.style.gap = "10px";
+    // Buttons are NOT a standard editable element; keep them attached to the main choices node.
+    // Let CSS position this headerbar so it stays consistent in both bullets+wheel views.
+    frame.appendChild(controlsBar);
 
     const title = document.createElement("div");
     title.className = "choices-question";
     title.textContent = "Poll";
     const list = document.createElement("div");
     list.className = "choices-list";
-    subBullets.append(title, list);
-
-    bulletsGroup.append(subButtons, subBullets);
+    // Inner wrapper: scale via transform for smooth zoom (no font-size jitter).
+    const bulletsInner = document.createElement("div");
+    bulletsInner.className = "choices-bullets-inner";
+    bulletsInner.append(title, list);
+    bullets.append(bulletsInner);
 
     // --- wheel group children (stored under <id>/wheel) ---
     const pie = document.createElement("div");
@@ -469,7 +585,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     pie.appendChild(canvas);
     wheelGroup.appendChild(pie);
 
-    layer.append(bulletsGroup, wheelGroup);
+    layer.append(bullets, wheelGroup);
     frame.append(layer);
     el.append(frame);
     setCommonStyles(el, node);
@@ -479,17 +595,19 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       if (n.type !== "choices") return;
       el.dataset.bullets = (n as any).bullets ?? "A";
       el.dataset.chart = (n as any).chart ?? "pie";
-      el.dataset.minPct = String((n as any).minPct ?? (n as any).min ?? "");
-      el.dataset.minInsidePct = String((n as any).minInsidePct ?? (n as any).minInside ?? "");
+      // Back-compat aliases:
+      // - includeLimit == minPct/min
+      // - textInsideLimit == minInsidePct/minInside
+      el.dataset.includeLimit = String((n as any).includeLimit ?? (n as any).minPct ?? (n as any).min ?? "");
+      el.dataset.textInsideLimit = String((n as any).textInsideLimit ?? (n as any).minInsidePct ?? (n as any).minInside ?? "");
       el.dataset.otherLabel = String((n as any).otherLabel ?? "");
       title.textContent = (n as any).question ?? "Poll";
       // default hidden until Show results is pressed (app layer controls actual rendering)
       if (!el.dataset.resultsVisible) el.dataset.resultsVisible = "0";
 
-      // Apply folder-nested composite geometries if provided.
+      // Apply composite geometries if provided.
       const byPath: any = (n as any).compositeGeometriesByPath ?? {};
       const rootGeoms = byPath[""] ?? {};
-      const bulletsGeoms = byPath["bullets"] ?? {};
       const wheelGeoms = byPath["wheel"] ?? {};
 
       const apply = (sub: HTMLElement, gAny: any, fallback: any) => {
@@ -514,38 +632,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
         sub.style.transform = `translate(${tx}, ${ty})`;
       };
 
-      apply(bulletsGroup, rootGeoms["bullets"], { x: 0.0, y: 0.0, w: 0.46, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
-      apply(wheelGroup, rootGeoms["wheel"], { x: 0.52, y: 0.0, w: 0.48, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
-
-      // Children are RELATIVE to their parent folder/group box.
-      // Make group containers the positioning context.
-      bulletsGroup.style.position = "absolute";
-      bulletsGroup.style.contain = "layout style";
-      (bulletsGroup.style as any).containerType = "size";
-      bulletsGroup.style.pointerEvents = "auto";
-      bulletsGroup.style.overflow = "visible";
-      bulletsGroup.style.transformOrigin = "0 0";
-      (bulletsGroup.style as any).position = "absolute";
-      bulletsGroup.style.position = "absolute";
-
-      wheelGroup.style.position = "absolute";
-      wheelGroup.style.contain = "layout style";
-      (wheelGroup.style as any).containerType = "size";
-      wheelGroup.style.pointerEvents = "auto";
-      wheelGroup.style.overflow = "visible";
-
-      // Ensure children are positioned relative to the group (not the root layer).
-      bulletsGroup.style.position = "absolute";
-      wheelGroup.style.position = "absolute";
-      bulletsGroup.style.setProperty("position", "absolute");
-      wheelGroup.style.setProperty("position", "absolute");
-      // Make them positioning contexts:
-      bulletsGroup.style.setProperty("position", "absolute");
-      wheelGroup.style.setProperty("position", "absolute");
-      // (positioned children already use absolute)
-
-      apply(subButtons, bulletsGeoms["buttons"], { x: 0.5, y: -0.10, w: 1.0, h: 0.18, anchor: "topCenter", rotationDeg: 0 });
-      apply(subBullets, bulletsGeoms["bullets"], { x: 0.0, y: 0.0, w: 1.0, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
+      // Bullets and wheel both default to full-frame; app layer toggles which one is visible.
+      apply(bullets, rootGeoms["bullets"], { x: 0.0, y: 0.0, w: 1.0, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
+      apply(wheelGroup, rootGeoms["wheel"], { x: 0.0, y: 0.0, w: 1.0, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
       apply(pie, wheelGeoms["pie"], { x: 0.5, y: 0.5, w: 1.0, h: 1.0, anchor: "centerCenter", rotationDeg: 0 });
     };
 
@@ -621,10 +710,10 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "timer") return;
-      el.dataset.showTime = String(!!n.showTime);
-      el.dataset.barColor = n.barColor ?? "orange";
-      el.dataset.lineColor = n.lineColor ?? "green";
-      el.dataset.stat = n.stat ?? "gaussian";
+      el.dataset.showTime = String(!!(n as any).showTime);
+      el.dataset.barColor = (n as any).barColor ?? "orange";
+      el.dataset.lineColor = (n as any).lineColor ?? "green";
+      el.dataset.stat = (n as any).stat ?? "gaussian";
       if (typeof (n as any).minS === "number") el.dataset.minS = String((n as any).minS);
       else delete (el.dataset as any).minS;
       if (typeof (n as any).maxS === "number") el.dataset.maxS = String((n as any).maxS);
@@ -906,6 +995,12 @@ export function layoutDomNodes(args: {
       const baseFontPx = Math.max(1, Number((nodeLayout as any).fontPx ?? (nodeLayout.transform.h ?? 40) * 0.6));
       handle.el.style.fontSize = `${Math.max(1, baseFontPx * z)}px`;
     }
+    if (nodeLayout.type === "table") {
+      const localH = Math.max(1e-9, Number(nodeLayout.transform.h ?? 0) || 0);
+      const z = nodeLayout.space === "world" ? px.h / localH : 1;
+      const baseFontPx = Math.max(10, Number((nodeLayout as any).fontPx ?? 20));
+      handle.el.style.fontSize = `${Math.max(10, baseFontPx * z)}px`;
+    }
 
     // Intro animations (appear)
     const appear: any = (nodeLayout as any).appear;
@@ -913,7 +1008,8 @@ export function layoutDomNodes(args: {
 
     // Detect visibility edges so enter animations start deterministically on "show".
     // This avoids timing-sensitive behavior (e.g. pressing ArrowRight before the image loads).
-    const visNow = node.visible !== false;
+    // (typed as any) to avoid BaseNodeModel union oddities.
+    const visNow = (node as any).visible !== false;
     const visPrev = handle.el.dataset.prevVisible === "1";
     if (visNow && !visPrev) {
       // Became visible: reset any prior animation state.

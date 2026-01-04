@@ -10,7 +10,13 @@ function normalizeTextForMath(input: string) {
   const s = String(input ?? "");
   if (s.includes("$")) return s;
   if (!AUTO_MATH_RE.test(s)) return s;
-  return formatStringToMathDisplay(s);
+  const formatted = formatStringToMathDisplay(s);
+  // The formatter returns $$...$$ (display). For single-line labels we want inline math
+  // so it behaves like the old `$...$` style.
+  if (formatted.startsWith("$$") && formatted.endsWith("$$") && !s.includes("\n")) {
+    return `$${formatted.slice(2, -2)}$`;
+  }
+  return formatted;
 }
 
 export function renderTextToHtml(input: string) {
@@ -39,6 +45,17 @@ export function hydrateTextMath(engine: Engine, model: PresentationModel) {
     // Keep in sync with the engine's text node updater (it uses dataset.rawText as change detector).
     (el.dataset as any).rawText = raw;
     renderTextToElement(contentEl, raw);
+  }
+
+  // Hydrate table cells too (so math formatting works inside tables).
+  for (const n of model.nodes) {
+    if ((n as any).type !== "table") continue;
+    const el = engine.getNodeElement((n as any).id);
+    if (!el) continue;
+    for (const td of Array.from(el.querySelectorAll<HTMLElement>("td.table-cell[data-raw]"))) {
+      const raw = String((td.dataset as any).raw ?? "");
+      renderTextToElement(td, raw);
+    }
   }
 }
 

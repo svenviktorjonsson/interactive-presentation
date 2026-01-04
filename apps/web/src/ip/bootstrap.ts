@@ -1,117 +1,12 @@
-import QRCode from "qrcode";
-import katex from "katex";
-import "katex/dist/katex.min.css";
 import type { PresentationModel } from "@interactive/content";
 import { Engine, screenToWorld } from "@interactive/engine";
-import "./styles.css";
+import { DEBUG_ANIM, dlog, BACKEND } from "./config";
+import { fetchModel, preloadImageAssets, saveModel } from "./api/presentation";
+import { uploadImageToMedia, loadImageSize } from "./api/media";
+import { hydrateQrImages } from "./features/qr";
+import { hydrateTextMath, renderTextWithKatexToHtml } from "./features/textMath";
+import { buildShell } from "./ui/shell";
 
-// When the backend serves the built frontend, same-origin fetch works.
-// In dev (vite on :5173), it will still default to :8000 unless overridden.
-const BACKEND = import.meta.env.VITE_BACKEND_URL ?? window.location.origin.replace(":5173", ":8000");
-
-const DEBUG_ANIM =
-  new URLSearchParams(window.location.search).get("debugAnim") === "1" || localStorage.getItem("ip_debug_anim") === "1";
-
-function dlog(...args: any[]) {
-  if (!DEBUG_ANIM) return;
-}
-
-function buildShell() {
-  const app = document.querySelector<HTMLDivElement>("#app");
-  if (!app) throw new Error("#app not found");
-
-  const stage = document.createElement("div");
-  stage.className = "stage";
-
-  const canvas = document.createElement("canvas");
-  canvas.className = "canvas";
-
-  const overlay = document.createElement("div");
-  overlay.className = "overlay";
-
-  stage.append(canvas, overlay);
-  app.append(stage);
-  return { canvas, overlay, stage };
-}
-
-async function fetchModel(): Promise<PresentationModel> {
-  const res = await fetch(`${BACKEND}/api/presentation`);
-  if (!res.ok) throw new Error(`Backend error: ${res.status}`);
-  return (await res.json()) as PresentationModel;
-}
-
-function preloadImageAssets(model: PresentationModel) {
-  // Ensure critical images (e.g. join_qr) are actually loaded before enter animations fire.
-  // Browsers may otherwise defer loading depending on heuristics.
-  for (const n of model.nodes) {
-    if ((n as any).type !== "image") continue;
-    const src = String((n as any).src ?? "");
-    if (!src) continue;
-    const img = new Image();
-    img.decoding = "async";
-    img.loading = "eager";
-    img.src = src;
-  }
-}
-
-async function saveModel(model: PresentationModel) {
-  const res = await fetch(`${BACKEND}/api/save`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(model)
-  });
-  if (!res.ok) throw new Error(`Save failed: ${res.status}`);
-}
-
-async function uploadImageToMedia(file: File): Promise<{ src: string; filename: string }> {
-  const fd = new FormData();
-  fd.append("file", file);
-  const res = await fetch(`${BACKEND}/api/media/upload`, { method: "POST", body: fd });
-  if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-  const j = (await res.json()) as any;
-  const src = String(j?.src ?? "");
-  const filename = String(j?.filename ?? "");
-  if (!src) throw new Error("Upload missing src");
-  return { src, filename };
-}
-
-async function loadImageSize(src: string): Promise<{ w: number; h: number } | null> {
-  try {
-    const img = new Image();
-    img.decoding = "async";
-    img.src = src;
-    // Use load event (works everywhere).
-    await new Promise<void>((resolve, reject) => {
-      img.addEventListener("load", () => resolve(), { once: true });
-      img.addEventListener("error", () => reject(new Error("image load failed")), { once: true });
-    });
-    const w = Number((img as any).naturalWidth ?? 0);
-    const h = Number((img as any).naturalHeight ?? 0);
-    if (w > 0 && h > 0) return { w, h };
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function hydrateQrImages(engine: Engine, model: PresentationModel) {
-  const qrNodes = model.nodes.filter((n) => n.type === "qr");
-  for (const n of qrNodes) {
-    if (n.type !== "qr") continue;
-    const el = engine.getNodeElement(n.id);
-    if (!el) continue;
-    const img = el.querySelector<HTMLImageElement>(".qr-img");
-    if (!img) continue;
-    img.alt = `QR: ${n.url}`;
-    img.src = await QRCode.toDataURL(n.url, {
-      margin: 1,
-      width: 512,
-      // Use rgba() to avoid any ambiguity about 8-digit hex support.
-      // Standard QR colors; pixelate animation controls fade-in.
-      color: { dark: "#000000ff", light: "#ffffffff" }
-    });
-  }
-}
 
 type TimerState = {
   accepting: boolean;
@@ -214,13 +109,14 @@ function drawChoicesPie(el: HTMLElement, opts: Array<{ color?: string; votes: nu
   const cx = W / 2;
   const cy = H / 2;
   const r0 = Math.max(10, Math.min(W, H) / 2 - 4);
-  const borderW = Math.max(1, dpr * 2);
-  const strokeCol = "rgba(255,255,255,0.85)";
-  const ringCol = "rgba(255,255,255,0.65)";
+  const borderW = Math.max(2, dpr * 4);
+  const strokeCol = "rgba(255,255,255,0.92)";
+  const ringCol = "rgba(255,255,255,0.92)";
   let start = -Math.PI / 2;
   const colors = ["#4caf50", "#e53935", "#1e88e5", "#ab47bc", "#00bcd4", "#fdd835", "#8d6e63"];
+  const boundaries: number[] = [start];
   if (total > 0) {
-    // Draw slices + white separators.
+    // Draw slices.
     opts.forEach((opt, idx) => {
       const val = Math.max(0, opt.votes || 0);
       if (val <= 0) return;
@@ -233,16 +129,23 @@ function drawChoicesPie(el: HTMLElement, opts: Array<{ color?: string; votes: nu
       ctx.fillStyle = opt.color || colors[idx % colors.length];
       ctx.globalAlpha = 0.92;
       ctx.fill();
-
-      ctx.globalAlpha = 1;
-      ctx.strokeStyle = strokeCol;
-      ctx.lineWidth = borderW;
-      ctx.stroke();
+      boundaries.push(end);
       start = end;
     });
   }
 
-  // Outer ring (always).
+  // Slice separators (thick white dividers).
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = strokeCol;
+  ctx.lineWidth = borderW;
+  for (const a of boundaries) {
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
+    ctx.stroke();
+  }
+
+  // Outer ring (always), thick.
   ctx.globalAlpha = 1;
   ctx.beginPath();
   ctx.arc(cx, cy, r0, 0, Math.PI * 2);
@@ -251,7 +154,7 @@ function drawChoicesPie(el: HTMLElement, opts: Array<{ color?: string; votes: nu
   ctx.stroke();
 }
 
-function renderChoicesNode(el: HTMLElement, node: any, state: ChoicesState | null) {
+function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: ChoicesState | null) {
   const question = el.querySelector<HTMLElement>(".choices-question");
   const list = el.querySelector<HTMLElement>(".choices-list");
   const total = el.querySelector<HTMLElement>(".choices-total");
@@ -314,33 +217,244 @@ function renderChoicesNode(el: HTMLElement, node: any, state: ChoicesState | nul
   }
 
   // Only render chart when results are visible.
-  const wheel = el.querySelector<HTMLElement>(".choices-wheel");
-  if (wheel) wheel.style.display = resultsVisible ? "block" : "none";
-  if (list) list.style.display = resultsVisible ? "none" : "flex";
+  const bulletsGroup = el.querySelector<HTMLElement>(".choices-bullets");
+  const wheelGroup = el.querySelector<HTMLElement>(".choices-wheel-group");
+  if (bulletsGroup) bulletsGroup.style.display = resultsVisible ? "none" : "flex";
+  if (wheelGroup) wheelGroup.style.display = resultsVisible ? "block" : "none";
 
   if (resultsVisible) {
-    const minPct = Number(node?.minPct ?? node?.min ?? el.dataset.minPct ?? "3");
+    const includeLimit = Number(node?.includeLimit ?? node?.minPct ?? node?.min ?? el.dataset.includeLimit ?? "3");
+    const textInsideLimit = Number(node?.textInsideLimit ?? node?.minInsidePct ?? node?.minInside ?? el.dataset.textInsideLimit ?? "6");
     const otherLabel = String(node?.otherLabel ?? el.dataset.otherLabel ?? "Other") || "Other";
 
     // Bucket tiny slices into "Other"
-    const big: Array<{ color?: string; votes: number; percent: number; label: string }> = [];
+    const big: Array<{ id: string; color?: string; votes: number; percent: number; label: string }> = [];
     let otherVotes = 0;
     let otherPercent = 0;
     for (const o of options) {
       const p = Number(o.percent ?? 0);
-      if (Number.isFinite(minPct) && p > 0 && p < minPct) {
+      if (Number.isFinite(includeLimit) && p > 0 && p < includeLimit) {
         otherVotes += Number(o.votes ?? 0);
         otherPercent += p;
       } else {
-        big.push({ color: o.color, votes: o.votes, percent: p, label: o.label });
+        big.push({ id: String(o.id ?? ""), color: o.color, votes: o.votes, percent: p, label: o.label });
       }
     }
-    if (otherVotes > 0) big.push({ color: "rgba(255,255,255,0.35)", votes: otherVotes, percent: otherPercent, label: otherLabel });
+    if (otherVotes > 0) big.push({ id: "other", color: "rgba(255,255,255,0.35)", votes: otherVotes, percent: otherPercent, label: otherLabel });
     drawChoicesPie(el, big.map((o) => ({ color: o.color, votes: o.votes })));
+    renderChoicesWheelOverlay(engine, String(node?.id ?? ""), big, {
+      totalVotes,
+      otherLabel,
+      textInsideLimit
+    });
   } else {
     drawChoicesPie(el, []);
+    renderChoicesWheelOverlay(engine, String(node?.id ?? ""), [], { totalVotes: 0, otherLabel: "Other", textInsideLimit: 6 });
   }
 }
+
+function ensureChoicesWheelLayer(engine: Engine, pollId: string) {
+  const m = engine.getModel();
+  const node = m?.nodes.find((n) => (n as any).id === pollId) as any;
+  const el = engine.getNodeElement(pollId);
+  if (!node || !el) return null;
+  const wheel = el.querySelector<HTMLElement>(".choices-wheel");
+  if (!wheel) return null;
+
+  let layer = wheel.querySelector<HTMLElement>(":scope > .choices-wheel-layer");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.className = "choices-wheel-layer";
+    layer.style.position = "absolute";
+    layer.style.inset = "0";
+    layer.style.overflow = "visible";
+    layer.style.pointerEvents = "none";
+    wheel.style.position = wheel.style.position || "absolute";
+    wheel.append(layer);
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("choices-wheel-svg");
+    svg.style.position = "absolute";
+    svg.style.inset = "0";
+    svg.style.width = "100%";
+    svg.style.height = "100%";
+    svg.style.overflow = "visible";
+    svg.style.pointerEvents = "none";
+    layer.append(svg);
+  }
+
+  const elementsPr = String(node.wheelElementsPr ?? "");
+  const prev = String((layer as any).__elementsPr ?? "");
+  if (elementsPr !== prev) {
+    (layer as any).__elementsPr = elementsPr;
+    const templates: Record<string, string> = {};
+    for (const ln0 of elementsPr.split(/\r?\n/)) {
+      const ln = ln0.trim();
+      if (!ln || ln.startsWith("#")) continue;
+      const mt = ln.match(/^text\[name=(?<id>[a-zA-Z_]\w*)\]\s*:\s*(?<content>.*)$/);
+      if (mt?.groups) templates[mt.groups.id] = mt.groups.content ?? "";
+    }
+    (layer as any).__templates = templates;
+  }
+
+  // Geoms for wheel internals are stored in compositeGeometriesByPath["wheel"].
+  const geoms: Record<string, any> = (node.compositeGeometriesByPath?.wheel ?? {}) as any;
+  (layer as any).__wheelGeoms = geoms;
+
+  return layer;
+}
+
+function renderChoicesWheelOverlay(
+  engine: Engine,
+  pollId: string,
+  slices: Array<{ id: string; color?: string; votes: number; percent: number; label: string }>,
+  opts: { totalVotes: number; otherLabel: string; textInsideLimit: number }
+) {
+  if (!pollId) return;
+  const layer = ensureChoicesWheelLayer(engine, pollId);
+  if (!layer) return;
+
+  const svg = layer.querySelector<SVGSVGElement>(":scope > .choices-wheel-svg");
+  if (!svg) return;
+
+  const templates: Record<string, string> = (layer as any).__templates ?? {};
+  const geoms: Record<string, any> = (layer as any).__wheelGeoms ?? {};
+
+  const wheelEl = layer.parentElement as HTMLElement;
+  const box = wheelEl.getBoundingClientRect();
+  const fontBase = Math.max(18, box.height * 0.055);
+
+  const textElsById = new Map<string, HTMLElement>();
+  for (const t of Array.from(layer.querySelectorAll<HTMLElement>(":scope > .choices-wheel-text"))) {
+    const sid = t.dataset.subId ?? "";
+    if (sid) textElsById.set(sid, t);
+  }
+
+  const ensureTextEl = (sid: string) => {
+    let t = textElsById.get(sid);
+    if (t) return t;
+    t = document.createElement("div");
+    t.className = "choices-wheel-text comp-sub";
+    t.dataset.subId = sid;
+    t.dataset.compPath = `${pollId}/wheel`;
+    t.dataset.anchor = "centerCenter";
+    // Stable content child (so selection handles don't get wiped by innerHTML).
+    const content = document.createElement("div");
+    content.className = "choices-wheel-text-content";
+    content.style.width = "100%";
+    content.style.height = "100%";
+    content.style.display = "grid";
+    content.style.placeItems = "center";
+    t.append(content);
+    t.style.position = "absolute";
+    t.style.pointerEvents = "none";
+    t.style.userSelect = "none";
+    t.style.background = "transparent";
+    t.style.border = "none";
+    t.style.padding = "0";
+    t.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+    t.style.fontWeight = "700";
+    t.style.color = "rgba(255,255,255,0.92)";
+    t.style.transform = "translate(-50%, -50%)";
+    layer.append(t);
+    textElsById.set(sid, t);
+    return t;
+  };
+
+  // Determine render order around the circle.
+  const total = Math.max(0, slices.reduce((s, o) => s + Math.max(0, o.votes || 0), 0));
+  const lines: Array<{ x0: number; y0: number; x1: number; y1: number }> = [];
+
+  // Hide everything by default; show only current slices.
+  for (const t of Array.from(layer.querySelectorAll<HTMLElement>(":scope > .choices-wheel-text"))) {
+    t.style.display = "none";
+  }
+
+  let a0 = -Math.PI / 2;
+  for (const s of slices) {
+    const val = Math.max(0, s.votes || 0);
+    if (total <= 0 || val <= 0) continue;
+    const frac = val / total;
+    const a1 = a0 + frac * Math.PI * 2;
+    const mid = (a0 + a1) / 2;
+
+    const pct = Number.isFinite(s.percent) ? s.percent : frac * 100;
+    const inside = Number.isFinite(opts.textInsideLimit) ? pct >= opts.textInsideLimit : true;
+
+    const sid = String(s.id || "other");
+    const t = ensureTextEl(sid);
+    t.style.display = "block";
+
+    const g = geoms[sid] ?? { x: 0, y: 0, w: 0.36, h: 0.10, rotationDeg: 0, anchor: "centerCenter", align: "center" };
+    const dx = Number(g.x ?? 0);
+    const dy = Number(g.y ?? 0);
+    const w = Number(g.w ?? 0.36);
+    const h = Number(g.h ?? 0.10);
+
+    // Base anchor point in wheel-local normalized coords.
+    // Radius is in [0..0.5] (0.5 == edge of the wheel box).
+    const rInside = 0.28;
+    const rOutside = 0.62;
+    const baseR = inside ? rInside : rOutside;
+    const baseX = 0.5 + Math.cos(mid) * baseR;
+    const baseY = 0.5 + Math.sin(mid) * baseR;
+
+    const x = baseX + dx;
+    const y = baseY + dy;
+    t.dataset.baseX = String(baseX);
+    t.dataset.baseY = String(baseY);
+
+    t.style.left = `${x * 100}%`;
+    t.style.top = `${y * 100}%`;
+    t.style.width = `${w * 100}%`;
+    t.style.height = `${h * 100}%`;
+    t.style.rotate = `${Number(g.rotationDeg ?? 0)}deg`;
+    t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+    t.style.fontSize = `${Math.max(14, fontBase)}px`;
+    t.style.lineHeight = `${Math.max(14, fontBase)}px`;
+    t.style.pointerEvents = (window as any).__ip_compositeEditing ? "auto" : "none";
+
+    const tpl = String(t.dataset.template ?? templates[sid] ?? "{{label}} ({{percent}}%)");
+    t.dataset.template = tpl;
+    const resolved = applyDataBindings(tpl, {
+      label: s.label,
+      percent: Math.round(pct),
+      votes: s.votes,
+      totalVotes: opts.totalVotes
+    });
+    const prevTxt = t.dataset.rawText ?? "";
+    if (prevTxt !== resolved) {
+      t.dataset.rawText = resolved;
+      const contentEl = t.querySelector<HTMLElement>(":scope > .choices-wheel-text-content");
+      if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+    }
+
+    if (!inside) {
+      const rEdge = 0.46;
+      const x0 = 0.5 + Math.cos(mid) * rEdge;
+      const y0 = 0.5 + Math.sin(mid) * rEdge;
+      lines.push({ x0, y0, x1: x, y1: y });
+    }
+
+    a0 = a1;
+  }
+
+  // Render arrows for outside labels.
+  svg.replaceChildren();
+  const strokeW = Math.max(2, (window.devicePixelRatio || 1) * 2.5);
+  for (const ln of lines) {
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", `${ln.x0 * 100}%`);
+    line.setAttribute("y1", `${ln.y0 * 100}%`);
+    line.setAttribute("x2", `${ln.x1 * 100}%`);
+    line.setAttribute("y2", `${ln.y1 * 100}%`);
+    line.setAttribute("stroke", "rgba(255,255,255,0.92)");
+    line.setAttribute("stroke-width", `${strokeW}`);
+    line.setAttribute("stroke-linecap", "round");
+    svg.append(line);
+  }
+}
+
 function _randn01() {
   // Box–Muller transform
   let u = 0;
@@ -555,7 +669,7 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   if (bg) bg.style.display = mode === "edit" ? "none" : "block";
 }
 
-function attachChoicesHandlers(stage: HTMLElement) {
+function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
   stage.addEventListener("click", async (ev) => {
     const t = ev.target as HTMLElement;
     const btn = t.closest<HTMLButtonElement>("button[data-action]");
@@ -611,7 +725,7 @@ function attachChoicesHandlers(stage: HTMLElement) {
         if (__choicesResultsVisible[pollId] == null) __choicesResultsVisible[pollId] = false;
         // Force a local re-render tick quickly.
         const el = stage.querySelector<HTMLElement>(`.node[data-node-id="${pollId}"], .node[data-node-id="${CSS.escape(pollId)}"]`);
-        if (el) renderChoicesNode(el, { id: pollId }, __choicesState[pollId]);
+        if (el) renderChoicesNode(engine, el, { id: pollId }, __choicesState[pollId]);
       } finally {
         btn.disabled = false;
       }
@@ -629,13 +743,13 @@ function ensureChoicesPolling(engine: Engine, model: PresentationModel, stage: H
       if (n.type !== "choices") continue;
       const el = engine.getNodeElement(n.id);
       if (!el) continue;
-      renderChoicesNode(el, n, __choicesState[n.id] ?? null);
+      renderChoicesNode(engine, el, n, __choicesState[n.id] ?? null);
     }
   };
 
   if (!__choicesPollStarted) {
     __choicesPollStarted = true;
-    attachChoicesHandlers(stage);
+    attachChoicesHandlers(stage, engine);
     window.setInterval(() => void tick(), 250);
   }
 }
@@ -1087,86 +1201,6 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
   window.setInterval(() => void tick(), 350);
 }
 
-function escapeHtml(s: string) {
-  return s
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-function findNextDelimiter(text: string, delim: "$" | "$$", start: number) {
-  const d = delim === "$$" ? "$$" : "$";
-  for (let i = start; i < text.length; i++) {
-    if (text[i] === "\\") {
-      i += 1;
-      continue;
-    }
-    if (d === "$$") {
-      if (text[i] === "$" && text[i + 1] === "$") return i;
-    } else {
-      if (text[i] === "$") return i;
-    }
-  }
-  return -1;
-}
-
-function renderTextWithKatexToHtml(input: string) {
-  // Supports inline $...$ and display $$...$$. No nesting. Escapes plain text.
-  const out: string[] = [];
-  let i = 0;
-  while (i < input.length) {
-    const nextDollar = input.indexOf("$", i);
-    if (nextDollar === -1) {
-      out.push(escapeHtml(input.slice(i)));
-      break;
-    }
-    // plain text before delimiter
-    out.push(escapeHtml(input.slice(i, nextDollar)));
-
-    const isDisplay = input[nextDollar + 1] === "$";
-    const delim: "$" | "$$" = isDisplay ? "$$" : "$";
-    const start = nextDollar + (isDisplay ? 2 : 1);
-    const end = findNextDelimiter(input, delim, start);
-    if (end === -1) {
-      // Unclosed: treat the rest as text.
-      out.push(escapeHtml(input.slice(nextDollar)));
-      break;
-    }
-    const expr = input.slice(start, end);
-    try {
-      out.push(
-        katex.renderToString(expr, {
-          displayMode: isDisplay,
-          throwOnError: false,
-          strict: "ignore"
-        })
-      );
-    } catch {
-      out.push(escapeHtml(input.slice(nextDollar, end + (isDisplay ? 2 : 1))));
-    }
-    i = end + (isDisplay ? 2 : 1);
-  }
-
-  return out.join("");
-}
-
-function hydrateTextMath(engine: Engine, model: PresentationModel) {
-  for (const n of model.nodes) {
-    if (n.type !== "text") continue;
-    const el = engine.getNodeElement(n.id);
-    if (!el) continue;
-    const contentEl = el.querySelector<HTMLElement>(":scope .node-text-content") ?? el;
-    // Render mixed text + math; keep newlines.
-    const raw = n.text ?? "";
-    // IMPORTANT: keep this in sync with the engine's per-frame text node updater.
-    // If we don't set it, the next render tick may overwrite our KaTeX HTML with raw text (including '$').
-    el.dataset.rawText = raw;
-    contentEl.innerHTML = renderTextWithKatexToHtml(raw).replaceAll("\n", "<br/>");
-  }
-}
-
 function smoothstep(edge0: number, edge1: number, x: number) {
   const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
   return t * t * (3 - 2 * t);
@@ -1184,7 +1218,20 @@ function gridSpacingForZoom(zoom: number, baseWorld = 100) {
 
 type DragMode = "none" | "move" | "resize" | "rotate";
 
+function getAppMode(): "edit" | "live" {
+  const raw =
+    (document.documentElement.dataset.ipMode ??
+      document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ??
+      "edit") + "";
+  return raw.toLowerCase() === "live" ? "live" : "edit";
+}
+
 function ensureHandles(el: HTMLElement) {
+  // Safety: never show transform UI in Live mode.
+  if (getAppMode() !== "edit") {
+    el.querySelector(":scope > .handles")?.remove();
+    return null;
+  }
   let handles = el.querySelector<HTMLDivElement>(":scope > .handles");
 
   const normalizeAnchor = (a: string | undefined) => {
@@ -1495,6 +1542,56 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     await commit(before);
   };
 
+  const addTableAt = async (
+    pos: { x: number; y: number },
+    opts?: { space?: "world" | "screen" }
+  ) => {
+    const model = engine.getModel();
+    if (!model) return;
+    const before = cloneModel(model);
+    const id = nextId("table");
+    const space = opts?.space === "screen" ? "screen" : "world";
+    const isScreen = space === "screen";
+    const node: any = {
+      id,
+      type: "table",
+      space,
+      delimiter: ";",
+      hstyle: "||c|c|c||",
+      vstyle: "|b||c|...|",
+      rows: [
+        ["C1", "C2", "C3"],
+        ["1", "2", "3"],
+        ["4", "5", "6"],
+        ["7", "8", "9"]
+      ],
+      transform: {
+        x: pos.x,
+        y: pos.y,
+        w: isScreen ? 520 : 720,
+        h: isScreen ? 260 : 320,
+        anchor: "centerCenter",
+        rotationDeg: 0
+      }
+    };
+    model.nodes.push(node);
+    if (isScreen) {
+      for (const v of model.views) {
+        if (!v.show.includes(id)) v.show.push(id);
+      }
+    } else {
+      const viewId = getActiveViewId();
+      const view = model.views.find((v) => v.id === viewId) ?? model.views[0];
+      if (view && !view.show.includes(id)) view.show.push(id);
+    }
+    engine.setModel(cloneModel(model));
+    hydrateTextMath(engine, model);
+    selected.clear();
+    selected.add(id);
+    applySelection();
+    await commit(before);
+  };
+
   const addImageAt = async (
     pos: { x: number; y: number },
     file: File,
@@ -1699,6 +1796,15 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
             { space: screenEditMode ? "screen" : "world" }
           )
       ),
+      mkItem(
+        "Add table",
+        canAdd,
+        () =>
+          addTableAt(
+            (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
+            { space: screenEditMode ? "screen" : "world" }
+          )
+      ),
       mkItem("Add image…", canAdd, async () => {
         (window as any).__ip_pickImage?.(
           (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
@@ -1765,11 +1871,16 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const applySelection = () => {
     const model = engine.getModel();
     if (!model) return;
+    const canShowTransformUi = getAppMode() === "edit";
     for (const n of model.nodes) {
       const el = engine.getNodeElement(n.id);
       if (!el) continue;
-      const isSel = selected.has(n.id);
+      const isSel = canShowTransformUi && selected.has(n.id);
       el.classList.toggle("is-selected", isSel);
+      if (!canShowTransformUi) {
+        el.querySelector(".handles")?.remove();
+        continue;
+      }
       if (isSel && selected.size === 1) {
         // While editing a composite (timer), never show handles for the composite itself.
         if (compositeEditTimerId && n.id === compositeEditTimerId) el.querySelector(".handles")?.remove();
@@ -2339,7 +2450,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
             fromS.addEventListener("change", () => (cur.from = fromS.value));
             fromF.appendChild(fromS);
 
-            wrap.appendChild(grid, fromF);
+            wrap.append(grid, fromF);
           } else if (cur?.kind === "pixelate") {
             const grid = document.createElement("div");
             grid.style.display = "grid";
@@ -2596,10 +2707,17 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const enterChoicesCompositeEdit = (pollId: string) => {
     compositeEditKind = "choices";
     compositeEditTimerId = pollId;
-    clearSelection();
     const el = engine.getNodeElement(pollId);
     if (!el) return;
-    el.querySelector(".handles")?.remove();
+    // Start with sub-element editing (root remains selectable via click/drag on the node itself).
+    clearSelection();
+
+    // Force bullets view while editing (ignore any "results" state from Live).
+    __choicesResultsVisible[pollId] = false;
+    el.dataset.resultsVisible = "0";
+    const m0 = engine.getModel();
+    const n0: any = m0?.nodes.find((n: any) => n.id === pollId);
+    if (n0) renderChoicesNode(engine, el, n0, __choicesState[pollId] ?? null);
 
     // Isolate: dim all other nodes.
     compositeHiddenEls = [];
@@ -2619,7 +2737,6 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const node = m?.nodes.find((n: any) => n.id === pollId);
     const byPath = (node as any)?.compositeGeometriesByPath ?? {};
     compositeGeomsByPath[pollId] = byPath[""] ?? {};
-    compositeGeomsByPath[`${pollId}/bullets`] = byPath["bullets"] ?? {};
     compositeGeomsByPath[`${pollId}/wheel`] = byPath["wheel"] ?? {};
     for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".comp-sub") ?? [])) {
       sub.style.pointerEvents = "auto";
@@ -2628,6 +2745,17 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       sub.style.background = "transparent";
       sub.style.borderRadius = "0";
       sub.style.padding = "0";
+    }
+
+    // Make bullets the "main" editable element by default.
+    const bulletsEl = el.querySelector<HTMLElement>(".choices-bullets.comp-sub");
+    if (bulletsEl) {
+      for (const e3 of Array.from(el.querySelectorAll<HTMLElement>(".comp-sub"))) e3.classList.remove("is-selected");
+      bulletsEl.classList.add("is-selected");
+      ensureHandles(bulletsEl);
+      compositeEditPath = String(bulletsEl.dataset.compPath || pollId);
+      compositeSelectedSubId = bulletsEl.dataset.subId ?? "bullets";
+      compositeSelectedSubEl = bulletsEl;
     }
 
     const modeBtn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
@@ -2646,7 +2774,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (layer) layer.style.pointerEvents = "none";
     } else {
       const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
-      if (layer) layer.style.pointerEvents = "none";
+      // Keep interactive so dblclick on bullets enters group edit (no "screen edit" by accident).
+      if (layer) layer.style.pointerEvents = "auto";
     }
     for (const e2 of compositeHiddenEls) e2.classList.remove("ip-dim-node");
     compositeHiddenEls = [];
@@ -2776,7 +2905,120 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     });
   };
 
+  const openChoicesWheelTextEditor = (pollId: string, subEl: HTMLElement) => {
+    const layer = ensureChoicesWheelLayer(engine, pollId);
+    if (!layer) return;
+    const subId = subEl.dataset.subId ?? "";
+    if (!subId) return;
+
+    const backdrop = document.createElement("div");
+    backdrop.className = "modal-backdrop";
+    const modal = document.createElement("div");
+    modal.className = "modal";
+    modal.style.width = "min(820px, calc(100vw - 40px))";
+    modal.style.height = "min(520px, calc(100vh - 40px))";
+
+    const header = document.createElement("div");
+    header.className = "modal-header";
+    header.innerHTML = `<div class="modal-title">Edit wheel text: <code>${subId}</code></div>`;
+    const body = document.createElement("div");
+    body.style.padding = "14px";
+    body.style.display = "grid";
+    body.style.gridTemplateRows = "auto 1fr";
+    body.style.gap = "12px";
+
+    const taWrap = document.createElement("div");
+    taWrap.className = "field";
+    taWrap.innerHTML = `<label>Template</label>`;
+    const ta = document.createElement("textarea");
+    ta.value = subEl.dataset.template ?? "";
+    ta.style.width = "100%";
+    ta.style.height = "120px";
+    ta.style.resize = "vertical";
+    taWrap.append(ta);
+
+    const preview = document.createElement("div");
+    preview.className = "field";
+    preview.innerHTML = `<label>Preview</label>`;
+    const pv = document.createElement("div");
+    pv.style.border = "1px solid rgba(255,255,255,0.12)";
+    pv.style.borderRadius = "12px";
+    pv.style.padding = "12px";
+    pv.style.minHeight = "120px";
+    pv.style.background = "rgba(255,255,255,0.04)";
+    pv.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+    pv.style.fontWeight = "700";
+    preview.append(pv);
+
+    const renderPreview = () => {
+      const templ = applyDataBindings(ta.value, { label: "Option", percent: 42, votes: 12, totalVotes: 30 });
+      pv.innerHTML = renderTextWithKatexToHtml(templ).replaceAll("\n", "<br/>");
+    };
+    ta.addEventListener("input", renderPreview);
+    renderPreview();
+
+    const footer = document.createElement("div");
+    footer.style.display = "flex";
+    footer.style.justifyContent = "flex-end";
+    footer.style.gap = "10px";
+    footer.style.padding = "12px 14px";
+    footer.style.borderTop = "1px solid rgba(255,255,255,0.12)";
+    const btnCancel = document.createElement("button");
+    btnCancel.className = "btn";
+    btnCancel.textContent = "Cancel";
+    const btnSave = document.createElement("button");
+    btnSave.className = "btn primary";
+    btnSave.textContent = "Save";
+    footer.append(btnCancel, btnSave);
+
+    modal.append(header, body, footer);
+    body.append(taWrap, preview);
+    backdrop.append(modal);
+    document.body.append(backdrop);
+
+    const close = () => backdrop.remove();
+    btnCancel.addEventListener("click", close);
+    modal.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+    backdrop.addEventListener("pointerdown", (ev) => {
+      if (ev.target === backdrop) close();
+    });
+
+    btnSave.addEventListener("click", () => {
+      const newText = ta.value.replaceAll("\r\n", "\n");
+      subEl.dataset.template = newText;
+
+      // Update the stored elements.pr (single-line text syntax).
+      const src = String((layer as any).__elementsPr ?? "");
+      const lines = src.split(/\r?\n/);
+      const out: string[] = [];
+      const re = new RegExp(`^\\s*text\\[name=${subId.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\]\\s*:\\s*(.*)$`);
+      let replaced = false;
+      for (const ln of lines) {
+        if (!replaced && re.test(ln)) {
+          out.push(`text[name=${subId}]: ${newText.replaceAll("\n", " ")}`);
+          replaced = true;
+        } else {
+          out.push(ln);
+        }
+      }
+      if (!replaced) out.push(`text[name=${subId}]: ${newText.replaceAll("\n", " ")}`);
+      const nextText = out.join("\n").replaceAll("\r\n", "\n");
+      (layer as any).__elementsPr = nextText;
+
+      // Persist elements.pr (and current geoms) to backend.
+      const geoms: any = compositeGeomsByPath[`${pollId}/wheel`] ?? (layer as any).__wheelGeoms ?? {};
+      void fetch(`${BACKEND}/api/composite/save`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ compositePath: `${pollId}/wheel`, geoms, elementsPr: nextText })
+      });
+      close();
+    });
+  };
+
   stage.addEventListener("dblclick", async (ev) => {
+    // Hard block: Live mode must be resistant to any editing gestures.
+    if (getAppMode() !== "edit") return;
     const target = ev.target as HTMLElement;
     // In composite edit mode, double-clicking a sub-text should open the text editor (not re-enter composite mode).
     if (compositeEditTimerId && compositeEditKind === "timer") {
@@ -2788,9 +3030,29 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         return;
       }
     }
+    if (compositeEditTimerId && compositeEditKind === "choices") {
+      // Double-clicking the bullets element should open the regular editor for the choices node.
+      const bulletsEl = target.closest<HTMLElement>(".choices-bullets");
+      if (bulletsEl) {
+        await openEditorModal(compositeEditTimerId);
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+      const sub = target.closest<HTMLElement>(".choices-wheel-text");
+      if (sub) {
+        openChoicesWheelTextEditor(compositeEditTimerId, sub);
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+    }
     const nodeEl = target.closest<HTMLElement>(".node");
     const id = nodeEl?.dataset.nodeId;
     if (!id) {
+      // Only enter screen edit mode when double-clicking the actual empty background.
+      // This avoids accidentally entering screen edit when double-clicking within composite UI.
+      if (target.closest(".node")) return;
       // Background double-click: enter screen edit mode (edit mode only).
       const currentMode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
       if (currentMode === "edit") {
@@ -2827,10 +3089,16 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   });
 
   stage.addEventListener("pointerdown", (ev) => {
+    // Hard block: Live mode must be resistant to any editing gestures.
+    if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId) return;
     const t = ev.target as HTMLElement;
     const sub = t.closest<HTMLElement>(".comp-sub");
     if (!sub) return;
+    // If the user is grabbing the root node handles, let the normal editor handle it.
+    if (t.closest(".node > .handles")) return;
+    // When selecting a sub-element, clear root selection so the transform UI follows the sub-element.
+    clearSelection();
     compositeEditPath = String(sub.dataset.compPath || compositeEditTimerId);
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
@@ -2853,6 +3121,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const geoms: Record<string, any> = (compositeGeomsByPath[compositeEditPath] ??= {});
     const g0 = geoms[subId] ?? {};
     const r = sub.getBoundingClientRect();
+    const baseX = Number(sub.dataset.baseX ?? "NaN");
+    const baseY = Number(sub.dataset.baseY ?? "NaN");
+    const isChoicesWheelLabel =
+      compositeEditKind === "choices" && compositeEditPath.endsWith("/wheel") && Number.isFinite(baseX) && Number.isFinite(baseY);
     const handleEl = t.closest<HTMLElement>(".handle");
     const anchorEl = t.closest<HTMLElement>(".anchor-dot");
     if (anchorEl?.dataset.anchor) {
@@ -2869,6 +3141,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       sub.style.left = `${newPos.x * 100}%`;
       sub.style.top = `${newPos.y * 100}%`;
       ensureHandles(sub);
+      // For dynamic wheel labels, store offsets from the computed base anchor (not absolute coords).
+      if (isChoicesWheelLabel && subId) {
+        const ox = newPos.x - baseX;
+        const oy = newPos.y - baseY;
+        geoms[subId] = { ...(geoms[subId] ?? {}), x: ox, y: oy, anchor: newAnchor };
+      }
       (ev as any).stopImmediatePropagation?.();
       ev.preventDefault();
       return;
@@ -2877,8 +3155,16 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     compositeStart = { x: ev.clientX, y: ev.clientY };
     compositeStartGeom = {
       // Source of truth is the stored geom (prevents jitter from DOM rect measurement).
-      x: Number(g0.x ?? (r.left + r.width / 2 - box.left) / box.width),
-      y: Number(g0.y ?? (r.top + r.height / 2 - box.top) / box.height),
+      x: Number(
+        isChoicesWheelLabel
+          ? baseX + Number(g0.x ?? (r.left + r.width / 2 - box.left) / box.width - baseX)
+          : (g0.x ?? (r.left + r.width / 2 - box.left) / box.width)
+      ),
+      y: Number(
+        isChoicesWheelLabel
+          ? baseY + Number(g0.y ?? (r.top + r.height / 2 - box.top) / box.height - baseY)
+          : (g0.y ?? (r.top + r.height / 2 - box.top) / box.height)
+      ),
       w: Number(g0.w ?? r.width / box.width),
       h: Number(g0.h ?? r.height / box.height),
       rotationDeg: Number(g0.rotationDeg ?? (Number((sub.style.rotate || "0deg").replace("deg", "")) || 0)),
@@ -2911,6 +3197,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   });
 
   stage.addEventListener("pointermove", (ev) => {
+    // Hard block: Live mode must be resistant to any editing gestures.
+    if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId || compositeDragMode === "none" || !compositeSelectedSubEl || !compositeStartGeom) return;
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
@@ -2922,6 +3210,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const box = groupBoxEl.getBoundingClientRect();
     const geoms: Record<string, any> = (compositeGeomsByPath[compositeEditPath] ??= {});
     const sid = sub.dataset.subId ?? "";
+    const baseX = Number(sub.dataset.baseX ?? "NaN");
+    const baseY = Number(sub.dataset.baseY ?? "NaN");
+    const isChoicesWheelLabel =
+      compositeEditKind === "choices" && compositeEditPath.endsWith("/wheel") && Number.isFinite(baseX) && Number.isFinite(baseY);
     const dx = (ev.clientX - compositeStart.x) / box.width;
     const dy = (ev.clientY - compositeStart.y) / box.height;
 
@@ -2932,7 +3224,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const ny = py - compositeGrabOff.y;
       sub.style.left = `${nx * 100}%`;
       sub.style.top = `${ny * 100}%`;
-      if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), x: nx, y: ny };
+      if (sid) {
+        if (isChoicesWheelLabel) geoms[sid] = { ...(geoms[sid] ?? {}), x: nx - baseX, y: ny - baseY };
+        else geoms[sid] = { ...(geoms[sid] ?? {}), x: nx, y: ny };
+      }
       return;
     }
 
@@ -3005,6 +3300,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   });
 
   stage.addEventListener("pointerup", () => {
+    // Hard block: Live mode must be resistant to any editing gestures.
+    if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId) return;
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
@@ -3026,10 +3323,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   });
 
   window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") exitTimerCompositeEdit();
+    if (ev.key === "Escape") (window as any).__ip_exitCompositeEdit?.();
   });
 
   stage.addEventListener("pointerdown", (ev) => {
+    // Hard block: Live mode must be resistant to any editing gestures.
+    if (getAppMode() !== "edit") return;
     const target = ev.target as HTMLElement;
     const anchorEl = target.closest<HTMLElement>(".anchor-dot");
     const handleEl = target.closest<HTMLElement>(".handle");
@@ -3049,8 +3348,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         return;
       }
 
-    // In composite edit mode, never allow selecting/rotating the composite timer itself.
-    if (compositeEditTimerId && id === compositeEditTimerId) {
+    // In composite edit mode:
+    // - Timer: never select/rotate the composite root itself (edit sub-elements only).
+    // - Choices: allow selecting/resizing the root (so the whole composite can be scaled).
+    if (compositeEditKind === "timer" && compositeEditTimerId && id === compositeEditTimerId) {
       nodeEl.querySelector(".handles")?.remove();
       ev.preventDefault();
       return;
@@ -3376,15 +3677,29 @@ async function main() {
   let mode: "edit" | "live" = (localStorage.getItem("ip_mode") as any) === "live" ? "live" : "edit";
 
   const applyMode = () => {
+    // Always leave any edit sub-modes before toggling.
+    try {
+      (window as any).__ip_exitCompositeEdit?.();
+    } catch {}
     exitScreenEdit();
     localStorage.setItem("ip_mode", mode);
     modeWrap.dataset.mode = mode;
+    document.documentElement.dataset.ipMode = mode;
     modeBtn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
     modeHint.textContent =
       mode === "live" ? "Live: left/right step, up/down view • editing disabled" : "Edit: drag/resize/rotate • double-click edit";
 
     detach?.();
     detach = null;
+
+    // Hard guarantee: strip any leftover selection/transform UI when entering Live.
+    if (mode === "live") {
+      document.documentElement.style.cursor = "";
+      for (const h of Array.from(stage.querySelectorAll<HTMLElement>(".handles"))) h.remove();
+      for (const n of Array.from(stage.querySelectorAll<HTMLElement>(".node.is-selected"))) n.classList.remove("is-selected");
+      for (const s of Array.from(stage.querySelectorAll<HTMLElement>(".timer-sub.is-selected, .comp-sub.is-selected")))
+        s.classList.remove("is-selected");
+    }
 
     if (mode === "edit") {
       // Stop polling in edit mode
@@ -3620,11 +3935,15 @@ async function main() {
   applyMode();
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error(err);
-  const app = document.querySelector<HTMLDivElement>("#app");
-  if (app) app.textContent = String(err);
-});
+export async function bootstrap() {
+  try {
+    await main();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    const app = document.querySelector<HTMLDivElement>("#app");
+    if (app) app.textContent = String(err);
+  }
+}
 
 

@@ -111,6 +111,10 @@ export interface TableNodeModel extends BaseNodeModel {
   type: "table";
   rows: string[][];
   delimiter?: string;
+  /** Column style spec (LaTeX-like), e.g. "||c|c|c||" */
+  hstyle?: string;
+  /** Row style spec (LaTeX-like), e.g. "b||c|...||" */
+  vstyle?: string;
 }
 
 export interface TimerNodeModel extends BaseNodeModel {
