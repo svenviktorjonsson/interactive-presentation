@@ -4521,11 +4521,23 @@ async function main() {
   let camTweenTimer: number | null = null;
 
   const DESIGN_H = (model as any).defaults?.designHeight ?? 1080;
+  const DESIGN_W = (model as any).defaults?.designWidth ?? 1920;
+  const baseViewCam = (viewsInOrder[0] as any)?.camera ?? { cx: 0, cy: 0, zoom: 1 };
   const toActualCamera = (c: { cx: number; cy: number; zoom: number }) => {
     // Treat model camera.zoom as a "zoom factor" relative to fitting the design viewport height.
     const scr = engine.getScreen();
     const fit = scr.h / DESIGN_H;
-    return { cx: c.cx, cy: c.cy, zoom: c.zoom * fit };
+    // Backend view layout uses DESIGN_W/DESIGN_H to place views one "design viewport" apart.
+    // But when we fit height, the visible world width depends on the current aspect ratio.
+    // Scale X offsets so adjacent views stay one viewport apart for any window size.
+    const aspect = scr.w / Math.max(1, scr.h);
+    const visibleWAtZoom1 = DESIGN_H * aspect;
+    const xScale = visibleWAtZoom1 / Math.max(1, DESIGN_W);
+    return {
+      cx: baseViewCam.cx + (c.cx - baseViewCam.cx) * xScale,
+      cy: baseViewCam.cy + (c.cy - baseViewCam.cy),
+      zoom: c.zoom * fit,
+    };
   };
 
   const setView = (idx: number, animate: boolean) => {
@@ -4888,6 +4900,15 @@ async function main() {
       window.removeEventListener("keydown", onKeyDown);
     };
   };
+
+  // Keep view layout stable across window resizes:
+  // the next view should always be just outside the visible viewport.
+  window.addEventListener("resize", () => {
+    if ((modeWrap.dataset.mode ?? "edit").toLowerCase() !== "live") return;
+    const v = viewsInOrder[viewIdx];
+    if (!v) return;
+    engine.setCamera(toActualCamera(v.camera));
+  });
 
   // Keyboard shortcuts:
   // - Ctrl+E: switch to Edit
