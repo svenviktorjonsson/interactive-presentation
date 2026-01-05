@@ -275,8 +275,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     };
 
     const renderItems = (items: string[], style: string) => {
-      const fontPx = typeof (node as any).fontPx === "number" ? (node as any).fontPx : 22;
-      el.style.fontSize = `${fontPx}px`;
+      // IMPORTANT:
+      // Do NOT set `el.style.fontSize` here. The engine layout pass sets it (and the editor's
+      // corner-resize updates `fontPx` for bullets just like text).
       list.innerHTML = "";
       items.forEach((item, idx) => {
         const row = document.createElement("div");
@@ -296,8 +297,6 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       setCommonStyles(el, n);
       if (n.type !== "bullets") return;
       const style = (n as any).bullets ?? "A";
-      const fontPx = typeof (n as any).fontPx === "number" ? (n as any).fontPx : 22;
-      el.style.fontSize = `${fontPx}px`;
       renderItems((n as any).items ?? [], style);
     };
 
