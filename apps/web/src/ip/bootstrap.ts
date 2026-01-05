@@ -4,7 +4,8 @@ import { DEBUG_ANIM, dlog, BACKEND } from "./config";
 import { fetchModel, preloadImageAssets, saveModel } from "./api/presentation";
 import { uploadImageToMedia, loadImageSize } from "./api/media";
 import { hydrateQrImages } from "./features/qr";
-import { hydrateTextMath, renderTextWithKatexToHtml } from "./features/textMath";
+import { hydrateTextMath, renderTextToElement, renderTextWithKatexToHtml } from "./features/textMath";
+import { drawTicksAndLabels, niceStepFromCandidates, prepareCanvas } from "./features/plot2d";
 import { buildShell } from "./ui/shell";
 
 
@@ -44,6 +45,31 @@ let exitScreenEdit: () => void = () => {};
 // Presentation started state: controls whether polling for timer/choices happens.
 // Only true in Live mode; false in Edit mode. Defaults to false on app load.
 let presentationStarted = false;
+let __soundState: any = null;
+let __soundStreamStarted = false;
+
+type SoundState = {
+  enabled: boolean;
+  computeSpectrum?: boolean;
+  computePressure?: boolean;
+  seq: number;
+  sampleRateHz: number;
+  windowMs: number;
+  pressure10ms: number[];
+  spectrum: { freqHz: number[]; magDb: number[] };
+  error?: string | null;
+  serverTimeMs: number;
+};
+
+async function fetchSoundState(): Promise<SoundState | null> {
+  try {
+    const res = await fetch(`${BACKEND}/api/sound/state`, { cache: "no-store" });
+    if (!res.ok) return null;
+    return (await res.json()) as SoundState;
+  } catch {
+    return null;
+  }
+}
 
 async function fetchTimerState(): Promise<TimerState | null> {
   try {
@@ -515,31 +541,10 @@ async function simulateTimerSubmissions(timerEl: HTMLElement, opts?: { users?: n
 function drawTimerNode(el: HTMLElement, state: TimerState) {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas.timer-canvas");
   if (!canvas) return;
-  // Skip when culled/hidden.
-  if (el.offsetParent === null) return;
-  const r = el.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  const W = Math.max(2, Math.round(r.width * dpr));
-  const H = Math.max(2, Math.round(r.height * dpr));
-  if (canvas.width !== W || canvas.height !== H) {
-    canvas.width = W;
-    canvas.height = H;
-  }
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, W, H);
-
-  // Define the data-rect coordinate system so it aligns with the default axis arrows.
-  // (left/bottom axes sit on the rectangle borders)
-  const leftF = 0.08;
-  const rightF = 0.92;
-  const topF = 0.10;
-  const bottomF = 0.90;
-  const ox = leftF * W;
-  const oy = bottomF * H;
-  const xLen = (rightF - leftF) * W;
-  const yLen = (bottomF - topF) * H;
+  const prep = prepareCanvas(el, canvas, { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 });
+  if (!prep) return;
+  const { ctx, dpr, rect: r, plot } = prep;
+  const { ox, oy, xLen, yLen } = plot;
 
   // No border around the graph area. The data rect is an invisible reference;
   // only ticks/ticklabels should "stick out" of it.
@@ -582,60 +587,27 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   ctx.globalAlpha = 1;
 
   // Ticks + tick labels (KaTeX font) — drawn on the canvas layer.
-  ctx.save();
-  // Scale tick labels with timer height for smooth zoom.
-  const fontCssPx = Math.max(12, Math.min(64, r.height * 0.028));
-  const fontPx = Math.round(fontCssPx * dpr);
-  ctx.font = `${fontPx}px KaTeX_Main, Times New Roman, serif`;
-  ctx.fillStyle = "rgba(255,255,255,0.80)";
-  ctx.strokeStyle = "rgba(255,255,255,0.32)";
-  ctx.lineWidth = lineWidthPx * dpr;
-
   // X ticks at bin edges from min..max using binSize
-  const tickLen = Math.max(10 * dpr, Math.round(fontCssPx * 0.7 * dpr));
   const fmt = (v: number) => {
     // Avoid noisy decimals but keep bin edges like 20.5.
     const s = Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(2);
     return s.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
   };
 
-  ctx.textAlign = "center";
-  ctx.textBaseline = "top";
-  for (let i = 0; i <= bins; i++) {
-    const v = minS + i * binSizeS;
-    const x = ox + ((v - minS) / span) * xLen;
-    // Tick mark
-    ctx.beginPath();
-    ctx.moveTo(x, oy);
-    ctx.lineTo(x, oy + tickLen);
-    ctx.stroke();
-    // Label
-    ctx.fillText(fmt(v), x, oy + tickLen + 8 * dpr);
-  }
-
   // Y ticks: adapt to the visible range (up to yMax).
   // Keep it simple: choose a "nice" step in percent.
-  const niceStepPct = (maxPct: number) => {
-    const target = Math.max(1, maxPct / 6);
-    const candidates = [1, 2, 5, 10, 20, 25, 50, 100];
-    for (const c of candidates) if (c >= target) return c;
-    return 100;
-  };
   const maxPct = Math.max(1, yMax * 100);
-  const stepPct = niceStepPct(maxPct);
+  const stepPct = niceStepFromCandidates(maxPct, 6, [1, 2, 5, 10, 20, 25, 50, 100]);
 
-  ctx.textAlign = "right";
-  ctx.textBaseline = "middle";
+  const xTicks = new Array(bins + 1).fill(0).map((_, i) => {
+    const v = minS + i * binSizeS;
+    return { xFrac: (v - minS) / span, label: fmt(v) };
+  });
+  const yTicks: Array<{ yFrac: number; label: string }> = [];
   for (let p = 0; p <= maxPct + 1e-9; p += stepPct) {
-    const frac = p / 100;
-    const y = oy - frac * yScale;
-    ctx.beginPath();
-    ctx.moveTo(ox, y);
-    ctx.lineTo(ox - tickLen, y);
-    ctx.stroke();
-    ctx.fillText(String(p), ox - tickLen - 10 * dpr, y);
+    yTicks.push({ yFrac: (p / 100) / yMax, label: String(p) });
   }
-  ctx.restore();
+  drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
 
   // Gaussian overlay normalized 0..1
   // Draw in the SAME units as the bars: expected probability mass per bin.
@@ -667,6 +639,117 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   const mode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
   const bg = el.querySelector<HTMLElement>(".timer-overlay-bg");
   if (bg) bg.style.display = mode === "edit" ? "none" : "block";
+}
+
+function drawSoundNode(el: HTMLElement, state: SoundState) {
+  const canvas = el.querySelector<HTMLCanvasElement>("canvas.sound-canvas");
+  if (!canvas) return;
+  const prep = prepareCanvas(el, canvas, { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 });
+  if (!prep) return;
+  const { ctx, dpr, rect: r, plot, H } = prep;
+  const { ox, oy, xLen, yLen } = plot;
+
+  const mode = (el.dataset.mode ?? "spectrum").toLowerCase();
+  const col = el.dataset.color ?? "white";
+  const windowS = Math.max(1, Number(el.dataset.windowS ?? "30") || 30);
+
+  if (!state.enabled) {
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.font = `${Math.max(12, Math.round(14 * dpr))}px system-ui, sans-serif`;
+    ctx.fillText("Paused", ox, 0.10 * H);
+    return;
+  }
+
+  // Title / error
+  if (state.error) {
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.font = `${Math.max(10, Math.round(12 * dpr))}px system-ui, sans-serif`;
+    ctx.fillText(String(state.error), ox, 0.10 * H);
+    return;
+  }
+
+  if (mode === "pressure") {
+    const ys0 = state.pressure10ms ?? [];
+    const nKeep = Math.max(2, Math.min(ys0.length, Math.round(windowS * 100)));
+    const ys = ys0.slice(-nKeep);
+    const n = ys.length;
+    if (n <= 1) return;
+    // Keep a bit of headroom so it doesn't look pegged.
+    const maxY = Math.max(1e-9, Math.max(...ys) * 1.05);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = Math.max(1, 2 * dpr);
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      const x = ox + t * xLen;
+      const yv = ys[i] / maxY;
+      const y = oy - yv * yLen;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Timer-like ticks/labels
+    const lineWidthPx = 2;
+    const xTicks: Array<{ xFrac: number; label: string }> = [];
+    const stepS = niceStepFromCandidates(windowS, 6, [0.5, 1, 2, 5, 10, 15, 30, 60]);
+    for (let s = 0; s <= windowS + 1e-9; s += stepS) {
+      xTicks.push({ xFrac: s / windowS, label: String(Math.round(s * 100) / 100).replace(/\.0+$/, "") });
+    }
+    const yTicks: Array<{ yFrac: number; label: string }> = [];
+    for (let i = 0; i <= 5; i++) {
+      const frac = i / 5;
+      yTicks.push({ yFrac: frac, label: String(Math.round(frac * 100) / 100) });
+    }
+    drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
+    return;
+  }
+
+  // spectrum
+  const f = state.spectrum?.freqHz ?? [];
+  const m = state.spectrum?.magDb ?? [];
+  const n = Math.min(f.length, m.length);
+  if (n <= 1) return;
+  // Show up to 8kHz by default (good for speech); clamp if SR is lower.
+  const maxHz = Math.min(8000, Math.max(...f));
+  const minDb = -120;
+  const maxDb = 0;
+  ctx.strokeStyle = col;
+  ctx.lineWidth = Math.max(1, 2 * dpr);
+  ctx.beginPath();
+  let started = false;
+  for (let i = 0; i < n; i++) {
+    const hz = f[i];
+    if (hz < 0 || hz > maxHz) continue;
+    const t = hz / maxHz;
+    const x = ox + t * xLen;
+    const db = Math.max(minDb, Math.min(maxDb, m[i]));
+    const yv = (db - minDb) / (maxDb - minDb);
+    const y = oy - yv * yLen;
+    if (!started) {
+      ctx.moveTo(x, y);
+      started = true;
+    } else {
+      ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+
+  // Spectrum ticks (timer-like)
+  {
+    const lineWidthPx = 2;
+    const xTicks: Array<{ xFrac: number; label: string }> = [];
+    const stepHz = niceStepFromCandidates(maxHz, 6, [100, 200, 500, 1000, 2000, 4000, 8000, 16000]);
+    for (let hz = 0; hz <= maxHz + 1e-9; hz += stepHz) {
+      xTicks.push({ xFrac: hz / maxHz, label: String(Math.round(hz)) });
+    }
+    const yTicks: Array<{ yFrac: number; label: string }> = [];
+    for (let db = minDb; db <= maxDb + 1e-9; db += 20) {
+      const frac = (db - minDb) / (maxDb - minDb);
+      yTicks.push({ yFrac: frac, label: String(db) });
+    }
+    drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
+  }
 }
 
 function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
@@ -789,6 +872,40 @@ function attachTimerNodeHandlers(stage: HTMLElement) {
       ev.preventDefault();
       return;
     }
+  });
+}
+
+function attachSoundNodeHandlers(stage: HTMLElement) {
+  stage.addEventListener("click", (ev) => {
+    const t = ev.target as HTMLElement;
+    const btn = t.closest<HTMLButtonElement>("button[data-action]");
+    if (!btn) return;
+    const action = btn.dataset.action;
+    const nodeEl = btn.closest<HTMLElement>(".node-sound");
+    if (!nodeEl) return;
+    if (action === "sound-toggle") {
+      const running = (__soundState as SoundState | null)?.enabled ?? false;
+      void fetch(`${BACKEND}/api/sound/${running ? "pause" : "start"}`, { method: "POST" });
+      ev.preventDefault();
+      return;
+    }
+    if (action === "sound-reset") {
+      void fetch(`${BACKEND}/api/sound/reset`, { method: "POST" });
+      ev.preventDefault();
+      return;
+    }
+    if (action?.startsWith("sound-mode-")) {
+      nodeEl.dataset.mode = action.endsWith("pressure") ? "pressure" : "spectrum";
+      // Tell backend to pause the inactive computation to save CPU.
+      void fetch(`${BACKEND}/api/sound/mode`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ mode: nodeEl.dataset.mode }),
+      });
+      ev.preventDefault();
+      return;
+    }
+    ev.preventDefault();
   });
 }
 
@@ -1201,6 +1318,320 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
   window.setInterval(() => void tick(), 350);
 }
 
+function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: HTMLElement) {
+  if (__soundStreamStarted) return;
+  __soundStreamStarted = true;
+  attachSoundNodeHandlers(stage);
+
+  // Draw loop
+  let rafStarted = false;
+  const startDrawRaf = () => {
+    if (rafStarted) return;
+    rafStarted = true;
+    const raf = () => {
+      const st = __soundState as SoundState | null;
+      if (st) {
+        const cur = engine.getModel();
+        if (cur) {
+          for (const n of cur.nodes) {
+            if ((n as any).type !== "sound") continue;
+            const el = engine.getNodeElement((n as any).id);
+            if (el) {
+              // Update run/pause label based on global capture state
+              const toggleBtn = el.querySelector<HTMLButtonElement>('button[data-action="sound-toggle"]');
+              if (toggleBtn) toggleBtn.textContent = st?.enabled ? "Pause" : "Run";
+              const resetBtn = el.querySelector<HTMLButtonElement>('button[data-action="sound-reset"]');
+              if (resetBtn) resetBtn.disabled = !st?.enabled && !(st?.seq > 0);
+              // Mode is a local UI toggle; default from node.dataset.mode if present.
+              drawSoundNode(el, st);
+              const layer = ensureSoundCompositeLayer(engine, (n as any).id);
+              if (layer) {
+                renderSoundCompositeArrows(el, layer);
+                layoutSoundCompositeTexts(el, layer);
+                const modeNow = (el.dataset.mode ?? "spectrum").toLowerCase();
+                // Peak frequency (spectrum only)
+                let peakHz: string | number = "-";
+                if (modeNow === "spectrum") {
+                  const f = st.spectrum?.freqHz ?? [];
+                  const m = st.spectrum?.magDb ?? [];
+                  let bestI = -1;
+                  let best = -1e9;
+                  for (let i = 1; i < Math.min(f.length, m.length); i++) {
+                    const hz = Number(f[i]);
+                    const db = Number(m[i]);
+                    if (!Number.isFinite(hz) || !Number.isFinite(db)) continue;
+                    if (hz < 20) continue;
+                    if (db > best) {
+                      best = db;
+                      bestI = i;
+                    }
+                  }
+                  if (bestI >= 0) peakHz = Math.round(Number(f[bestI]));
+                }
+                const data: Record<string, string> =
+                  modeNow === "pressure"
+                    ? { xLabel: "Time (s)", yLabel: "Pressure (RMS)", peakHz: "-" }
+                    : { xLabel: "Frequency (Hz)", yLabel: "Magnitude (dB)", peakHz: String(peakHz) };
+                renderSoundCompositeTexts(el, layer, data);
+              }
+            }
+          }
+        }
+      }
+      window.requestAnimationFrame(raf);
+    };
+    window.requestAnimationFrame(raf);
+  };
+  startDrawRaf();
+
+  // SSE stream (only meaningful in Live mode, but harmless in Edit)
+  try {
+    const es = new EventSource(`${BACKEND}/api/sound/stream`);
+    es.onmessage = (ev) => {
+      try {
+        __soundState = JSON.parse(ev.data) as SoundState;
+      } catch {
+        // ignore
+      }
+    };
+    es.onerror = async () => {
+      // fallback: poll slowly if SSE fails
+      const st = await fetchSoundState();
+      if (st) __soundState = st;
+    };
+  } catch {
+    // fallback to polling
+    window.setInterval(async () => {
+      const st = await fetchSoundState();
+      if (st) __soundState = st;
+    }, 200);
+  }
+}
+
+function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
+  const m = engine.getModel();
+  const node = m?.nodes.find((n) => (n as any).id === soundId) as any;
+  const el = engine.getNodeElement(soundId);
+  if (!node || !el) return null;
+  const frame = el.querySelector<HTMLElement>(":scope .sound-frame");
+  if (!frame) return null;
+
+  let layer = frame.querySelector<HTMLElement>(":scope .sound-sub-layer");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.className = "sound-sub-layer";
+    layer.dataset.soundId = soundId;
+    layer.style.position = "absolute";
+    layer.style.inset = "0";
+    layer.style.overflow = "visible";
+    layer.style.pointerEvents = "none";
+    frame.append(layer);
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("sound-sub-svg");
+    svg.style.position = "absolute";
+    svg.style.inset = "0";
+    svg.style.width = "100%";
+    svg.style.height = "100%";
+    svg.style.overflow = "visible";
+    svg.style.pointerEvents = "none";
+    layer.append(svg);
+
+    const geoms: Record<string, any> = node.compositeGeometries ?? {};
+    const text = String(node.elementsText ?? "");
+    const lines = text.split(/\r?\n/);
+    const arrowSpecs: Array<{ id: string; x0: number; y0: number; x1: number; y1: number; color: string; width: number }> = [];
+    for (const ln0 of lines) {
+      const ln = ln0.trim();
+      if (!ln || ln.startsWith("#")) continue;
+
+      const mt = ln.match(/^text\[name=(?<id>[a-zA-Z_]\w*)\]\s*:\s*(?<content>.*)$/);
+      if (mt?.groups) {
+        const sid = mt.groups.id;
+        const content = mt.groups.content ?? "";
+        const g = geoms[sid] ?? { x: 0.5, y: 0.5, w: 0.4, h: 0.1, rotationDeg: 0, anchor: "centerCenter", align: "center" };
+        const d = document.createElement("div");
+        d.className = "sound-sub sound-sub-text comp-sub";
+        d.dataset.subId = sid;
+        d.dataset.compPath = soundId;
+        d.dataset.template = content;
+        const contentEl = document.createElement("div");
+        contentEl.className = "sound-sub-content";
+        contentEl.style.width = "100%";
+        contentEl.style.height = "100%";
+        contentEl.style.display = "grid";
+        contentEl.style.placeItems = "center";
+        d.append(contentEl);
+        d.style.position = "absolute";
+        d.style.left = `${(g.x ?? 0.5) * 100}%`;
+        d.style.top = `${(g.y ?? 0.5) * 100}%`;
+        d.style.width = `${(g.w ?? 0.4) * 100}%`;
+        d.style.height = `${(g.h ?? 0.1) * 100}%`;
+        d.style.transform = "translate(-50%, -50%)";
+        d.style.padding = "0";
+        d.style.borderRadius = "0";
+        d.style.border = "none";
+        d.style.background = "transparent";
+        d.style.color = "rgba(255,255,255,0.92)";
+        d.style.userSelect = "none";
+        d.style.pointerEvents = "none";
+        d.style.whiteSpace = "nowrap";
+        d.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+        d.style.fontWeight = "400";
+        d.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+        const rot = Number(g.rotationDeg ?? 0);
+        if (rot) d.style.rotate = `${rot}deg`;
+        layer.append(d);
+        continue;
+      }
+
+      const ma = ln.match(
+        /^arrow\[name=(?<id>[a-zA-Z_]\w*),from=\((?<x0>-?(?:\d+\.?\d*|\.\d+)),(?<y0>-?(?:\d+\.?\d*|\.\d+))\),to=\((?<x1>-?(?:\d+\.?\d*|\.\d+)),(?<y1>-?(?:\d+\.?\d*|\.\d+))\)(?:,color=(?<color>[^,\]]+))?(?:,width=(?<width>-?(?:\d+\.?\d*|\.\d+)))?\]$/
+      );
+      if (ma?.groups) {
+        const sid = ma.groups.id;
+        arrowSpecs.push({
+          id: sid,
+          x0: Number(ma.groups.x0),
+          y0: Number(ma.groups.y0),
+          x1: Number(ma.groups.x1),
+          y1: Number(ma.groups.y1),
+          color: (ma.groups.color ?? "white").trim(),
+          width: ma.groups.width == null ? 0.006 : Number(ma.groups.width),
+        });
+        continue;
+      }
+    }
+    (layer as any).__arrowSpecs = arrowSpecs;
+    (layer as any).__textGeoms = geoms;
+    (layer as any).__elementsText = text;
+  }
+  return layer;
+}
+
+function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .sound-sub-text"));
+  const hPx = Number(soundEl.dataset.soundHpx ?? "0");
+  const wPx = Number(soundEl.dataset.soundWpx ?? "0");
+  const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
+  for (const t of els) {
+    const sid = t.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const x = Number(g.x ?? 0.5);
+    const y = Number(g.y ?? 0.5);
+    const w = Number(g.w ?? 0.4);
+    const h = Number(g.h ?? 0.1);
+    const anchor = String(g.anchor ?? t.dataset.anchor ?? "centerCenter");
+    t.dataset.anchor = anchor;
+    t.style.left = `${x * 100}%`;
+    t.style.top = `${y * 100}%`;
+    t.style.width = `${w * 100}%`;
+    t.style.height = `${h * 100}%`;
+    t.style.rotate = `${Number(g.rotationDeg ?? 0)}deg`;
+    t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+    const fontPx = Math.max(16, box.height * h * 0.85);
+    t.style.fontSize = `${fontPx}px`;
+    t.style.lineHeight = `${fontPx}px`;
+    const tpl = t.dataset.template ?? "";
+    const resolved = applyDataBindings(tpl, data);
+    const prev = t.dataset.rawText ?? "";
+    if (prev !== resolved) {
+      t.dataset.rawText = resolved;
+      const contentEl = t.querySelector<HTMLElement>(":scope > .sound-sub-content");
+      if (contentEl) renderTextToElement(contentEl, resolved);
+    }
+
+    // Spectrum-only label
+    if (sid === "peak") {
+      const modeNow = (soundEl.dataset.mode ?? "spectrum").toLowerCase();
+      t.style.display = modeNow === "pressure" ? "none" : "block";
+    }
+  }
+}
+
+function layoutSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .sound-sub-text"));
+  const hPx = Number(soundEl.dataset.soundHpx ?? "0");
+  const wPx = Number(soundEl.dataset.soundWpx ?? "0");
+  const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
+  for (const t of els) {
+    const sid = t.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const h = Number(g.h ?? 0.1);
+    const fontPx = Math.max(16, box.height * h * 0.85);
+    t.style.fontSize = `${fontPx}px`;
+    t.style.lineHeight = `${fontPx}px`;
+  }
+}
+
+function renderSoundCompositeArrows(soundEl: HTMLElement, layer: HTMLElement) {
+  const svg = layer.querySelector<SVGSVGElement>(":scope > .sound-sub-svg");
+  if (!svg) return;
+  const specs: any[] = (layer as any).__arrowSpecs ?? [];
+  if (!Array.isArray(specs) || specs.length === 0) {
+    svg.replaceChildren();
+    return;
+  }
+  const cachedW = Number(soundEl.dataset.soundWpx ?? "0");
+  const cachedH = Number(soundEl.dataset.soundHpx ?? "0");
+  if (!(cachedW > 1 && cachedH > 1)) return;
+  let w = Math.max(1, cachedW);
+  let h = Math.max(1, cachedH);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  const soundId = layer.dataset.soundId ?? "sound";
+
+  const leftF = 0.08;
+  const rightF = 0.92;
+  const topF = 0.10;
+  const bottomF = 0.90;
+  const ox = leftF * w;
+  const oy = bottomF * h;
+  const xLen = (rightF - leftF) * w;
+  const yLen = (bottomF - topF) * h;
+  const mapX = (u: number) => ox + u * xLen;
+  const mapY = (vUp: number) => oy - vUp * yLen;
+  const dataMin = Math.max(1, Math.min(xLen, yLen));
+
+  for (const a of specs) {
+    const relW = typeof a.width === "number" && isFinite(a.width) ? a.width : 0.006;
+    const lwPx = Math.max(0.5, Math.min(16, relW * dataMin));
+    const headWPx = 3 * lwPx;
+    const headLPx = 5 * lwPx;
+    const x1 = mapX(Number(a.x0 ?? 0));
+    const y1 = mapY(Number(a.y0 ?? 0));
+    const x2 = mapX(Number(a.x1 ?? 1));
+    const y2 = mapY(Number(a.y1 ?? 1));
+    const markerId = `arrowhead-${soundId}-${a.id}`;
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.setAttribute("id", markerId);
+    marker.setAttribute("markerUnits", "userSpaceOnUse");
+    marker.setAttribute("markerWidth", String(headLPx));
+    marker.setAttribute("markerHeight", String(headWPx));
+    marker.setAttribute("refX", "0");
+    marker.setAttribute("refY", String(headWPx / 2));
+    marker.setAttribute("orient", "auto");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M0,0 L${headLPx},${headWPx / 2} L0,${headWPx} Z`);
+    path.setAttribute("fill", a.color ?? "white");
+    marker.append(path);
+    defs.append(marker);
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+    line.setAttribute("stroke", a.color ?? "white");
+    line.setAttribute("stroke-width", String(lwPx));
+    line.setAttribute("stroke-linecap", "round");
+    line.setAttribute("marker-end", `url(#${markerId})`);
+    g.append(line);
+  }
+  svg.replaceChildren(defs, g);
+}
 function smoothstep(edge0: number, edge1: number, x: number) {
   const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
   return t * t * (3 - 2 * t);
@@ -1401,6 +1832,90 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   let lastContextWorld: { x: number; y: number } | null = null;
   let activeViewId: string = stage.dataset.viewId || "home";
 
+  // Simple top toolbox (edit mode): pick what to place.
+  let tool: "select" | "text" | "bullets" | "arrow" = "select";
+  let arrowDraft:
+    | null
+    | {
+        start: { x: number; y: number };
+        space: "world" | "screen";
+        previewEl: HTMLElement;
+        lineEl: SVGLineElement;
+      } = null;
+  const toolbox = document.createElement("div");
+  toolbox.className = "edit-toolbox";
+  toolbox.style.position = "fixed";
+  toolbox.style.left = "50%";
+  toolbox.style.top = "10px";
+  toolbox.style.transform = "translateX(-50%)";
+  toolbox.style.zIndex = "99998";
+  toolbox.style.display = "flex";
+  toolbox.style.gap = "8px";
+  toolbox.style.padding = "8px";
+  toolbox.style.borderRadius = "12px";
+  toolbox.style.border = "1px solid rgba(255,255,255,0.16)";
+  toolbox.style.background = "rgba(15,17,24,0.92)";
+  toolbox.style.backdropFilter = "blur(8px)";
+  toolbox.style.pointerEvents = "auto";
+  // Keep toolbox clicks local (but don't block the button itself).
+  toolbox.addEventListener("pointerdown", (e) => e.stopPropagation());
+  toolbox.addEventListener("click", (e) => e.stopPropagation());
+
+  const mkToolBtn = (id: typeof tool, label: string, iconHtml: string) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.innerHTML = iconHtml;
+    b.title = label;
+    b.setAttribute("aria-label", label);
+    b.style.border = "1px solid rgba(255,255,255,0.16)";
+    b.style.borderRadius = "10px";
+    b.style.width = "44px";
+    b.style.height = "40px";
+    b.style.padding = "0";
+    b.style.background = "rgba(255,255,255,0.06)";
+    b.style.color = "rgba(255,255,255,0.92)";
+    b.style.fontWeight = "800";
+    b.style.display = "grid";
+    (b.style as any).placeItems = "center";
+    b.addEventListener("click", () => {
+      tool = id;
+      for (const x of Array.from(toolbox.querySelectorAll<HTMLButtonElement>("button"))) {
+        x.dataset.active = x === b ? "1" : "0";
+        x.style.background = x === b ? "rgba(110,168,255,0.22)" : "rgba(255,255,255,0.06)";
+        x.style.borderColor = x === b ? "rgba(110,168,255,0.36)" : "rgba(255,255,255,0.16)";
+      }
+    });
+    return b;
+  };
+
+  const ICON = {
+    select: `<svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M4 3l8 18 2.2-6.2L21 12 4 3z" fill="currentColor" opacity="0.92"/>
+    </svg>`,
+    text: `<span style="display:inline-grid;place-items:center;border:1px dashed rgba(255,255,255,0.55);border-radius:6px;padding:2px 6px;font-weight:900;line-height:1;">Aa</span>`,
+    bullets: `<svg width="22" height="18" viewBox="0 0 22 18" fill="none" aria-hidden="true">
+      <circle cx="3" cy="4" r="1.4" fill="currentColor" opacity="0.92"/>
+      <circle cx="3" cy="9" r="1.4" fill="currentColor" opacity="0.92"/>
+      <circle cx="3" cy="14" r="1.4" fill="currentColor" opacity="0.92"/>
+      <path d="M7 4h14M7 9h14M7 14h14" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity="0.92"/>
+    </svg>`,
+    arrow: `<svg width="22" height="18" viewBox="0 0 22 18" fill="none" aria-hidden="true">
+      <path d="M2 9h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+      <path d="M12 4l6 5-6 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`
+  };
+  toolbox.append(
+    mkToolBtn("select", "Select", ICON.select),
+    mkToolBtn("text", "Text", ICON.text),
+    mkToolBtn("bullets", "Bullets", ICON.bullets),
+    mkToolBtn("arrow", "Arrow", ICON.arrow)
+  );
+  // Default active button
+  (toolbox.querySelector<HTMLButtonElement>("button") as any)?.click?.();
+  // Avoid duplicating if attachEditor is called multiple times.
+  document.querySelector(".edit-toolbox")?.remove();
+  document.body.appendChild(toolbox);
+
   const undoStack: PresentationModel[] = [];
   const redoStack: PresentationModel[] = [];
   const cloneModel = (m: PresentationModel): PresentationModel => JSON.parse(JSON.stringify(m)) as PresentationModel;
@@ -1509,6 +2024,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const id = nextId("text");
     const space = opts?.space === "screen" ? "screen" : "world";
     const isScreen = space === "screen";
+    const scr = engine.getScreen();
+    const pxToFrac = (p: { x: number; y: number }) =>
+      scr.w > 0 && scr.h > 0 ? { x: p.x / scr.w, y: p.y / scr.h } : { x: 0, y: 0 };
     const node: any = {
       id,
       type: "text",
@@ -1516,10 +2034,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       text: "New text",
       align: "center",
       transform: {
-        x: pos.x,
-        y: pos.y,
-        w: isScreen ? 420 : 520,
-        h: isScreen ? 80 : 80,
+        x: isScreen ? pxToFrac(pos).x : pos.x,
+        y: isScreen ? pxToFrac(pos).y : pos.y,
+        // Screen-space sizes are normalized; derive from current pixel size targets.
+        w: isScreen ? 420 / Math.max(1, scr.w) : 520,
+        h: isScreen ? 80 / Math.max(1, scr.h) : 80,
         anchor: "centerCenter",
         rotationDeg: 0
       }
@@ -1552,6 +2071,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const id = nextId("table");
     const space = opts?.space === "screen" ? "screen" : "world";
     const isScreen = space === "screen";
+    const scr = engine.getScreen();
+    const pxToFrac = (p: { x: number; y: number }) =>
+      scr.w > 0 && scr.h > 0 ? { x: p.x / scr.w, y: p.y / scr.h } : { x: 0, y: 0 };
     const node: any = {
       id,
       type: "table",
@@ -1566,10 +2088,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         ["7", "8", "9"]
       ],
       transform: {
-        x: pos.x,
-        y: pos.y,
-        w: isScreen ? 520 : 720,
-        h: isScreen ? 260 : 320,
+        x: isScreen ? pxToFrac(pos).x : pos.x,
+        y: isScreen ? pxToFrac(pos).y : pos.y,
+        w: isScreen ? 520 / Math.max(1, scr.w) : 720,
+        h: isScreen ? 260 / Math.max(1, scr.h) : 320,
         anchor: "centerCenter",
         rotationDeg: 0
       }
@@ -1592,6 +2114,244 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     await commit(before);
   };
 
+  const addBulletsAt = async (
+    pos: { x: number; y: number },
+    opts?: { space?: "world" | "screen" }
+  ) => {
+    const model = engine.getModel();
+    if (!model) return;
+    const before = cloneModel(model);
+    const id = nextId("bullets");
+    const space = opts?.space === "screen" ? "screen" : "world";
+    const isScreen = space === "screen";
+    const scr = engine.getScreen();
+    const pxToFrac = (p: { x: number; y: number }) =>
+      scr.w > 0 && scr.h > 0 ? { x: p.x / scr.w, y: p.y / scr.h } : { x: 0, y: 0 };
+    const node: any = {
+      id,
+      type: "bullets",
+      space,
+      bullets: "A",
+      items: ["First", "Second", "Third"],
+      fontPx: 22,
+      transform: {
+        x: isScreen ? pxToFrac(pos).x : pos.x,
+        y: isScreen ? pxToFrac(pos).y : pos.y,
+        w: isScreen ? 520 / Math.max(1, scr.w) : 520,
+        h: isScreen ? 220 / Math.max(1, scr.h) : 220,
+        anchor: "centerCenter",
+        rotationDeg: 0
+      }
+    };
+    model.nodes.push(node);
+    if (isScreen) {
+      for (const v of model.views) {
+        if (!v.show.includes(id)) v.show.push(id);
+      }
+    } else {
+      const viewId = getActiveViewId();
+      const view = model.views.find((v) => v.id === viewId) ?? model.views[0];
+      if (view && !view.show.includes(id)) view.show.push(id);
+    }
+    engine.setModel(cloneModel(model));
+    hydrateTextMath(engine, model);
+    selected.clear();
+    selected.add(id);
+    applySelection();
+    await commit(before);
+  };
+
+  const addArrowFromTo = async (
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    opts?: { space?: "world" | "screen" }
+  ) => {
+    const model = engine.getModel();
+    if (!model) return;
+    const before = cloneModel(model);
+    const id = nextId("arrow");
+    const space = opts?.space === "screen" ? "screen" : "world";
+
+    const minSize = 10;
+    const x0 = Math.min(from.x, to.x);
+    const y0 = Math.min(from.y, to.y);
+    const w0 = Math.max(minSize, Math.abs(to.x - from.x));
+    const h0 = Math.max(minSize, Math.abs(to.y - from.y));
+    const fx = (from.x - x0) / w0;
+    const fy = (from.y - y0) / h0;
+    const tx = (to.x - x0) / w0;
+    const ty = (to.y - y0) / h0;
+
+    const scr = engine.getScreen();
+    const xN = space === "screen" ? x0 / Math.max(1, scr.w) : x0;
+    const yN = space === "screen" ? y0 / Math.max(1, scr.h) : y0;
+    const wN = space === "screen" ? w0 / Math.max(1, scr.w) : w0;
+    const hN = space === "screen" ? h0 / Math.max(1, scr.h) : h0;
+
+    const node: any = {
+      id,
+      type: "arrow",
+      space,
+      from: { x: fx, y: fy },
+      to: { x: tx, y: ty },
+      color: "white",
+      width: 0.02,
+      transform: { x: xN, y: yN, w: wN, h: hN, anchor: "topLeft", rotationDeg: 0 }
+    };
+    model.nodes.push(node);
+
+    if (space === "screen") {
+      for (const v of model.views) {
+        if (!v.show.includes(id)) v.show.push(id);
+      }
+    } else {
+      const viewId = getActiveViewId();
+      const view = model.views.find((v) => v.id === viewId) ?? model.views[0];
+      if (view && !view.show.includes(id)) view.show.push(id);
+    }
+    engine.setModel(cloneModel(model));
+    hydrateTextMath(engine, model);
+    selected.clear();
+    selected.add(id);
+    applySelection();
+    await commit(before);
+  };
+
+  // Placement tool handler (capture) so it runs before selection/pan handlers.
+  stage.addEventListener(
+    "pointerdown",
+    (ev) => {
+      if (getAppMode() !== "edit") return;
+      if (tool === "select") return;
+      const t = ev.target as HTMLElement;
+      // Don’t interfere with normal manipulation when clicking nodes/handles/UI.
+      if (
+        t.closest(".edit-toolbox") ||
+        t.closest(".node") ||
+        t.closest(".handles") ||
+        t.closest(".modal") ||
+        t.closest(".ctx-menu") ||
+        t.closest(".mode-toggle")
+      )
+        return;
+
+      const r = stage.getBoundingClientRect();
+      const cam = engine.getCamera();
+      const scr = engine.getScreen();
+      const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+      const space: "world" | "screen" = screenEditMode ? "screen" : "world";
+      const pos = space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
+
+      if (tool === "text") {
+        void addTextAt(pos, { space });
+        ev.preventDefault();
+        (ev as any).stopImmediatePropagation?.();
+        return;
+      }
+      if (tool === "bullets") {
+        void addBulletsAt(pos, { space });
+        ev.preventDefault();
+        (ev as any).stopImmediatePropagation?.();
+        return;
+      }
+      if (tool === "arrow") {
+        // Create a lightweight preview overlay (not part of the model).
+        const preview = document.createElement("div");
+        preview.style.position = "absolute";
+        preview.style.left = `${pos.x}px`;
+        preview.style.top = `${pos.y}px`;
+        preview.style.width = "1px";
+        preview.style.height = "1px";
+        preview.style.pointerEvents = "none";
+        preview.style.overflow = "visible";
+
+        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("width", "1");
+        svg.setAttribute("height", "1");
+        svg.setAttribute("viewBox", "0 0 100 100");
+        (svg.style as any).overflow = "visible";
+
+        const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+        const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+        marker.setAttribute("id", "arrowhead-preview");
+        marker.setAttribute("markerWidth", "10");
+        marker.setAttribute("markerHeight", "10");
+        marker.setAttribute("refX", "10");
+        marker.setAttribute("refY", "5");
+        marker.setAttribute("orient", "auto");
+        marker.setAttribute("markerUnits", "strokeWidth");
+        const pth = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        pth.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
+        pth.setAttribute("fill", "white");
+        marker.appendChild(pth);
+        defs.appendChild(marker);
+        svg.appendChild(defs);
+
+        const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        ln.setAttribute("x1", "0");
+        ln.setAttribute("y1", "0");
+        ln.setAttribute("x2", "100");
+        ln.setAttribute("y2", "0");
+        ln.setAttribute("stroke", "white");
+        ln.setAttribute("stroke-width", "2");
+        ln.setAttribute("stroke-linecap", "round");
+        ln.setAttribute("marker-end", "url(#arrowhead-preview)");
+        svg.appendChild(ln);
+
+        preview.appendChild(svg);
+        // Use overlay for consistent positioning.
+        const overlay = engine.getNodeElement("__nonexistent__")?.parentElement ?? stage.querySelector<HTMLElement>(".overlay") ?? stage;
+        overlay.appendChild(preview);
+
+        arrowDraft = { start: pos, space, previewEl: preview, lineEl: ln };
+        (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+        ev.preventDefault();
+        (ev as any).stopImmediatePropagation?.();
+      }
+    },
+    { capture: true }
+  );
+
+  stage.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (!arrowDraft) return;
+      const r = stage.getBoundingClientRect();
+      const cam = engine.getCamera();
+      const scr = engine.getScreen();
+      const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+      const pos = arrowDraft.space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
+      const dx = pos.x - arrowDraft.start.x;
+      const dy = pos.y - arrowDraft.start.y;
+      const len = Math.max(1, Math.hypot(dx, dy));
+      const ux = (dx / len) * 100;
+      const uy = (dy / len) * 100;
+      arrowDraft.lineEl.setAttribute("x2", String(ux));
+      arrowDraft.lineEl.setAttribute("y2", String(uy));
+    },
+    { capture: true }
+  );
+
+  stage.addEventListener(
+    "pointerup",
+    (ev) => {
+      if (!arrowDraft) return;
+      const r = stage.getBoundingClientRect();
+      const cam = engine.getCamera();
+      const scr = engine.getScreen();
+      const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
+      const end = arrowDraft.space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
+      const start = arrowDraft.start;
+      arrowDraft.previewEl.remove();
+      const space = arrowDraft.space;
+      arrowDraft = null;
+      void addArrowFromTo(start, end, { space });
+      ev.preventDefault();
+      (ev as any).stopImmediatePropagation?.();
+    },
+    { capture: true }
+  );
+
   const addImageAt = async (
     pos: { x: number; y: number },
     file: File,
@@ -1603,6 +2363,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const id = nextId("image");
     const space = opts?.space === "screen" ? "screen" : "world";
     const isScreen = space === "screen";
+    const scr = engine.getScreen();
+    const pxToFrac = (p: { x: number; y: number }) =>
+      scr.w > 0 && scr.h > 0 ? { x: p.x / scr.w, y: p.y / scr.h } : { x: 0, y: 0 };
 
     const up = await uploadImageToMedia(file);
     const size = await loadImageSize(up.src);
@@ -1619,10 +2382,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       space,
       src: up.src,
       transform: {
-        x: pos.x,
-        y: pos.y,
-        w,
-        h,
+        x: isScreen ? pxToFrac(pos).x : pos.x,
+        y: isScreen ? pxToFrac(pos).y : pos.y,
+        w: isScreen ? w / Math.max(1, scr.w) : w,
+        h: isScreen ? h / Math.max(1, scr.h) : h,
         anchor: "centerCenter",
         rotationDeg: 0
       }
@@ -1792,6 +2555,15 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         canAdd,
         () =>
           addTextAt(
+            (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
+            { space: screenEditMode ? "screen" : "world" }
+          )
+      ),
+      mkItem(
+        "Add bullets",
+        canAdd,
+        () =>
+          addBulletsAt(
             (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
             { space: screenEditMode ? "screen" : "world" }
           )
@@ -2593,7 +3365,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
   // Composite edit mode (timer/choices): allow editing sub-elements without opening the regular modal.
   let compositeEditTimerId: string | null = null; // composite root node id
-  let compositeEditKind: "timer" | "choices" = "timer";
+  let compositeEditKind: "timer" | "choices" | "sound" = "timer";
   let compositeEditPath: string = "";
   const compositeGeomsByPath: Record<string, any> = {};
   let compositeHiddenEls: HTMLElement[] = [];
@@ -2642,11 +3414,27 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     clearSelection();
     screenEditMode = true;
     const model = engine.getModel();
+    const clampScreenTransform = (t: any) => {
+      const w = Number(t.w ?? 0.2);
+      const h = Number(t.h ?? 0.1);
+      const anchor = String(t.anchor ?? "topLeft");
+      const tl0 = anchorToTopLeftWorld({ x: Number(t.x ?? 0), y: Number(t.y ?? 0), w, h, anchor } as any);
+      const tlx = Math.max(-0.5 * w, Math.min(1 - 0.5 * w, tl0.x));
+      const tly = Math.max(-0.5 * h, Math.min(1 - 0.5 * h, tl0.y));
+      const ap = topLeftToAnchorWorld({ x: tlx, y: tly, w, h }, anchor);
+      return { ...t, x: ap.x, y: ap.y };
+    };
     for (const n of model?.nodes ?? []) {
       const el = engine.getNodeElement(n.id);
       if (!el) continue;
       if (n.space === "screen") {
         el.style.pointerEvents = "auto";
+        // Snap underlying transform into a "half-visible" region so it's draggable immediately.
+        const t0: any = (n as any).transform ?? {};
+        const t1 = clampScreenTransform(t0);
+        if (t1.x !== t0.x || t1.y !== t0.y) {
+          engine.updateNode(n.id, { transform: { x: t1.x, y: t1.y } as any } as any);
+        }
         continue;
       }
       el.classList.add("ip-dim-node");
@@ -2661,6 +3449,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   const enterTimerCompositeEdit = (timerId: string) => {
+    // Avoid conflicting isolate modes.
+    exitScreenEdit();
     compositeEditKind = "timer";
     compositeEditTimerId = timerId;
     clearSelection();
@@ -2705,6 +3495,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   const enterChoicesCompositeEdit = (pollId: string) => {
+    // Avoid conflicting isolate modes.
+    exitScreenEdit();
     compositeEditKind = "choices";
     compositeEditTimerId = pollId;
     const el = engine.getNodeElement(pollId);
@@ -2764,6 +3556,44 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     (window as any).__ip_compositeEditing = true;
   };
 
+  const enterSoundCompositeEdit = (soundId: string) => {
+    // Avoid conflicting isolate modes.
+    exitScreenEdit();
+    compositeEditKind = "sound";
+    compositeEditTimerId = soundId;
+    clearSelection();
+    const el = engine.getNodeElement(soundId);
+    if (!el) return;
+    el.querySelector(".handles")?.remove();
+    const ov = el.querySelector<HTMLElement>(".sound-overlay");
+    if (ov) ov.style.display = "none";
+
+    compositeHiddenEls = [];
+    const model = engine.getModel();
+    for (const n of model?.nodes ?? []) {
+      if (n.id === soundId) continue;
+      const e2 = engine.getNodeElement(n.id);
+      if (!e2) continue;
+      e2.classList.add("ip-dim-node");
+      compositeHiddenEls.push(e2);
+    }
+    const layer = ensureSoundCompositeLayer(engine, soundId);
+    if (layer) layer.style.pointerEvents = "auto";
+    compositeGeomsByPath[soundId] = (layer as any)?.__textGeoms ?? {};
+    for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".comp-sub") ?? [])) {
+      sub.style.pointerEvents = "auto";
+      sub.style.cursor = "grab";
+      sub.style.border = "none";
+      sub.style.background = "transparent";
+      sub.style.borderRadius = "0";
+      sub.style.padding = "0";
+    }
+    const modeBtn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+    if (modeBtn) modeBtn.textContent = "Exit group edit";
+    (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
+    (window as any).__ip_compositeEditing = true;
+  };
+
   const exitTimerCompositeEdit = () => {
     if (!compositeEditTimerId) return;
     const el = engine.getNodeElement(compositeEditTimerId);
@@ -2771,6 +3601,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const ov = el?.querySelector<HTMLElement>(".timer-overlay");
       if (ov) ov.style.display = "block";
       const layer = el?.querySelector<HTMLElement>(".timer-sub-layer");
+      if (layer) layer.style.pointerEvents = "none";
+    } else if (compositeEditKind === "sound") {
+      const ov = el?.querySelector<HTMLElement>(".sound-overlay");
+      if (ov) ov.style.display = "block";
+      const layer = el?.querySelector<HTMLElement>(".sound-sub-layer");
       if (layer) layer.style.pointerEvents = "none";
     } else {
       const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
@@ -3085,6 +3920,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       ev.preventDefault();
       return;
     }
+    if (node?.type === "sound") {
+      enterSoundCompositeEdit(id);
+      ev.preventDefault();
+      return;
+    }
     await openEditorModal(id);
   });
 
@@ -3250,18 +4090,23 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const min = 0.01;
       const hnd = compositeActiveHandle;
       const isCorner = hnd === "nw" || hnd === "ne" || hnd === "sw" || hnd === "se";
+      const forceUniform =
+        compositeEditKind === "choices" && (sid === "wheel" || sid === "pie"); // keep wheel aspect
 
       // Convert anchor-point rect -> top-left rect for resizing math
       const tl = anchorToTopLeftWorld({ ...rect, anchor: compositeStartGeom.anchor } as any);
       let tlr = { x: tl.x, y: tl.y, w: rect.w, h: rect.h };
 
-      if (isCorner) {
+      if (isCorner || forceUniform) {
         // Uniform scale for bottom corners (equal aspect ratio)
-        const sx = hnd.includes("w") ? -dx : dx;
-        const sy = hnd.includes("n") ? -dy : dy;
+        const sx =
+          hnd.includes("w") ? -dx : hnd.includes("e") ? dx : 0;
+        const sy =
+          hnd.includes("n") ? -dy : hnd.includes("s") ? dy : 0;
         const w1 = Math.max(min, rect.w + sx);
         const h1 = Math.max(min, rect.h + sy);
-        const s = Math.max(w1 / Math.max(1e-9, rect.w), h1 / Math.max(1e-9, rect.h));
+        // If we're forcing uniform scaling from an edge, scale from that axis only.
+        const s = isCorner ? Math.max(w1 / Math.max(1e-9, rect.w), h1 / Math.max(1e-9, rect.h)) : (sx !== 0 ? w1 / Math.max(1e-9, rect.w) : h1 / Math.max(1e-9, rect.h));
         tlr.w = Math.max(min, rect.w * s);
         tlr.h = Math.max(min, rect.h * s);
         if (hnd.includes("w")) tlr.x = tl.x + (rect.w - tlr.w);
@@ -3295,6 +4140,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       sub.style.width = `${rect.w * 100}%`;
       sub.style.height = `${rect.h * 100}%`;
       if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+
+      // Choices composite: scale bullets content with its own sub-element size (so resizing bullets scales fonts).
+      if (compositeEditKind === "choices" && sid === "bullets") {
+        const localScale = Math.max(0.1, Math.min(1, Math.min(rect.w, rect.h)));
+        sub.style.setProperty("--local-scale", String(localScale));
+      }
       return;
     }
   });
@@ -3349,9 +4200,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
 
     // In composite edit mode:
-    // - Timer: never select/rotate the composite root itself (edit sub-elements only).
+    // - Timer/Sound: never select/rotate the composite root itself (edit sub-elements only).
     // - Choices: allow selecting/resizing the root (so the whole composite can be scaled).
-    if (compositeEditKind === "timer" && compositeEditTimerId && id === compositeEditTimerId) {
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && id === compositeEditTimerId) {
       nodeEl.querySelector(".handles")?.remove();
       ev.preventDefault();
       return;
@@ -3435,14 +4286,15 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const dx = ev.clientX - start.x;
     const dy = ev.clientY - start.y;
     const cam = engine.getCamera();
+    const scr = engine.getScreen();
 
     if (dragMode === "move") {
       for (const id of selected) {
         const s = startNodesById[id];
         if (!s) continue;
         const sp = s.space ?? "world";
-        const ddx = sp === "world" ? dx / cam.zoom : dx;
-        const ddy = sp === "world" ? dy / cam.zoom : dy;
+        const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
+        const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
         let nx = (s.transform?.x ?? 0) + ddx;
         let ny = (s.transform?.y ?? 0) + ddy;
 
@@ -3465,6 +4317,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const startNode = startNodesById[onlyId];
     if (!startNode) return;
     const t0 = startNode.transform;
+    const sp = startNode.space ?? "world";
 
     if (dragMode === "rotate") {
       const el = engine.getNodeElement(onlyId);
@@ -3483,9 +4336,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (dragMode === "resize" && activeHandle) {
       const tl0 = anchorToTopLeftWorld(t0);
       let rect = { x: tl0.x, y: tl0.y, w: t0.w, h: t0.h };
-      const ddx = dx / cam.zoom;
-      const ddy = dy / cam.zoom;
-      const min = 5;
+      const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
+      const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
+      const min = sp === "world" ? 5 : 0.01;
       const isCorner =
         activeHandle === "nw" || activeHandle === "ne" || activeHandle === "sw" || activeHandle === "se";
 
@@ -3671,6 +4524,7 @@ async function main() {
   hydrateTextMath(engine, model);
   ensureTimerPolling(engine, model, stage);
   ensureChoicesPolling(engine, model, stage);
+  ensureSoundStreaming(engine, model, stage);
 
   // Mode toggle: Edit vs Live
   const modeWrap = document.createElement("div");
@@ -3704,6 +4558,7 @@ async function main() {
     // Hard guarantee: strip any leftover selection/transform UI when entering Live.
     if (mode === "live") {
       document.documentElement.style.cursor = "";
+      document.querySelector(".edit-toolbox")?.remove();
       for (const h of Array.from(stage.querySelectorAll<HTMLElement>(".handles"))) h.remove();
       for (const n of Array.from(stage.querySelectorAll<HTMLElement>(".node.is-selected"))) n.classList.remove("is-selected");
       for (const s of Array.from(stage.querySelectorAll<HTMLElement>(".timer-sub.is-selected, .comp-sub.is-selected")))
@@ -3721,6 +4576,7 @@ async function main() {
       void hydrateQrImages(engine, model).then(() => hydrateTextMath(engine, model));
       ensureTimerPolling(engine, model, stage);
       ensureChoicesPolling(engine, model, stage);
+      ensureSoundStreaming(engine, model, stage);
       attachEditor(stage, engine);
       return;
     }
