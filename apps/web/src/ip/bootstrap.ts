@@ -3491,10 +3491,19 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
       const curModel = engine.getModel();
       const curNode: any = curModel?.nodes.find((n) => n.id === onlyId);
-      const isTextLike = curNode?.type === "text" || curNode?.type === "bullets";
+      // Text-like scaling should apply to:
+      // - text nodes (fontPx)
+      // - bullets nodes (fontPx)
+      // - choices nodes: scale internal UI via --ui-scale using fontPx as a multiplier baseline
+      const isTextLike = curNode?.type === "text" || curNode?.type === "bullets" || curNode?.type === "choices";
       // IMPORTANT: base font must come from the drag start snapshot to avoid inversion/jitter.
+      // For choices, use a stable baseline that maps to --ui-scale=1.
       const startFontPx =
-        isTextLike && startNode != null ? Number((startNode as any).fontPx ?? (t0.h ?? 40) * 0.6) : null;
+        isTextLike && startNode != null
+          ? curNode?.type === "choices"
+            ? Number((startNode as any).fontPx ?? 24)
+            : Number((startNode as any).fontPx ?? (t0.h ?? 40) * 0.6)
+          : null;
 
       if (isCorner) {
         const sx = activeHandle.includes("w") ? -ddx : ddx;
@@ -3507,7 +3516,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         if (activeHandle.includes("w")) rect.x = tl0.x + (t0.w - rect.w);
         if (activeHandle.includes("n")) rect.y = tl0.y + (t0.h - rect.h);
 
-        // Corner scaling should scale text font size along with the box.
+        // Corner scaling should scale text-like font size along with the box.
         if (isTextLike) {
           engine.updateNode(onlyId, { fontPx: Math.max(1, (startFontPx ?? 28) * s) } as any);
         }
@@ -3720,8 +3729,26 @@ async function main() {
     presentationStarted = true;
     engine.setPanZoomEnabled(false);
     engine.setAnimationsEnabled(true);
-    // Snap to the current view camera when switching into Live (no smooth transition).
-    setView(viewIdx, false);
+    // When switching into Live, choose the view closest to the *current* camera center
+    // (so presenters can pan around in Edit and start Live from the nearest authored view).
+    {
+      const cam = engine.getCamera();
+      let bestIdx = viewIdx;
+      let bestD2 = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < viewsInOrder.length; i++) {
+        const v = viewsInOrder[i] as any;
+        if (!v || !v.camera) continue; // skip screen views / malformed
+        const dx = Number(cam.cx ?? 0) - Number(v.camera.cx ?? 0);
+        const dy = Number(cam.cy ?? 0) - Number(v.camera.cy ?? 0);
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) {
+          bestD2 = d2;
+          bestIdx = i;
+        }
+      }
+      // Snap to the chosen view camera (no smooth transition).
+      setView(bestIdx, false);
+    }
 
     const allCues = (model as any).animationCues as Array<{ id: string; when: "enter" | "exit" }> | undefined;
     let showSet = new Set<string>();
