@@ -16,13 +16,6 @@ Welcome to my presentation
 
 image[name=join_qr]
 
-table[name=my_table,delim=;,hstyle=||c|c|c||,vstyle=|b||c|...|]:
-C1;C2;C3
-1;2;3
-4;5;6
-7;8;9
-
-
 view[name=view2,refView=home,loc=right]:
 text[name=v2_note]:
 Hur bra är vi på att estimera 30 sekunder tror ni?
@@ -32,3 +25,9 @@ timer[name=timer1,barColor=orange,binSize=1,lineColor=green,lineWidth=2,max=40,m
 view[name=view3,refView=view2,loc=right]:
 choices[name=fav_subjects,type=pie,bullets=A,includeLimit=3,textInsideLimit=6,otherLabel=Other,choices={Biologi:green,Kemi:red,Fysik:blue,Matematik:magenta,Övrigt:cyan}]:
 Vilket ämne tycker ni är roligast i skolan?
+
+view[name=view4,refView=home,loc=down]:
+text[name=sound_title]:
+Live sound (server mic)
+
+sound[name=sound1,mode=spectrum,color=white]
