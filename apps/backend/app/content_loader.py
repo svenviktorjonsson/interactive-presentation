@@ -115,6 +115,90 @@ def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None
     )
 
 
+def _ensure_sound_composite_defaults(pres_dir: Path, composite_dir: str) -> None:
+    """
+    Ensure a default composite folder for sound nodes.
+    Mirrors timer composites: groups/<name>/elements.pr + geometries.csv.
+    """
+    if not re.match(r"^[a-zA-Z0-9_][a-zA-Z0-9_\-]{0,63}$", composite_dir):
+        raise ValueError(f"Invalid composite folder name: {composite_dir!r}")
+
+    groups_dir = pres_dir / "groups"
+    groups_dir.mkdir(parents=True, exist_ok=True)
+    sound_dir = groups_dir / composite_dir
+    sound_dir.mkdir(parents=True, exist_ok=True)
+
+    elements_txt_path = sound_dir / "elements.txt"
+    elements_pr_path = sound_dir / "elements.pr"
+    geometries_path = sound_dir / "geometries.csv"
+    animations_path = sound_dir / "animations.csv"
+    # If everything exists, still do a tiny forward-migration:
+    # ensure the newer "peak" label exists in elements + geometries.
+    if (elements_txt_path.exists() or elements_pr_path.exists()) and geometries_path.exists() and animations_path.exists():
+        try:
+            p = elements_pr_path if elements_pr_path.exists() else elements_txt_path
+            txt = p.read_text(encoding="utf-8")
+            if "text[name=peak]" not in txt:
+                txt = txt.rstrip() + "\ntext[name=peak]: \\mathrm{peak}={{peakHz}}\\,\\mathrm{Hz}\n"
+                p.write_text(txt + ("\n" if not txt.endswith("\n") else ""), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            gtxt = geometries_path.read_text(encoding="utf-8")
+            if "\npeak," not in gtxt:
+                # Insert after y_label if possible, else append.
+                line = "peak,sound,0.98,0.04,0.55,0.08,0,topRight,right\n"
+                if "y_label,sound" in gtxt:
+                    parts = gtxt.splitlines(keepends=True)
+                    out_lines: list[str] = []
+                    inserted = False
+                    for ln in parts:
+                        out_lines.append(ln)
+                        if (not inserted) and ln.startswith("y_label,sound"):
+                            out_lines.append(line)
+                            inserted = True
+                    if not inserted:
+                        out_lines.append(line)
+                    geometries_path.write_text("".join(out_lines), encoding="utf-8")
+                else:
+                    geometries_path.write_text(gtxt.rstrip() + "\n" + line, encoding="utf-8")
+        except Exception:
+            pass
+        return
+
+    default_elements = (
+        "# sound composite elements (draft)\n"
+        "# Delete the whole `groups/<name>/` folder to regenerate defaults.\n"
+        "\n"
+        "# Axis labels (auto-updated via {{...}} binding, editable/positionable):\n"
+        "text[name=x_label]: {{xLabel}}\n"
+        "text[name=y_label]: {{yLabel}}\n"
+        # Spectrum-only label (hidden in pressure mode by the frontend):
+        "text[name=peak]: \\mathrm{peak}={{peakHz}}\\,\\mathrm{Hz}\n"
+        "\n"
+        "# Default axis arrows (data-rect coords; origin is bottom-left of plot region):\n"
+        "arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]\n"
+        "arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]\n"
+    )
+    if not elements_txt_path.exists():
+        elements_txt_path.write_text(default_elements, encoding="utf-8")
+    if not elements_pr_path.exists():
+        elements_pr_path.write_text(default_elements, encoding="utf-8")
+    geometries_path.write_text(
+        "id,view,x,y,w,h,rotationDeg,anchor,align\n"
+        "x_label,sound,0.50,1.06,0.60,0.08,0,topCenter,center\n"
+        "y_label,sound,-0.14,0.50,0.45,0.08,-90,centerRight,center\n"
+        "peak,sound,0.98,0.04,0.55,0.08,0,topRight,right\n"
+        "x_axis,sound,0,0,1,1,0,topLeft,\n"
+        "y_axis,sound,0,0,1,1,0,topLeft,\n",
+        encoding="utf-8",
+    )
+    animations_path.write_text(
+        "id,when,how,from,durationMs,delayMs\n",
+        encoding="utf-8",
+    )
+
+
 def _ensure_choices_composite_defaults(pres_dir: Path, composite_dir: str) -> None:
     """
     Create a default composite folder for choices nodes.
@@ -767,6 +851,116 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 screen_nodes.add(name)
             continue
 
+        if kw == "arrow":
+            # Simple arrow node (rendered by the frontend as SVG).
+            # Syntax: arrow[name=...,from=(0,0),to=(1,0),color=white,width=0.01]
+            def parse_vec(raw_v: str | None, default: tuple[float, float]) -> tuple[float, float]:
+                s = str(raw_v or "").strip()
+                m2 = re.match(r"^\(\s*([\-0-9.]+)\s*,\s*([\-0-9.]+)\s*\)\s*$", s)
+                if not m2:
+                    return default
+                try:
+                    return (float(m2.group(1)), float(m2.group(2)))
+                except ValueError:
+                    return default
+
+            fx, fy = parse_vec(params.get("from"), (0.0, 0.5))
+            tx, ty = parse_vec(params.get("to"), (1.0, 0.5))
+            col = str(params.get("color") or params.get("stroke") or "white").strip() or "white"
+            w_raw = str(params.get("width") or params.get("strokeWidth") or "").strip()
+            width = None
+            if w_raw:
+                try:
+                    width = float(w_raw)
+                except ValueError:
+                    width = None
+            nodes_by_id[name] = {
+                "id": name,
+                "type": "arrow",
+                "space": "screen" if screen_mode else "world",
+                "from": {"x": fx, "y": fy},
+                "to": {"x": tx, "y": ty},
+                "color": col,
+                "width": width,
+            }
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
+            continue
+
+        if kw == "sound":
+            # Server-side audio spectrum/time-series viewer.
+            # Syntax: sound[name=...,mode=spectrum|pressure,color=white]
+            # Ensure the composite defaults exist only if a sound node is actually used.
+            try:
+                _ensure_sound_composite_defaults(path.parent, name)
+            except Exception:
+                pass
+            mode = str(params.get("mode") or "spectrum").strip().lower()
+            if mode not in {"spectrum", "pressure"}:
+                mode = "spectrum"
+            col = str(params.get("color") or "white").strip() or "white"
+            win_s_raw = str(params.get("windowS") or params.get("window") or "30").strip()
+            try:
+                win_s = float(win_s_raw) if win_s_raw else 30.0
+            except ValueError:
+                win_s = 30.0
+            win_s = max(1.0, min(300.0, win_s))
+            nodes_by_id[name] = {
+                "id": name,
+                "type": "sound",
+                "space": "screen" if screen_mode else "world",
+                "mode": mode,
+                "windowS": win_s,
+                "color": col,
+                "compositeDir": name,
+                "args": {k: v for k, v in params.items() if k != "name"},
+            }
+            _apply_style_params(nodes_by_id[name], params)
+            # Load composite text template + geometries (mirrors timer composites).
+            try:
+                pres_dir = path.parent
+                comp_dir = pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name)
+                tpl_path = (comp_dir / "elements.pr") if (comp_dir / "elements.pr").exists() else (comp_dir / "elements.txt")
+                if tpl_path.exists():
+                    tpl = tpl_path.read_text(encoding="utf-8")
+                    nodes_by_id[name]["elementsText"] = tpl
+            except Exception:
+                pass
+            try:
+                pres_dir = path.parent
+                g_path = (pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name) / "geometries.csv")
+                if g_path.exists():
+                    geoms: dict[str, Any] = {}
+                    with g_path.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            sid = (row.get("id") or "").strip()
+                            if not sid or sid.startswith("#"):
+                                continue
+                            try:
+                                geoms[sid] = {
+                                    "x": float((row.get("x") or "0").strip() or 0),
+                                    "y": float((row.get("y") or "0").strip() or 0),
+                                    "w": float((row.get("w") or "0.2").strip() or 0.2),
+                                    "h": float((row.get("h") or "0.1").strip() or 0.1),
+                                    "rotationDeg": float((row.get("rotationDeg") or "0").strip() or 0),
+                                    "anchor": (row.get("anchor") or "topLeft").strip() or "topLeft",
+                                    "align": (row.get("align") or "").strip(),
+                                }
+                            except Exception:
+                                continue
+                    nodes_by_id[name]["compositeGeometries"] = geoms
+            except Exception:
+                pass
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
+            continue
+
         if kw == "timer":
             # Interactive timer / histogram node (rendered by the frontend; data via backend APIs).
             # Ensure the composite defaults exist only if a timer is actually used in the presentation.
@@ -1082,6 +1276,8 @@ def _parse_geometries_csv(
             cam = view.get("camera") or {"cx": 0.0, "cy": 0.0, "zoom": 1.0}
             vcx = float(cam.get("cx", 0.0) or 0.0)
             vcy = float(cam.get("cy", 0.0) or 0.0)
+            # Determine space from view: if view is a screen view, this is screen-space
+            is_screen_view = view.get("screen", False)
 
             xn = num("x", 0.0, row)
             yn = num("y", 0.0, row)
@@ -1092,14 +1288,17 @@ def _parse_geometries_csv(
                 # Parent-relative: store as-is (normalized units).
                 xw, yw, ww, hw = xn, yn, wn, hn
             else:
-                # Convert view-relative -> world pixels (design pixel world).
-                xw = vcx + xn * design_h
-                yw = vcy + yn * design_h
-                ww = wn * design_h
-                hw = hn * design_h
+                if is_screen_view:
+                    # Screen-space nodes are normalized in [0..1] (top-left origin) relative to the runtime screen.
+                    # Store normalized values; the frontend converts to pixels each frame.
+                    xw, yw, ww, hw = xn, yn, wn, hn
+                else:
+                    # Convert view-relative -> world pixels (design pixel world).
+                    xw = vcx + xn * design_h
+                    yw = vcy + yn * design_h
+                    ww = wn * design_h
+                    hw = hn * design_h
 
-            # Determine space from view: if view is a screen view, this is screen-space
-            is_screen_view = view.get("screen", False)
             g: dict[str, Any] = {
                 "space": "screen" if is_screen_view else "world",
                 "view": view_id,
@@ -1250,12 +1449,17 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
         else:
             # Sensible defaults if geometry is missing
             if node.get("space") == "screen":
-                node["transform"] = {"x": 16.0, "y": 16.0, "w": 220.0, "h": 90.0, "anchor": "topLeft"}
+                # Normalized 0..1 (top-left origin) for screen-space nodes
+                node["transform"] = {"x": 0.02, "y": 0.02, "w": 0.20, "h": 0.08, "anchor": "topLeft"}
             elif node["type"] == "text":
                 node["transform"] = {"x": 24.0, "y": 18.0, "w": 900.0, "h": 60.0, "anchor": "topLeft"}
             elif node["type"] == "qr":
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 280.0, "h": 280.0, "anchor": "center"}
             elif node["type"] == "table":
+                node["transform"] = {"x": 0.0, "y": 0.0, "w": 800.0, "h": 360.0, "anchor": "topLeft"}
+            elif node["type"] == "arrow":
+                node["transform"] = {"x": 0.0, "y": 0.0, "w": 420.0, "h": 80.0, "anchor": "topLeft"}
+            elif node["type"] == "sound":
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 800.0, "h": 360.0, "anchor": "topLeft"}
             else:
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0, "anchor": "topLeft"}
