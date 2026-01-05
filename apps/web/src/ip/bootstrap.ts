@@ -61,6 +61,21 @@ type SoundState = {
   serverTimeMs: number;
 };
 
+function ensureSoundStateDefaults(prev: SoundState | null): SoundState {
+  return {
+    enabled: prev?.enabled ?? false,
+    computeSpectrum: prev?.computeSpectrum ?? true,
+    computePressure: prev?.computePressure ?? false,
+    seq: prev?.seq ?? 0,
+    sampleRateHz: prev?.sampleRateHz ?? 48_000,
+    windowMs: prev?.windowMs ?? 10,
+    pressure10ms: prev?.pressure10ms ?? [],
+    spectrum: prev?.spectrum ?? { freqHz: [], magDb: [] },
+    error: prev?.error ?? null,
+    serverTimeMs: prev?.serverTimeMs ?? 0,
+  };
+}
+
 async function fetchSoundState(): Promise<SoundState | null> {
   try {
     const res = await fetch(`${BACKEND}/api/sound/state`, { cache: "no-store" });
@@ -878,20 +893,52 @@ function attachSoundNodeHandlers(stage: HTMLElement) {
     const nodeEl = btn.closest<HTMLElement>(".node-sound");
     if (!nodeEl) return;
     if (action === "sound-toggle") {
-      const running = (__soundState as SoundState | null)?.enabled ?? false;
-      // Instant UI feedback
-      (__soundState as any) = { ...(__soundState as any), enabled: !running };
-      btn.textContent = running ? "Resume" : "Pause";
-      void fetch(`${BACKEND}/api/sound/${running ? "pause" : "start"}`, { method: "POST" });
+      const prev = (__soundState as SoundState | null) ?? null;
+      const st0 = ensureSoundStateDefaults(prev);
+      const running = !!st0.enabled;
+      const modeNow = (nodeEl.dataset.mode ?? "spectrum").toLowerCase() === "pressure" ? "pressure" : "spectrum";
+
+      // Instant UI feedback (optimistic), but also reconcile with backend state.
+      if (running) {
+        (__soundState as any) = { ...st0, enabled: false };
+        btn.textContent = (st0.seq ?? 0) > 0 ? "Resume" : "Run";
+        void fetch(`${BACKEND}/api/sound/pause`, { method: "POST" }).finally(async () => {
+          const st = await fetchSoundState();
+          if (st) __soundState = st;
+        });
+      } else {
+        (__soundState as any) = { ...st0, enabled: true, error: null };
+        btn.textContent = "Pause";
+        // Ensure backend computes the active mode when we start.
+        void fetch(`${BACKEND}/api/sound/mode`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ mode: modeNow }),
+        })
+          .catch(() => {})
+          .finally(() => {
+            void fetch(`${BACKEND}/api/sound/start`, { method: "POST" }).finally(async () => {
+              // Reconcile quickly so UI doesn't snap back to Run if start didn't take.
+              const st = await fetchSoundState();
+              if (st) __soundState = st;
+              else (__soundState as any) = { ...ensureSoundStateDefaults(__soundState as any), enabled: false, error: "Sound backend unreachable" };
+            });
+          });
+      }
       ev.preventDefault();
       return;
     }
     if (action === "sound-reset") {
       // Instant UI feedback
-      (__soundState as any) = { ...(__soundState as any), enabled: false, seq: 0, pressure10ms: [], spectrum: { freqHz: [], magDb: [] } };
+      const prev = (__soundState as SoundState | null) ?? null;
+      const st0 = ensureSoundStateDefaults(prev);
+      (__soundState as any) = { ...st0, enabled: false, seq: 0, pressure10ms: [], spectrum: { freqHz: [], magDb: [] }, error: null };
       const toggleBtn = nodeEl.querySelector<HTMLButtonElement>('button[data-action="sound-toggle"]');
       if (toggleBtn) toggleBtn.textContent = "Run";
-      void fetch(`${BACKEND}/api/sound/reset`, { method: "POST" });
+      void fetch(`${BACKEND}/api/sound/reset`, { method: "POST" }).finally(async () => {
+        const st = await fetchSoundState();
+        if (st) __soundState = st;
+      });
       ev.preventDefault();
       return;
     }
