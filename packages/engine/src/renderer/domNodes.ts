@@ -309,10 +309,19 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const el = document.createElement("div");
     el.classList.add("node-table");
     el.style.boxSizing = "border-box";
-    el.style.overflow = "hidden";
+    // Allow selection handles / anchors to render outside bounds (edit mode).
+    el.style.overflow = "visible";
     el.style.color = "rgba(255,255,255,0.92)";
     el.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
     el.style.fontWeight = "400";
+
+    // Inner frame clips table contents while outer keeps handles visible.
+    const frame = document.createElement("div");
+    frame.className = "table-frame";
+    frame.style.position = "absolute";
+    frame.style.inset = "0";
+    frame.style.overflow = "hidden";
+    frame.style.boxSizing = "border-box";
 
     const table = document.createElement("table");
     table.className = "table-grid";
@@ -327,7 +336,8 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     table.style.tableLayout = "fixed";
     const tbody = document.createElement("tbody");
     table.appendChild(tbody);
-    el.appendChild(table);
+    frame.appendChild(table);
+    el.appendChild(frame);
 
     const render = (n: any) => {
       const rows: string[][] = Array.isArray(n.rows) ? n.rows : [];
@@ -346,19 +356,16 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       const rowAligns = Array.from({ length: rows.length }, (_, i) => getOrDefault(vParsed.aligns, i, "c"));
       const rowBounds = Array.from({ length: rows.length + 1 }, (_, i) => getOrDefault(vParsed.bounds, i, 0));
 
-      const borderColor = "rgba(255,255,255,0.65)";
-      // Border thickness semantics:
-      // - "|"  => single line
-      // - "||" => double line
-      // CSS can render a true double border via `border-style: double` but it needs enough width
-      // (>= 3px) to actually show as two lines.
-      const borderCss = (bars: number) => {
+      // Slightly higher opacity so the gap in `double` is visible.
+      const borderColor = "rgba(255,255,255,0.85)";
+      const borderSingle = `1px solid ${borderColor}`;
+      const insetLine = (dx: number, dy: number) => `inset ${dx}px ${dy}px 0 0 ${borderColor}`;
+      const secondLineOffsetPx = (bars: number) => {
         const n = Math.max(0, Math.floor(Number(bars) || 0));
-        if (n <= 0) return "0px solid transparent";
-        if (n === 1) return `1px solid ${borderColor}`;
-        // n>=2: use double borders; scale width a bit with n but cap it.
-        const px = Math.min(8, 3 + (n - 2) * 2); // 2 bars => 3px, 3 bars => 5px, 4 bars => 7px ...
-        return `${px}px double ${borderColor}`;
+        // Two-line "double" border spacing:
+        // - bars=2 => second line at 3px (gap ~1px)
+        // - bars=3 => 5px, bars=4 => 7px ...
+        return 3 + Math.max(0, n - 2) * 2;
       };
 
       tbody.innerHTML = "";
@@ -379,10 +386,26 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
           const va = rowAligns[ri];
           td.style.verticalAlign = va === "t" ? "top" : va === "b" ? "bottom" : "middle";
           // Borders:
-          td.style.borderLeft = borderCss(colBounds[ci]);
-          td.style.borderTop = borderCss(rowBounds[ri]);
-          if (ci === colCount - 1) td.style.borderRight = borderCss(colBounds[colCount]);
-          if (ri === rows.length - 1) td.style.borderBottom = borderCss(rowBounds[rows.length]);
+          // We avoid `border-style: double` because some browsers still flatten it into a single thick
+          // line depending on table border-collapsing rules. Instead we draw "double" as:
+          // - a normal 1px border on the edge
+          // - + an inset box-shadow line slightly inside the cell
+          const leftBars = colBounds[ci];
+          const topBars = rowBounds[ri];
+          const rightBars = ci === colCount - 1 ? colBounds[colCount] : 0;
+          const bottomBars = ri === rows.length - 1 ? rowBounds[rows.length] : 0;
+
+          td.style.borderLeft = leftBars > 0 ? borderSingle : "0";
+          td.style.borderTop = topBars > 0 ? borderSingle : "0";
+          td.style.borderRight = rightBars > 0 ? borderSingle : "0";
+          td.style.borderBottom = bottomBars > 0 ? borderSingle : "0";
+
+          const shadows: string[] = [];
+          if (leftBars >= 2) shadows.push(insetLine(secondLineOffsetPx(leftBars), 0));
+          if (rightBars >= 2) shadows.push(insetLine(-secondLineOffsetPx(rightBars), 0));
+          if (topBars >= 2) shadows.push(insetLine(0, secondLineOffsetPx(topBars)));
+          if (bottomBars >= 2) shadows.push(insetLine(0, -secondLineOffsetPx(bottomBars)));
+          td.style.boxShadow = shadows.join(", ");
           tr.appendChild(td);
         }
         tbody.appendChild(tr);
@@ -1027,6 +1050,14 @@ export function layoutDomNodes(args: {
       const localH = Math.max(1e-9, Number(nodeLayout.transform.h ?? 0) || 0);
       const z = nodeLayout.space === "world" ? px.h / localH : 1;
       const baseFontPx = Math.max(1, Number((nodeLayout as any).fontPx ?? (nodeLayout.transform.h ?? 40) * 0.6));
+      handle.el.style.fontSize = `${Math.max(1, baseFontPx * z)}px`;
+    }
+    if (nodeLayout.type === "bullets") {
+      // Match text behavior: font scales with camera zoom, and with `fontPx` when set
+      // (corner resize in the editor updates `fontPx` for text-like nodes).
+      const localH = Math.max(1e-9, Number(nodeLayout.transform.h ?? 0) || 0);
+      const z = nodeLayout.space === "world" ? px.h / localH : 1;
+      const baseFontPx = Math.max(1, Number((nodeLayout as any).fontPx ?? 22));
       handle.el.style.fontSize = `${Math.max(1, baseFontPx * z)}px`;
     }
     if (nodeLayout.type === "table") {
