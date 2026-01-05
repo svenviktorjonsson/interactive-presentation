@@ -763,6 +763,8 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
 
 function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
   stage.addEventListener("click", async (ev) => {
+    // In Edit mode, choices buttons should not be interactive (it interferes with editing).
+    if (getAppMode() !== "live") return;
     const t = ev.target as HTMLElement;
     const btn = t.closest<HTMLButtonElement>("button[data-action]");
     if (!btn) return;
@@ -848,6 +850,8 @@ function ensureChoicesPolling(engine: Engine, model: PresentationModel, stage: H
 
 function attachTimerNodeHandlers(stage: HTMLElement) {
   stage.addEventListener("click", async (ev) => {
+    // In Edit mode, timer buttons should not be interactive (it interferes with editing).
+    if (getAppMode() !== "live") return;
     const t = ev.target as HTMLElement;
     const btn = t.closest<HTMLButtonElement>("button[data-action]");
     if (!btn) return;
@@ -886,6 +890,8 @@ function attachTimerNodeHandlers(stage: HTMLElement) {
 
 function attachSoundNodeHandlers(stage: HTMLElement) {
   stage.addEventListener("click", (ev) => {
+    // In Edit mode, sound buttons should not be interactive (it interferes with editing).
+    if (getAppMode() !== "live") return;
     const t = ev.target as HTMLElement;
     const btn = t.closest<HTMLButtonElement>("button[data-action]");
     if (!btn) return;
@@ -1575,6 +1581,7 @@ function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, dat
   const hPx = Number(soundEl.dataset.soundHpx ?? "0");
   const wPx = Number(soundEl.dataset.soundWpx ?? "0");
   const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
+  const isGroupEditing = soundEl.dataset.compositeEditing === "1";
   for (const t of els) {
     const sid = t.dataset.subId ?? "";
     const g = geoms[sid] ?? {};
@@ -1602,11 +1609,15 @@ function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, dat
       if (contentEl) renderTextToElement(contentEl, resolved);
     }
 
+    // Make ALL composite elements editable when in group edit mode.
+    // (Otherwise they should not intercept pointer events.)
+    t.style.pointerEvents = isGroupEditing ? "auto" : "none";
+    t.style.cursor = isGroupEditing ? "grab" : "default";
+
     // Spectrum-only label
     if (sid === "peak") {
       const modeNow = (soundEl.dataset.mode ?? "spectrum").toLowerCase();
       // Always show while group-editing so the user can reposition it.
-      const isGroupEditing = soundEl.dataset.compositeEditing === "1";
       t.style.display = isGroupEditing ? "block" : modeNow === "pressure" ? "none" : "block";
     }
   }

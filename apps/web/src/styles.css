@@ -438,6 +438,13 @@ html[data-ip-mode="live"] .handles {
   border-color: rgba(110,168,255,0.28);
 }
 
+/* In Edit mode, header buttons should not steal clicks (editing should be easy). */
+html[data-ip-mode="edit"] .node-timer .timer-header,
+html[data-ip-mode="edit"] .node-choices .choices-headerbar,
+html[data-ip-mode="edit"] .node-sound .sound-header {
+  pointer-events: none;
+}
+
 .ip-hide-node {
   display: none !important;
 }
