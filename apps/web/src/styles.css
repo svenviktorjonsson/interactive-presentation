@@ -178,9 +178,11 @@ html[data-ip-mode="live"] .handles {
   position: absolute;
   inset: 0;
   transform-origin: top left;
-  transform: scale(var(--ui-scale, 1));
-  width: calc(100% / var(--ui-scale, 1));
-  height: calc(100% / var(--ui-scale, 1));
+  /* --ui-scale: zoom + (optional) fontPx scaling from the editor */
+  /* --local-scale: derived from the bullets sub-element size in composite edit */
+  transform: scale(calc(var(--ui-scale, 1) * var(--local-scale, 1)));
+  width: calc(100% / (var(--ui-scale, 1) * var(--local-scale, 1)));
+  height: calc(100% / (var(--ui-scale, 1) * var(--local-scale, 1)));
   padding: 18px;
   display: flex;
   flex-direction: column;
@@ -398,6 +400,42 @@ html[data-ip-mode="live"] .handles {
 
 .node-timer .timer-btn.primary {
   background: rgba(110, 168, 255, 0.22);
+}
+
+.node-sound {
+  --sound-scale: 1;
+}
+
+.node-sound .sound-frame {
+  border: none;
+  background: transparent;
+}
+
+.node-sound .sound-header {
+  top: calc(-44px * var(--sound-scale, 1));
+  gap: calc(10px * var(--sound-scale, 1));
+  padding: 0 calc(10px * var(--sound-scale, 1));
+  pointer-events: auto;
+}
+
+.node-sound .sound-btn {
+  padding: calc(12px * var(--sound-scale, 1)) calc(14px * var(--sound-scale, 1));
+  border-radius: calc(10px * var(--sound-scale, 1));
+  border: 1px solid rgba(255,255,255,0.16);
+  background: transparent;
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 800;
+  cursor: pointer;
+  font-size: calc(16px * var(--sound-scale, 1));
+}
+
+.node-sound .sound-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.node-sound .sound-btn:active {
+  background: rgba(110, 168, 255, 0.18);
+  border-color: rgba(110,168,255,0.28);
 }
 
 .ip-hide-node {

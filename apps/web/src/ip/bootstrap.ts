@@ -653,13 +653,6 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
   const col = el.dataset.color ?? "white";
   const windowS = Math.max(1, Number(el.dataset.windowS ?? "30") || 30);
 
-  if (!state.enabled) {
-    ctx.fillStyle = "rgba(255,255,255,0.85)";
-    ctx.font = `${Math.max(12, Math.round(14 * dpr))}px system-ui, sans-serif`;
-    ctx.fillText("Paused", ox, 0.10 * H);
-    return;
-  }
-
   // Title / error
   if (state.error) {
     ctx.fillStyle = "rgba(255,255,255,0.85)";
@@ -667,6 +660,7 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
     ctx.fillText(String(state.error), ox, 0.10 * H);
     return;
   }
+  // When paused, still draw the last buffers (frozen plot).
 
   if (mode === "pressure") {
     const ys0 = state.pressure10ms ?? [];
@@ -885,22 +879,33 @@ function attachSoundNodeHandlers(stage: HTMLElement) {
     if (!nodeEl) return;
     if (action === "sound-toggle") {
       const running = (__soundState as SoundState | null)?.enabled ?? false;
+      // Instant UI feedback
+      (__soundState as any) = { ...(__soundState as any), enabled: !running };
+      btn.textContent = running ? "Resume" : "Pause";
       void fetch(`${BACKEND}/api/sound/${running ? "pause" : "start"}`, { method: "POST" });
       ev.preventDefault();
       return;
     }
     if (action === "sound-reset") {
+      // Instant UI feedback
+      (__soundState as any) = { ...(__soundState as any), enabled: false, seq: 0, pressure10ms: [], spectrum: { freqHz: [], magDb: [] } };
+      const toggleBtn = nodeEl.querySelector<HTMLButtonElement>('button[data-action="sound-toggle"]');
+      if (toggleBtn) toggleBtn.textContent = "Run";
       void fetch(`${BACKEND}/api/sound/reset`, { method: "POST" });
       ev.preventDefault();
       return;
     }
-    if (action?.startsWith("sound-mode-")) {
-      nodeEl.dataset.mode = action.endsWith("pressure") ? "pressure" : "spectrum";
+    if (action === "sound-mode-toggle") {
+      const cur = (nodeEl.dataset.mode ?? "spectrum").toLowerCase();
+      const next = cur === "pressure" ? "spectrum" : "pressure";
+      nodeEl.dataset.mode = next;
+      // Button text describes where we will go next.
+      btn.textContent = next === "pressure" ? "As Spectrum" : "As Time Series";
       // Tell backend to pause the inactive computation to save CPU.
       void fetch(`${BACKEND}/api/sound/mode`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ mode: nodeEl.dataset.mode }),
+        body: JSON.stringify({ mode: next }),
       });
       ev.preventDefault();
       return;
@@ -1339,9 +1344,17 @@ function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: H
             if (el) {
               // Update run/pause label based on global capture state
               const toggleBtn = el.querySelector<HTMLButtonElement>('button[data-action="sound-toggle"]');
-              if (toggleBtn) toggleBtn.textContent = st?.enabled ? "Pause" : "Run";
+              if (toggleBtn) {
+                if (st?.enabled) toggleBtn.textContent = "Pause";
+                else toggleBtn.textContent = (st?.seq ?? 0) > 0 ? "Resume" : "Run";
+              }
               const resetBtn = el.querySelector<HTMLButtonElement>('button[data-action="sound-reset"]');
               if (resetBtn) resetBtn.disabled = !st?.enabled && !(st?.seq > 0);
+              const modeBtn = el.querySelector<HTMLButtonElement>('button[data-action="sound-mode-toggle"]');
+              if (modeBtn) {
+                const cur = (el.dataset.mode ?? "spectrum").toLowerCase();
+                modeBtn.textContent = cur === "pressure" ? "As Spectrum" : "As Time Series";
+              }
               // Mode is a local UI toggle; default from node.dataset.mode if present.
               drawSoundNode(el, st);
               const layer = ensureSoundCompositeLayer(engine, (n as any).id);
@@ -1545,7 +1558,9 @@ function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, dat
     // Spectrum-only label
     if (sid === "peak") {
       const modeNow = (soundEl.dataset.mode ?? "spectrum").toLowerCase();
-      t.style.display = modeNow === "pressure" ? "none" : "block";
+      // Always show while group-editing so the user can reposition it.
+      const isGroupEditing = soundEl.dataset.compositeEditing === "1";
+      t.style.display = isGroupEditing ? "block" : modeNow === "pressure" ? "none" : "block";
     }
   }
 }
@@ -3565,6 +3580,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const el = engine.getNodeElement(soundId);
     if (!el) return;
     el.querySelector(".handles")?.remove();
+    el.dataset.compositeEditing = "1";
     const ov = el.querySelector<HTMLElement>(".sound-overlay");
     if (ov) ov.style.display = "none";
 
@@ -3607,6 +3623,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (ov) ov.style.display = "block";
       const layer = el?.querySelector<HTMLElement>(".sound-sub-layer");
       if (layer) layer.style.pointerEvents = "none";
+      if (el) el.dataset.compositeEditing = "0";
     } else {
       const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
       // Keep interactive so dblclick on bullets enters group edit (no "screen edit" by accident).
@@ -3855,6 +3872,30 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // Hard block: Live mode must be resistant to any editing gestures.
     if (getAppMode() !== "edit") return;
     const target = ev.target as HTMLElement;
+
+    // Background double-click behavior:
+    // - If in group edit: exit group edit.
+    // - Else if in screen edit: exit screen edit.
+    // - Else: enter screen edit.
+    if (!target.closest(".node") && !target.closest(".modal") && !target.closest(".ctx-menu") && !target.closest(".edit-toolbox")) {
+      if ((window as any).__ip_exitCompositeEdit) {
+        (window as any).__ip_exitCompositeEdit?.();
+        ev.preventDefault();
+        return;
+      }
+      if (screenEditMode) {
+        exitScreenEdit();
+        ev.preventDefault();
+        return;
+      }
+      const currentMode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
+      if (currentMode === "edit") {
+        enterScreenEdit();
+        ev.preventDefault();
+      }
+      return;
+    }
+
     // In composite edit mode, double-clicking a sub-text should open the text editor (not re-enter composite mode).
     if (compositeEditTimerId && compositeEditKind === "timer") {
       const sub = target.closest<HTMLElement>(".timer-sub-text");
@@ -3885,15 +3926,6 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const nodeEl = target.closest<HTMLElement>(".node");
     const id = nodeEl?.dataset.nodeId;
     if (!id) {
-      // Only enter screen edit mode when double-clicking the actual empty background.
-      // This avoids accidentally entering screen edit when double-clicking within composite UI.
-      if (target.closest(".node")) return;
-      // Background double-click: enter screen edit mode (edit mode only).
-      const currentMode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
-      if (currentMode === "edit") {
-        enterScreenEdit();
-        ev.preventDefault();
-      }
       return;
     }
     const model = engine.getModel();
@@ -4617,20 +4649,22 @@ async function main() {
     };
     rebuildForCurrentView();
 
-    // Debug (always-on but minimal): help diagnose missing join QR.
-    try {
-      const vcur = viewsInOrder[viewIdx];
-      const hasJoin = showSet.has("join_qr");
-      const hasCue = cues.some((c) => c.id === "join_qr" && c.when === "enter");
-      if (hasJoin && !hasCue) {
-        // eslint-disable-next-line no-console
-        console.warn("[ip] join_qr is in view but has no enter cue; it will not animate in", { view: vcur?.id });
-      }
-      if (!hasJoin) {
-        // eslint-disable-next-line no-console
-        console.warn("[ip] join_qr is not part of the current view; it will not appear here", { view: vcur?.id });
-      }
-    } catch {}
+    // Debug-only: diagnose missing join QR.
+    if (DEBUG_ANIM) {
+      try {
+        const vcur = viewsInOrder[viewIdx];
+        const hasJoin = showSet.has("join_qr");
+        const hasCue = cues.some((c) => c.id === "join_qr" && c.when === "enter");
+        if (hasJoin && !hasCue) {
+          // eslint-disable-next-line no-console
+          console.warn("[ip] join_qr is in view but has no enter cue; it will not animate in", { view: vcur?.id });
+        }
+        if (!hasJoin) {
+          // eslint-disable-next-line no-console
+          console.warn("[ip] join_qr is not part of the current view; it will not appear here", { view: vcur?.id });
+        }
+      } catch {}
+    }
     let cueIdx = 0;
     const pendingHide = new Map<string, number>();
 
@@ -4796,6 +4830,31 @@ async function main() {
       window.removeEventListener("keydown", onKeyDown);
     };
   };
+
+  // Keyboard shortcuts:
+  // - Ctrl+E: switch to Edit
+  // - Ctrl+L: switch to Live
+  window.addEventListener("keydown", (ev) => {
+    if (!ev.ctrlKey) return;
+    const k = (ev.key || "").toLowerCase();
+    // Don't steal shortcuts while typing.
+    const ae = document.activeElement as HTMLElement | null;
+    const tag = (ae?.tagName || "").toLowerCase();
+    const isTyping = !!ae && (tag === "input" || tag === "textarea" || (ae as any).isContentEditable);
+    if (isTyping) return;
+    if (k === "e") {
+      mode = "edit";
+      applyMode();
+      ev.preventDefault();
+      return;
+    }
+    if (k === "l") {
+      mode = "live";
+      applyMode();
+      ev.preventDefault();
+      return;
+    }
+  });
 
   modeBtn.addEventListener("click", () => {
     // If we're editing a composite group, this button acts as "Exit group edit".
