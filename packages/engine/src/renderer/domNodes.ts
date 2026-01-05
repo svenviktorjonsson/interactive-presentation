@@ -342,7 +342,19 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       const rowBounds = Array.from({ length: rows.length + 1 }, (_, i) => getOrDefault(vParsed.bounds, i, 0));
 
       const borderColor = "rgba(255,255,255,0.65)";
-      const borderCss = (w: number) => (w > 0 ? `${Math.min(6, w)}px solid ${borderColor}` : "0px solid transparent");
+      // Border thickness semantics:
+      // - "|"  => single line
+      // - "||" => double line
+      // CSS can render a true double border via `border-style: double` but it needs enough width
+      // (>= 3px) to actually show as two lines.
+      const borderCss = (bars: number) => {
+        const n = Math.max(0, Math.floor(Number(bars) || 0));
+        if (n <= 0) return "0px solid transparent";
+        if (n === 1) return `1px solid ${borderColor}`;
+        // n>=2: use double borders; scale width a bit with n but cap it.
+        const px = Math.min(8, 3 + (n - 2) * 2); // 2 bars => 3px, 3 bars => 5px, 4 bars => 7px ...
+        return `${px}px double ${borderColor}`;
+      };
 
       tbody.innerHTML = "";
       rows.forEach((r, ri) => {
