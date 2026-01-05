@@ -255,9 +255,9 @@ def _ensure_choices_composite_defaults(pres_dir: Path, composite_dir: str) -> No
     if not geometries_path.exists():
         geometries_path.write_text(
             "id,view,x,y,w,h,rotationDeg,anchor,align,parent\n"
-            # Both children cover the full rect; frontend toggles which one is visible.
-            "bullets,composite,0.00,0.00,1.00,1.00,0,topLeft,left,\n"
-            "wheel,composite,0.00,0.00,1.00,1.00,0,topLeft,center,\n",
+            # Default layout: bullets on left, wheel on right (wheel itself is square).
+            "bullets,composite,0.00,0.00,0.62,1.00,0,topLeft,left,\n"
+            "wheel,composite,1.00,0.50,0.38,0.38,0,centerRight,center,\n",
             encoding="utf-8",
         )
 
@@ -903,6 +903,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 mode = "spectrum"
             col = str(params.get("color") or "white").strip() or "white"
             win_s_raw = str(params.get("windowS") or params.get("window") or "30").strip()
+            grid_raw = str(params.get("grid") or "").strip().lower()
             try:
                 win_s = float(win_s_raw) if win_s_raw else 30.0
             except ValueError:
@@ -914,6 +915,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "space": "screen" if screen_mode else "world",
                 "mode": mode,
                 "windowS": win_s,
+                "grid": grid_raw in {"1", "true", "yes", "on"},
                 "color": col,
                 "compositeDir": name,
                 "args": {k: v for k, v in params.items() if k != "name"},
@@ -969,6 +971,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             except Exception:
                 pass
             show_time = (params.get("showTime") or "0").strip()
+            grid_raw = str(params.get("grid") or "").strip().lower()
             bar_color = (params.get("barColor") or "orange").strip()
             line_color = (params.get("lineColor") or "green").strip()
             line_w_raw = (params.get("lineWidth") or "").strip()
@@ -1001,6 +1004,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "type": "timer",
                 "space": "world",
                 "showTime": show_time == "1" or show_time.lower() in {"true", "yes", "on"},
+                "grid": grid_raw in {"1", "true", "yes", "on"},
                 "barColor": bar_color,
                 "lineColor": line_color,
                 "lineWidth": line_w,

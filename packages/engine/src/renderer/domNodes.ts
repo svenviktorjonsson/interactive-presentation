@@ -652,6 +652,8 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const layer = document.createElement("div");
     layer.className = "choices-sub-layer";
     layer.style.position = "absolute";
+    // Keep content covering the full node. Headerbar lives inside the node and overlays on top.
+    // This avoids distorting the wheel aspect ratio.
     layer.style.inset = "0";
     layer.style.overflow = "visible";
     // Important: allow clicks/dblclicks on bullets area to reach the node (edit mode).
@@ -670,11 +672,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     bullets.style.pointerEvents = "auto";
     bullets.style.display = "block";
 
+    // Wrapper is not selectable; the wheel itself is the selectable group element (single bounding box).
     const wheelGroup = document.createElement("div");
-    wheelGroup.className = "choices-sub comp-sub comp-group choices-wheel-group";
-    wheelGroup.dataset.subId = "wheel";
-    wheelGroup.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
-    wheelGroup.dataset.groupPath = `${node.id}/wheel`; // children stored in groups/<id>/wheel/
+    wheelGroup.className = "choices-sub choices-wheel-group";
     wheelGroup.style.position = "absolute";
     wheelGroup.style.overflow = "visible";
     wheelGroup.style.pointerEvents = "auto";
@@ -706,9 +706,11 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
 
     // --- wheel group children (stored under <id>/wheel) ---
     const pie = document.createElement("div");
-    pie.className = "choices-sub comp-sub choices-wheel";
-    pie.dataset.subId = "pie";
-    pie.dataset.compPath = `${node.id}/wheel`;
+    // The wheel itself is the selectable group element.
+    pie.className = "choices-sub comp-sub comp-group choices-wheel";
+    pie.dataset.subId = "wheel";
+    pie.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
+    pie.dataset.groupPath = `${node.id}/wheel`; // children stored in groups/<id>/wheel/
     pie.style.position = "absolute";
     pie.style.pointerEvents = "auto";
     const canvas = document.createElement("canvas");
@@ -784,9 +786,10 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
 
       // Default: bullets left, wheel right.
       apply(bullets, isOk01(rootGeoms["bullets"]) ? rootGeoms["bullets"] : null, { x: 0.0, y: 0.0, w: bulletsWFrac, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
-      apply(wheelGroup, isOk01(rootGeoms["wheel"]) ? rootGeoms["wheel"] : null, { x: 1.0, y: 0.0, w: wheelWFrac, h: 1.0, anchor: "topRight", rotationDeg: 0 });
-      // Pie should always fill the wheel box; ignore any out-of-range saved geom.
-      apply(pie, isOk01(wheelGeoms["pie"]) ? wheelGeoms["pie"] : null, { x: 0.5, y: 0.5, w: 1.0, h: 1.0, anchor: "centerCenter", rotationDeg: 0 });
+      // Wheel wrapper fills the right column; wheel itself is square and centered within it.
+      apply(wheelGroup, null, { x: 1.0, y: 0.0, w: wheelWFrac, h: 1.0, anchor: "topRight", rotationDeg: 0 });
+      // The wheel element is square in the composite coordinate system (w==h) and centered vertically.
+      apply(pie, isOk01(rootGeoms["wheel"]) ? rootGeoms["wheel"] : null, { x: 1.0, y: 0.5, w: wheelWFrac, h: wheelWFrac, anchor: "centerRight", rotationDeg: 0 });
     };
 
     update(node);
