@@ -33,7 +33,7 @@ type ChoicesState = {
 let __choicesPollStarted = false;
 const __choicesState: Record<string, ChoicesState | null> = {};
 const __activeChoicesPollIds = new Set<string>();
-const __choicesResultsVisible: Record<string, boolean> = {};
+// Choices are always rendered live (no separate "results mode").
 
 // Screen edit state (shared across handlers)
 let screenEditMode = false;
@@ -47,6 +47,102 @@ let exitScreenEdit: () => void = () => {};
 let presentationStarted = false;
 let __soundState: any = null;
 let __soundStreamStarted = false;
+
+type PlotRanges = {
+  xMin: number;
+  xMax: number;
+  yMin: number;
+  yMax: number;
+  /** Whether the user has interacted (pan/zoom) */
+  user: boolean;
+};
+
+const __plotRanges = new Map<string, PlotRanges>();
+let __plotDrag:
+  | {
+      key: string;
+      kind: "timer" | "sound-spectrum" | "sound-pressure";
+      xMin: number;
+      xMax: number;
+      yMin: number;
+      yMax: number;
+      startClientX: number;
+      startClientY: number;
+      rect: DOMRect;
+    }
+  | null = null;
+
+const PLOT_FRACS = { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 };
+
+function _plotRectCss(nodeEl: HTMLElement) {
+  const r = nodeEl.getBoundingClientRect();
+  const ox = r.left + PLOT_FRACS.leftF * r.width;
+  const oy = r.top + PLOT_FRACS.bottomF * r.height;
+  const xLen = (PLOT_FRACS.rightF - PLOT_FRACS.leftF) * r.width;
+  const yLen = (PLOT_FRACS.bottomF - PLOT_FRACS.topF) * r.height;
+  const top = r.top + PLOT_FRACS.topF * r.height;
+  const bottom = r.top + PLOT_FRACS.bottomF * r.height;
+  return { r, ox, oy, xLen, yLen, top, bottom };
+}
+
+function _isInsidePlot(nodeEl: HTMLElement, clientX: number, clientY: number) {
+  const { ox, xLen, top, bottom } = _plotRectCss(nodeEl);
+  return clientX >= ox && clientX <= ox + xLen && clientY >= top && clientY <= bottom;
+}
+
+function _clamp(v: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+function _niceTicks(
+  minV: number,
+  maxV: number,
+  targetTicks: number,
+  candidates: number[],
+  fmt: (v: number) => string
+): Array<{ frac: number; label: string; value: number }> {
+  const a = Number(minV);
+  const b = Number(maxV);
+  const span = Math.max(1e-12, b - a);
+  const step = niceStepFromCandidates(span, targetTicks, candidates);
+  // Use a stable tick start even for negative mins.
+  const start = Math.ceil((a - 1e-12) / step) * step;
+  const out: Array<{ frac: number; label: string; value: number }> = [];
+  for (let v = start; v <= b + 1e-9; v += step) {
+    const f = (v - a) / span;
+    out.push({ frac: f, label: fmt(v), value: v });
+    if (out.length > 200) break;
+  }
+  return out;
+}
+
+function _drawGrid(
+  ctx: CanvasRenderingContext2D,
+  plot: { ox: number; oy: number; xLen: number; yLen: number },
+  dpr: number,
+  xTicks: Array<{ xFrac: number }>,
+  yTicks: Array<{ yFrac: number }>
+) {
+  const { ox, oy, xLen, yLen } = plot;
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.10)";
+  ctx.lineWidth = Math.max(1, 1 * dpr);
+  for (const t of xTicks) {
+    const x = ox + t.xFrac * xLen;
+    ctx.beginPath();
+    ctx.moveTo(x, oy);
+    ctx.lineTo(x, oy - yLen);
+    ctx.stroke();
+  }
+  for (const t of yTicks) {
+    const y = oy - t.yFrac * yLen;
+    ctx.beginPath();
+    ctx.moveTo(ox, y);
+    ctx.lineTo(ox + xLen, y);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
 
 type SoundState = {
   enabled: boolean;
@@ -205,11 +301,11 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
   const accepting = !!state?.accepting;
   const bullet = String(state?.bullets ?? (node?.bullets ?? "A"));
   const optsFromNode: Array<any> = Array.isArray(node?.options) ? node.options : [];
-  const resultsVisible = __choicesResultsVisible[String(node?.id ?? "")] === true;
-  el.dataset.resultsVisible = resultsVisible ? "1" : "0";
+  const resultsVisible = true;
+  el.dataset.resultsVisible = "1";
 
   if (question) question.textContent = state?.question || node?.question || "Poll";
-  if (startBtn) startBtn.textContent = accepting ? "Stop" : "Start";
+  if (startBtn) startBtn.textContent = accepting ? "Stop" : "Run";
   if (resetBtn) resetBtn.disabled = !optsFromNode.length;
 
   const options: Array<ChoiceOptionState> = optsFromNode.map((opt: any) => {
@@ -218,13 +314,13 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
       id: opt.id,
       label: opt.label,
       color: opt.color,
-      votes: resultsVisible ? (st?.votes ?? 0) : 0,
-      percent: resultsVisible ? (st?.percent ?? 0) : 0,
+      votes: st?.votes ?? 0,
+      percent: st?.percent ?? 0,
     };
   });
 
-  const totalVotes = resultsVisible ? (state?.totalVotes ?? options.reduce((s, o) => s + o.votes, 0)) : 0;
-  if (total) total.textContent = resultsVisible ? `${totalVotes} vote${totalVotes === 1 ? "" : "s"}` : "";
+  const totalVotes = state?.totalVotes ?? options.reduce((s, o) => s + o.votes, 0);
+  if (total) total.textContent = totalVotes > 0 ? `${totalVotes} vote${totalVotes === 1 ? "" : "s"}` : "-";
 
   if (list) {
     list.innerHTML = "";
@@ -245,11 +341,11 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
 
       const meta = document.createElement("div");
       meta.className = "choices-meta";
-      if (resultsVisible) {
+      if (totalVotes <= 0) {
+        meta.textContent = "-";
+      } else {
         const pct = Math.round(opt.percent ?? 0);
         meta.textContent = `${opt.votes} vote${opt.votes === 1 ? "" : "s"} • ${pct}%`;
-      } else {
-        meta.textContent = "";
       }
 
       row.append(label, meta);
@@ -257,41 +353,34 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
     });
   }
 
-  // Only render chart when results are visible.
+  // Always render bullets + chart together (animations can hide/reveal if desired).
   const bulletsGroup = el.querySelector<HTMLElement>(".choices-bullets");
   const wheelGroup = el.querySelector<HTMLElement>(".choices-wheel-group");
-  if (bulletsGroup) bulletsGroup.style.display = resultsVisible ? "none" : "flex";
-  if (wheelGroup) wheelGroup.style.display = resultsVisible ? "block" : "none";
+  if (bulletsGroup) bulletsGroup.style.display = "flex";
+  if (wheelGroup) wheelGroup.style.display = "block";
 
-  if (resultsVisible) {
-    const includeLimit = Number(node?.includeLimit ?? node?.minPct ?? node?.min ?? el.dataset.includeLimit ?? "3");
-    const textInsideLimit = Number(node?.textInsideLimit ?? node?.minInsidePct ?? node?.minInside ?? el.dataset.textInsideLimit ?? "6");
-    const otherLabel = String(node?.otherLabel ?? el.dataset.otherLabel ?? "Other") || "Other";
+  const includeLimit = Number(node?.includeLimit ?? node?.minPct ?? node?.min ?? el.dataset.includeLimit ?? "3");
+  const textInsideLimit = Number(node?.textInsideLimit ?? node?.minInsidePct ?? node?.minInside ?? el.dataset.textInsideLimit ?? "6");
+  const otherLabel = String(node?.otherLabel ?? el.dataset.otherLabel ?? "Other") || "Other";
 
-    // Bucket tiny slices into "Other"
-    const big: Array<{ id: string; color?: string; votes: number; percent: number; label: string }> = [];
-    let otherVotes = 0;
-    let otherPercent = 0;
-    for (const o of options) {
-      const p = Number(o.percent ?? 0);
-      if (Number.isFinite(includeLimit) && p > 0 && p < includeLimit) {
-        otherVotes += Number(o.votes ?? 0);
-        otherPercent += p;
-      } else {
-        big.push({ id: String(o.id ?? ""), color: o.color, votes: o.votes, percent: p, label: o.label });
-      }
+  // Bucket tiny slices into "Other"
+  const big: Array<{ id: string; color?: string; votes: number; percent: number; label: string }> = [];
+  let otherVotes = 0;
+  let otherPercent = 0;
+  for (const o of options) {
+    const p = Number(o.percent ?? 0);
+    if (Number.isFinite(includeLimit) && p > 0 && p < includeLimit) {
+      otherVotes += Number(o.votes ?? 0);
+      otherPercent += p;
+    } else {
+      // If there are no votes yet, draw equal slices visually, but show "-" in labels.
+      const v = totalVotes > 0 ? o.votes : 1;
+      big.push({ id: String(o.id ?? ""), color: o.color, votes: v, percent: totalVotes > 0 ? p : (NaN as any), label: o.label });
     }
-    if (otherVotes > 0) big.push({ id: "other", color: "rgba(255,255,255,0.35)", votes: otherVotes, percent: otherPercent, label: otherLabel });
-    drawChoicesPie(el, big.map((o) => ({ color: o.color, votes: o.votes })));
-    renderChoicesWheelOverlay(engine, String(node?.id ?? ""), big, {
-      totalVotes,
-      otherLabel,
-      textInsideLimit
-    });
-  } else {
-    drawChoicesPie(el, []);
-    renderChoicesWheelOverlay(engine, String(node?.id ?? ""), [], { totalVotes: 0, otherLabel: "Other", textInsideLimit: 6 });
   }
+  if (otherVotes > 0) big.push({ id: "other", color: "rgba(255,255,255,0.35)", votes: otherVotes, percent: otherPercent, label: otherLabel });
+  drawChoicesPie(el, big.map((o) => ({ color: o.color, votes: o.votes })));
+  renderChoicesWheelOverlay(engine, String(node?.id ?? ""), big, { totalVotes, otherLabel, textInsideLimit });
 }
 
 function ensureChoicesWheelLayer(engine: Engine, pollId: string) {
@@ -457,11 +546,12 @@ function renderChoicesWheelOverlay(
 
     const tpl = String(t.dataset.template ?? templates[sid] ?? "{{label}} ({{percent}}%)");
     t.dataset.template = tpl;
+    const noVotes = !(opts.totalVotes > 0);
     const resolved = applyDataBindings(tpl, {
       label: s.label,
-      percent: Math.round(pct),
-      votes: s.votes,
-      totalVotes: opts.totalVotes
+      percent: noVotes ? "-" : Math.round(pct),
+      votes: noVotes ? "-" : s.votes,
+      totalVotes: noVotes ? "-" : opts.totalVotes
     });
     const prevTxt = t.dataset.rawText ?? "";
     if (prevTxt !== resolved) {
@@ -570,18 +660,19 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   const barColor = el.dataset.barColor ?? "orange";
   const lineColor = el.dataset.lineColor ?? "green";
   const lineWidthPx = Math.max(0.5, Number(el.dataset.lineWidth ?? "2"));
+  const gridOn = String(el.dataset.grid ?? "").toLowerCase() === "true";
 
   // Domain and binning (seconds)
-  const minS = Number(el.dataset.minS ?? "0");
+  const baseMinS = Number(el.dataset.minS ?? "0");
   const maxSDefault = Math.max(1, ...samples.map((x) => x / 1000));
-  const maxS = Number(el.dataset.maxS ?? String(Math.max(1, maxSDefault)));
+  const baseMaxS = Number(el.dataset.maxS ?? String(Math.max(1, maxSDefault)));
   const binSizeS = Number(el.dataset.binSizeS ?? "0.5");
-  const span = Math.max(1e-9, maxS - minS);
-  const bins = Math.max(1, Math.round(span / binSizeS));
+  const spanBase = Math.max(1e-9, baseMaxS - baseMinS);
+  const bins = Math.max(1, Math.round(spanBase / binSizeS));
   const counts = new Array(bins).fill(0);
   for (const ms of samples) {
     const s = ms / 1000;
-    const idx = Math.max(0, Math.min(bins - 1, Math.floor(((s - minS) / span) * bins)));
+    const idx = Math.max(0, Math.min(bins - 1, Math.floor(((s - baseMinS) / spanBase) * bins)));
     counts[idx] += 1;
   }
   const perc = counts.map((c) => (n > 0 ? c / n : 0));
@@ -589,39 +680,57 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
   // Bars
   // Normalize y so the view shows up to 1.1× the highest bar.
   const maxBar = Math.max(0, ...perc);
-  const yMax = Math.max(1e-9, maxBar * 1.1);
-  const yScale = yLen / yMax; // (fraction units) -> canvas pixels
+  const yMaxAuto = Math.max(1e-9, maxBar * 1.1);
 
-  ctx.fillStyle = barColor;
-  const bw = xLen / bins;
-  for (let i = 0; i < bins; i++) {
-    const h = perc[i] * yScale;
-    ctx.globalAlpha = 0.85;
-    ctx.fillRect(ox + i * bw + bw * 0.08, oy - h, bw * 0.84, h);
-  }
-  ctx.globalAlpha = 1;
+  // Current view range (pan/zoom)
+  const id = el.dataset.nodeId ?? "timer";
+  const key = `timer:${id}`;
+  const pr0 = __plotRanges.get(key);
+  const xMin = pr0?.xMin ?? baseMinS;
+  const xMax = pr0?.xMax ?? baseMaxS;
+  const yMin = pr0?.yMin ?? 0;
+  const yMax = pr0?.yMax ?? yMaxAuto;
+  const xSpan = Math.max(1e-9, xMax - xMin);
+  const ySpan = Math.max(1e-9, yMax - yMin);
+  const yScale = yLen / ySpan;
 
   // Ticks + tick labels (KaTeX font) — drawn on the canvas layer.
-  // X ticks at bin edges from min..max using binSize
+  // X ticks are based on current view range (pan/zoom).
   const fmt = (v: number) => {
     // Avoid noisy decimals but keep bin edges like 20.5.
     const s = Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(2);
     return s.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
   };
 
-  // Y ticks: adapt to the visible range (up to yMax).
-  // Keep it simple: choose a "nice" step in percent.
-  const maxPct = Math.max(1, yMax * 100);
-  const stepPct = niceStepFromCandidates(maxPct, 6, [1, 2, 5, 10, 20, 25, 50, 100]);
-
-  const xTicks = new Array(bins + 1).fill(0).map((_, i) => {
-    const v = minS + i * binSizeS;
-    return { xFrac: (v - minS) / span, label: fmt(v) };
-  });
+  const xTickVals = _niceTicks(xMin, xMax, 7, [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60], fmt);
+  const xTicks = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
   const yTicks: Array<{ yFrac: number; label: string }> = [];
-  for (let p = 0; p <= maxPct + 1e-9; p += stepPct) {
-    yTicks.push({ yFrac: (p / 100) / yMax, label: String(p) });
+  // y is a fraction (0..1-ish). Show labels in %.
+  const yTickVals = _niceTicks(yMin, yMax, 6, [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1], (v) => {
+    const p = v * 100;
+    const s = Math.abs(p - Math.round(p)) < 1e-9 ? String(Math.round(p)) : p.toFixed(1);
+    return s.replace(/\.0$/, "");
+  });
+  for (const t of yTickVals) yTicks.push({ yFrac: t.frac, label: t.label });
+
+  if (gridOn) _drawGrid(ctx, plot, dpr, xTicks, yTicks);
+
+  // Bars (draw in view coords)
+  ctx.fillStyle = barColor;
+  for (let i = 0; i < bins; i++) {
+    const x0 = baseMinS + i * binSizeS;
+    const x1 = x0 + binSizeS;
+    if (x1 < xMin || x0 > xMax) continue;
+    const hFrac = perc[i];
+    const yv = (hFrac - yMin) / ySpan;
+    const h = Math.max(0, yv) * yLen;
+    const sx0 = ox + ((x0 - xMin) / xSpan) * xLen;
+    const sw = (binSizeS / xSpan) * xLen;
+    ctx.globalAlpha = 0.85;
+    ctx.fillRect(sx0 + sw * 0.08, oy - h, sw * 0.84, h);
   }
+  ctx.globalAlpha = 1;
+
   drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
 
   // Gaussian overlay normalized 0..1
@@ -636,11 +745,11 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
     ctx.lineWidth = lineWidthPx * dpr;
     ctx.beginPath();
     for (let i = 0; i <= 200; i++) {
-      const x = minS + (i / 200) * span;
+      const x = xMin + (i / 200) * xSpan;
       // Approximate expected mass in a bin of width binSizeS at position x.
       const y = pdf(x) * binSizeS; // fraction (0..1-ish), comparable to bar heights
-      const sx = ox + ((x - minS) / span) * xLen;
-      const sy = oy - y * yScale;
+      const sx = ox + ((x - xMin) / xSpan) * xLen;
+      const sy = oy - ((y - yMin) / ySpan) * yLen;
       if (i === 0) ctx.moveTo(sx, sy);
       else ctx.lineTo(sx, sy);
     }
@@ -667,6 +776,7 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
   const mode = (el.dataset.mode ?? "spectrum").toLowerCase();
   const col = el.dataset.color ?? "white";
   const windowS = Math.max(1, Number(el.dataset.windowS ?? "30") || 30);
+  const gridOn = String(el.dataset.grid ?? "").toLowerCase() === "true";
 
   // Title / error
   if (state.error) {
@@ -684,14 +794,33 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
     const n = ys.length;
     if (n <= 1) return;
     // Keep a bit of headroom so it doesn't look pegged.
-    const maxY = Math.max(1e-9, Math.max(...ys) * 1.05);
+    const maxYAuto = Math.max(1e-9, Math.max(...ys) * 1.05);
+
+    const id = el.dataset.nodeId ?? "sound";
+    const key = `sound:${id}:pressure`;
+    const pr0 = __plotRanges.get(key);
+    let xMin = pr0?.xMin ?? 0;
+    let xMax = pr0?.xMax ?? windowS;
+    const xSpan0 = Math.max(1e-9, xMax - xMin);
+    if (xSpan0 > windowS) {
+      xMin = 0;
+      xMax = windowS;
+    } else {
+      xMin = _clamp(xMin, 0, windowS - 1e-9);
+      xMax = _clamp(xMax, xMin + 1e-6, windowS);
+    }
+    const yMin = pr0?.yMin ?? 0;
+    const yMax = pr0?.yMax ?? maxYAuto;
+    const xSpan = Math.max(1e-9, xMax - xMin);
+    const ySpan = Math.max(1e-9, yMax - yMin);
     ctx.strokeStyle = col;
     ctx.lineWidth = Math.max(1, 2 * dpr);
     ctx.beginPath();
     for (let i = 0; i < n; i++) {
-      const t = i / (n - 1);
-      const x = ox + t * xLen;
-      const yv = ys[i] / maxY;
+      const xVal = (i / (n - 1)) * windowS;
+      const xf = (xVal - xMin) / xSpan;
+      const x = ox + xf * xLen;
+      const yv = (ys[i] - yMin) / ySpan;
       const y = oy - yv * yLen;
       if (i === 0) ctx.moveTo(x, y);
       else ctx.lineTo(x, y);
@@ -700,16 +829,15 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
 
     // Timer-like ticks/labels
     const lineWidthPx = 2;
-    const xTicks: Array<{ xFrac: number; label: string }> = [];
-    const stepS = niceStepFromCandidates(windowS, 6, [0.5, 1, 2, 5, 10, 15, 30, 60]);
-    for (let s = 0; s <= windowS + 1e-9; s += stepS) {
-      xTicks.push({ xFrac: s / windowS, label: String(Math.round(s * 100) / 100).replace(/\.0+$/, "") });
-    }
-    const yTicks: Array<{ yFrac: number; label: string }> = [];
-    for (let i = 0; i <= 5; i++) {
-      const frac = i / 5;
-      yTicks.push({ yFrac: frac, label: String(Math.round(frac * 100) / 100) });
-    }
+    const fmtS = (v: number) => String(Math.round(v * 100) / 100).replace(/\.0+$/, "");
+    const xTickVals = _niceTicks(xMin, xMax, 6, [0.5, 1, 2, 5, 10, 15, 30, 60], fmtS);
+    const xTicks: Array<{ xFrac: number; label: string }> = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
+    const yTickVals = _niceTicks(yMin, yMax, 6, [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1], (v) => {
+      const s = v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+      return s || "0";
+    });
+    const yTicks: Array<{ yFrac: number; label: string }> = yTickVals.map((t) => ({ yFrac: t.frac, label: t.label }));
+    if (gridOn) _drawGrid(ctx, plot, dpr, xTicks, yTicks);
     drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
     return;
   }
@@ -717,23 +845,37 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
   // spectrum
   const f = state.spectrum?.freqHz ?? [];
   const m = state.spectrum?.magDb ?? [];
-  const n = Math.min(f.length, m.length);
-  if (n <= 1) return;
+  const n2 = Math.min(f.length, m.length);
+  if (n2 <= 1) return;
   // Show up to 8kHz by default (good for speech); clamp if SR is lower.
-  const maxHz = Math.min(8000, Math.max(...f));
-  const minDb = -120;
-  const maxDb = 0;
+  const maxHzAuto = Math.min(8000, Math.max(...f));
+  const minDbAuto = -120;
+  const maxDbAuto = 0;
+
+  const id = el.dataset.nodeId ?? "sound";
+  const key = `sound:${id}:spectrum`;
+  const pr0 = __plotRanges.get(key);
+  let xMin = pr0?.xMin ?? 0;
+  let xMax = pr0?.xMax ?? maxHzAuto;
+  xMin = _clamp(xMin, 0, Math.max(1e-6, maxHzAuto - 1e-9));
+  xMax = _clamp(xMax, xMin + 1e-6, maxHzAuto);
+  let yMin = pr0?.yMin ?? minDbAuto;
+  let yMax = pr0?.yMax ?? maxDbAuto;
+  yMin = _clamp(yMin, minDbAuto, maxDbAuto - 1e-6);
+  yMax = _clamp(yMax, yMin + 1e-6, maxDbAuto);
+  const xSpan = Math.max(1e-9, xMax - xMin);
+  const ySpan = Math.max(1e-9, yMax - yMin);
   ctx.strokeStyle = col;
   ctx.lineWidth = Math.max(1, 2 * dpr);
   ctx.beginPath();
   let started = false;
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < n2; i++) {
     const hz = f[i];
-    if (hz < 0 || hz > maxHz) continue;
-    const t = hz / maxHz;
+    if (hz < xMin || hz > xMax) continue;
+    const t = (hz - xMin) / xSpan;
     const x = ox + t * xLen;
-    const db = Math.max(minDb, Math.min(maxDb, m[i]));
-    const yv = (db - minDb) / (maxDb - minDb);
+    const db = Math.max(yMin, Math.min(yMax, m[i]));
+    const yv = (db - yMin) / ySpan;
     const y = oy - yv * yLen;
     if (!started) {
       ctx.moveTo(x, y);
@@ -747,18 +889,218 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
   // Spectrum ticks (timer-like)
   {
     const lineWidthPx = 2;
-    const xTicks: Array<{ xFrac: number; label: string }> = [];
-    const stepHz = niceStepFromCandidates(maxHz, 6, [100, 200, 500, 1000, 2000, 4000, 8000, 16000]);
-    for (let hz = 0; hz <= maxHz + 1e-9; hz += stepHz) {
-      xTicks.push({ xFrac: hz / maxHz, label: String(Math.round(hz)) });
-    }
-    const yTicks: Array<{ yFrac: number; label: string }> = [];
-    for (let db = minDb; db <= maxDb + 1e-9; db += 20) {
-      const frac = (db - minDb) / (maxDb - minDb);
-      yTicks.push({ yFrac: frac, label: String(db) });
-    }
+    const xTickVals = _niceTicks(xMin, xMax, 6, [50, 100, 200, 500, 1000, 2000, 4000, 8000, 16000], (v) => String(Math.round(v)));
+    const xTicks: Array<{ xFrac: number; label: string }> = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
+    const yTickVals = _niceTicks(yMin, yMax, 6, [5, 10, 20, 30, 40, 60], (v) => String(Math.round(v)));
+    const yTicks: Array<{ yFrac: number; label: string }> = yTickVals.map((t) => ({ yFrac: t.frac, label: t.label }));
+    if (gridOn) _drawGrid(ctx, plot, dpr, xTicks, yTicks);
     drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
   }
+}
+
+let __plotPanZoomAttached = false;
+function attachPlotPanZoom(stage: HTMLElement) {
+  if (__plotPanZoomAttached) return;
+  __plotPanZoomAttached = true;
+
+  const plotInfo = (nodeEl: HTMLElement) => {
+    const id = nodeEl.dataset.nodeId ?? "node";
+    const type = (nodeEl.dataset.nodeType ?? "").toLowerCase();
+    if (type === "timer") {
+      const baseMinS = Number(nodeEl.dataset.minS ?? "0");
+      const baseMaxS = Number(nodeEl.dataset.maxS ?? "40");
+
+      // Auto yMax from histogram (matches drawTimerNode closely).
+      const samples = __timerState?.samplesMs ?? [];
+      const n = samples.length;
+      const binSizeS = Number(nodeEl.dataset.binSizeS ?? "0.5");
+      const spanBase = Math.max(1e-9, baseMaxS - baseMinS);
+      const bins = Math.max(1, Math.round(spanBase / binSizeS));
+      const counts = new Array(bins).fill(0);
+      for (const ms of samples) {
+        const s = ms / 1000;
+        const idx = Math.max(0, Math.min(bins - 1, Math.floor(((s - baseMinS) / spanBase) * bins)));
+        counts[idx] += 1;
+      }
+      const perc = counts.map((c) => (n > 0 ? c / n : 0));
+      const maxBar = Math.max(0, ...perc);
+      const yMaxAuto = Math.max(1e-9, maxBar * 1.1);
+
+      const key = `timer:${id}`;
+      const pr0 = __plotRanges.get(key);
+      return {
+        key,
+        kind: "timer" as const,
+        bounds: { xMin: baseMinS, xMax: baseMaxS, yMin: 0, yMax: 1 },
+        current: pr0 ?? { xMin: baseMinS, xMax: baseMaxS, yMin: 0, yMax: yMaxAuto, user: false },
+      };
+    }
+    if (type === "sound") {
+      const mode = (nodeEl.dataset.mode ?? "spectrum").toLowerCase() === "pressure" ? "pressure" : "spectrum";
+      if (mode === "pressure") {
+        const windowS = Math.max(1, Number(nodeEl.dataset.windowS ?? "30") || 30);
+        const ys0 = (__soundState as SoundState | null)?.pressure10ms ?? [];
+        const nKeep = Math.max(2, Math.min(ys0.length, Math.round(windowS * 100)));
+        const ys = ys0.slice(-nKeep);
+        const maxYAuto = Math.max(1e-9, Math.max(0, ...ys) * 1.05);
+
+        const key = `sound:${id}:pressure`;
+        const pr0 = __plotRanges.get(key);
+        return {
+          key,
+          kind: "sound-pressure" as const,
+          bounds: { xMin: 0, xMax: windowS, yMin: 0, yMax: Number.POSITIVE_INFINITY },
+          current: pr0 ?? { xMin: 0, xMax: windowS, yMin: 0, yMax: maxYAuto, user: false },
+        };
+      }
+      const f = (__soundState as SoundState | null)?.spectrum?.freqHz ?? [];
+      const maxHzAuto = Math.min(8000, Math.max(1, ...f.map((x) => Number(x) || 0)));
+      const key = `sound:${id}:spectrum`;
+      const pr0 = __plotRanges.get(key);
+      return {
+        key,
+        kind: "sound-spectrum" as const,
+        bounds: { xMin: 0, xMax: maxHzAuto, yMin: -120, yMax: 0 },
+        current: pr0 ?? { xMin: 0, xMax: maxHzAuto, yMin: -120, yMax: 0, user: false },
+      };
+    }
+    return null;
+  };
+
+  stage.addEventListener(
+    "wheel",
+    (ev) => {
+      if (getAppMode() !== "live") return;
+      const t = ev.target as HTMLElement;
+      const nodeEl = t.closest<HTMLElement>(".node-timer, .node-sound");
+      if (!nodeEl) return;
+      if (!_isInsidePlot(nodeEl, ev.clientX, ev.clientY)) return;
+      const info = plotInfo(nodeEl);
+      if (!info) return;
+
+      const { ox, oy, xLen, yLen } = _plotRectCss(nodeEl);
+      if (!(xLen > 1 && yLen > 1)) return;
+
+      const xFrac = _clamp((ev.clientX - ox) / xLen, 0, 1);
+      const yFrac = _clamp((oy - ev.clientY) / yLen, 0, 1);
+
+      const cur = info.current;
+      const xSpan = Math.max(1e-9, cur.xMax - cur.xMin);
+      const ySpan = Math.max(1e-9, cur.yMax - cur.yMin);
+      const xCursor = cur.xMin + xFrac * xSpan;
+      const yCursor = cur.yMin + yFrac * ySpan;
+
+      const z = _clamp(Math.exp(-ev.deltaY * 0.001), 0.2, 5);
+      const zoomX = ev.shiftKey ? 1 : z;
+      const zoomY = ev.shiftKey ? z : (ev.ctrlKey ? z : 1);
+
+      const newXSpan = xSpan / zoomX;
+      const newYSpan = ySpan / zoomY;
+      let nx0 = xCursor - xFrac * newXSpan;
+      let nx1 = nx0 + newXSpan;
+      let ny0 = yCursor - yFrac * newYSpan;
+      let ny1 = ny0 + newYSpan;
+
+      // Clamp to bounds
+      {
+        const b0 = info.bounds.xMin;
+        const b1 = info.bounds.xMax;
+        const spanB = Math.max(1e-9, b1 - b0);
+        const spanN = Math.max(1e-9, nx1 - nx0);
+        if (spanN > spanB) {
+          nx0 = b0;
+          nx1 = b1;
+        } else {
+          nx0 = _clamp(nx0, b0, b1 - spanN);
+          nx1 = nx0 + spanN;
+        }
+      }
+      ny0 = Math.max(info.bounds.yMin, ny0);
+      ny1 = Math.min(info.bounds.yMax, ny1);
+      if (!(ny1 > ny0 + 1e-9)) {
+        ny0 = cur.yMin;
+        ny1 = cur.yMax;
+      }
+
+      __plotRanges.set(info.key, { xMin: nx0, xMax: nx1, yMin: ny0, yMax: ny1, user: true });
+      ev.preventDefault();
+    },
+    { passive: false }
+  );
+
+  stage.addEventListener("pointerdown", (ev) => {
+    if (getAppMode() !== "live") return;
+    if (ev.button !== 0) return;
+    const t = ev.target as HTMLElement;
+    const nodeEl = t.closest<HTMLElement>(".node-timer, .node-sound");
+    if (!nodeEl) return;
+    if (!_isInsidePlot(nodeEl, ev.clientX, ev.clientY)) return;
+    const info = plotInfo(nodeEl);
+    if (!info) return;
+    const pr = _plotRectCss(nodeEl);
+    __plotDrag = {
+      key: info.key,
+      kind: info.kind,
+      xMin: info.current.xMin,
+      xMax: info.current.xMax,
+      yMin: info.current.yMin,
+      yMax: info.current.yMax,
+      startClientX: ev.clientX,
+      startClientY: ev.clientY,
+      rect: pr.r,
+    };
+    (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+    ev.preventDefault();
+  });
+
+  stage.addEventListener("pointermove", (ev) => {
+    if (!__plotDrag) return;
+    if (getAppMode() !== "live") return;
+    const dxPx = ev.clientX - __plotDrag.startClientX;
+    const dyPx = ev.clientY - __plotDrag.startClientY;
+    const r = __plotDrag.rect;
+    const xLen = (PLOT_FRACS.rightF - PLOT_FRACS.leftF) * r.width;
+    const yLen = (PLOT_FRACS.bottomF - PLOT_FRACS.topF) * r.height;
+    if (!(xLen > 1 && yLen > 1)) return;
+    const xSpan = Math.max(1e-9, __plotDrag.xMax - __plotDrag.xMin);
+    const ySpan = Math.max(1e-9, __plotDrag.yMax - __plotDrag.yMin);
+
+    let nx0 = __plotDrag.xMin - (dxPx / xLen) * xSpan;
+    let nx1 = __plotDrag.xMax - (dxPx / xLen) * xSpan;
+    let ny0 = __plotDrag.yMin + (dyPx / yLen) * ySpan;
+    let ny1 = __plotDrag.yMax + (dyPx / yLen) * ySpan;
+
+    // Clamp using current plot bounds (re-resolve from the element each time)
+    const t = ev.target as HTMLElement;
+    const nodeEl = t.closest<HTMLElement>(".node-timer, .node-sound");
+    if (nodeEl) {
+      const info = plotInfo(nodeEl);
+      if (info && info.key === __plotDrag.key) {
+        const b0 = info.bounds.xMin;
+        const b1 = info.bounds.xMax;
+        const spanB = Math.max(1e-9, b1 - b0);
+        const spanN = Math.max(1e-9, nx1 - nx0);
+        if (spanN > spanB) {
+          nx0 = b0;
+          nx1 = b1;
+        } else {
+          nx0 = _clamp(nx0, b0, b1 - spanN);
+          nx1 = nx0 + spanN;
+        }
+        ny0 = Math.max(info.bounds.yMin, ny0);
+        ny1 = Math.min(info.bounds.yMax, ny1);
+      }
+    }
+
+    __plotRanges.set(__plotDrag.key, { xMin: nx0, xMax: nx1, yMin: ny0, yMax: ny1, user: true });
+    ev.preventDefault();
+  });
+
+  const endDrag = () => {
+    __plotDrag = null;
+  };
+  stage.addEventListener("pointerup", endDrag);
+  stage.addEventListener("pointercancel", endDrag);
 }
 
 function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
@@ -782,20 +1124,6 @@ function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
         body: JSON.stringify(accepting ? { pollId } : { pollId, reset: true }),
       });
       __choicesState[pollId] = await fetchChoicesState(pollId);
-      // Hide results while collecting votes.
-      if (!accepting) __choicesResultsVisible[pollId] = false;
-      ev.preventDefault();
-      return;
-    }
-    if (action === "choices-showResults") {
-      // Stop accepting, then fetch once and reveal results (no real-time updates).
-      await fetch(`${BACKEND}/api/choices/stop`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ pollId }),
-      });
-      __choicesState[pollId] = await fetchChoicesState(pollId);
-      __choicesResultsVisible[pollId] = true;
       ev.preventDefault();
       return;
     }
@@ -806,23 +1134,6 @@ function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
         body: JSON.stringify({ pollId }),
       });
       __choicesState[pollId] = await fetchChoicesState(pollId);
-      __choicesResultsVisible[pollId] = false;
-      ev.preventDefault();
-      return;
-    }
-    if (action === "choices-test") {
-      btn.disabled = true;
-      try {
-        await simulateChoicesVotes(pollId, { users: 40 });
-        __choicesState[pollId] = await fetchChoicesState(pollId);
-        // Keep results hidden unless explicitly shown.
-        if (__choicesResultsVisible[pollId] == null) __choicesResultsVisible[pollId] = false;
-        // Force a local re-render tick quickly.
-        const el = stage.querySelector<HTMLElement>(`.node[data-node-id="${pollId}"], .node[data-node-id="${CSS.escape(pollId)}"]`);
-        if (el) renderChoicesNode(engine, el, { id: pollId }, __choicesState[pollId]);
-      } finally {
-        btn.disabled = false;
-      }
       ev.preventDefault();
       return;
     }
@@ -1614,12 +1925,7 @@ function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, dat
     t.style.pointerEvents = isGroupEditing ? "auto" : "none";
     t.style.cursor = isGroupEditing ? "grab" : "default";
 
-    // Spectrum-only label
-    if (sid === "peak") {
-      const modeNow = (soundEl.dataset.mode ?? "spectrum").toLowerCase();
-      // Always show while group-editing so the user can reposition it.
-      t.style.display = isGroupEditing ? "block" : modeNow === "pressure" ? "none" : "block";
-    }
+    // Visibility should be controlled by animations, not by mode-specific hard hides.
   }
 }
 
@@ -3577,9 +3883,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // Start with sub-element editing (root remains selectable via click/drag on the node itself).
     clearSelection();
 
-    // Force bullets view while editing (ignore any "results" state from Live).
-    __choicesResultsVisible[pollId] = false;
-    el.dataset.resultsVisible = "0";
+    // No separate "results view" anymore; keep the normal live layout while editing.
+    el.dataset.resultsVisible = "1";
     const m0 = engine.getModel();
     const n0: any = m0?.nodes.find((n: any) => n.id === pollId);
     if (n0) renderChoicesNode(engine, el, n0, __choicesState[pollId] ?? null);
@@ -4150,8 +4455,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (compositeDragMode === "move") {
       const px = (ev.clientX - box.left) / box.width;
       const py = (ev.clientY - box.top) / box.height;
-      const nx = px - compositeGrabOff.x;
-      const ny = py - compositeGrabOff.y;
+      let nx = px - compositeGrabOff.x;
+      let ny = py - compositeGrabOff.y;
+      if (ev.shiftKey) {
+        const step = 0.01;
+        nx = Math.round(nx / step) * step;
+        ny = Math.round(ny / step) * step;
+      }
       sub.style.left = `${nx * 100}%`;
       sub.style.top = `${ny * 100}%`;
       if (sid) {
@@ -4196,7 +4506,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         const w1 = Math.max(min, rect.w + sx);
         const h1 = Math.max(min, rect.h + sy);
         // If we're forcing uniform scaling from an edge, scale from that axis only.
-        const s = isCorner ? Math.max(w1 / Math.max(1e-9, rect.w), h1 / Math.max(1e-9, rect.h)) : (sx !== 0 ? w1 / Math.max(1e-9, rect.w) : h1 / Math.max(1e-9, rect.h));
+        let s = isCorner ? Math.max(w1 / Math.max(1e-9, rect.w), h1 / Math.max(1e-9, rect.h)) : (sx !== 0 ? w1 / Math.max(1e-9, rect.w) : h1 / Math.max(1e-9, rect.h));
+        if (ev.shiftKey) {
+          const step = 0.05;
+          s = Math.max(step, Math.round(s / step) * step);
+        }
         tlr.w = Math.max(min, rect.w * s);
         tlr.h = Math.max(min, rect.h * s);
         if (hnd.includes("w")) tlr.x = tl.x + (rect.w - tlr.w);
@@ -4233,7 +4547,14 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
       // Choices composite: scale bullets content with its own sub-element size (so resizing bullets scales fonts).
       if (compositeEditKind === "choices" && sid === "bullets") {
-        const localScale = Math.max(0.1, Math.min(1, Math.min(rect.w, rect.h)));
+        const baseW = Number(sub.dataset.baseW ?? String(compositeStartGeom.w ?? rect.w));
+        const baseH = Number(sub.dataset.baseH ?? String(compositeStartGeom.h ?? rect.h));
+        // Seed base sizes once (so scaling works both up and down).
+        if (!Number.isFinite(Number(sub.dataset.baseW))) sub.dataset.baseW = String(baseW);
+        if (!Number.isFinite(Number(sub.dataset.baseH))) sub.dataset.baseH = String(baseH);
+        const sx = rect.w / Math.max(1e-9, baseW);
+        const sy = rect.h / Math.max(1e-9, baseH);
+        const localScale = Math.max(0.1, Math.min(sx, sy));
         sub.style.setProperty("--local-scale", String(localScale));
       }
       return;
@@ -4627,6 +4948,7 @@ async function main() {
   ensureTimerPolling(engine, model, stage);
   ensureChoicesPolling(engine, model, stage);
   ensureSoundStreaming(engine, model, stage);
+  attachPlotPanZoom(stage);
 
   // Mode toggle: Edit vs Live
   const modeWrap = document.createElement("div");
@@ -4863,6 +5185,9 @@ async function main() {
 
     const onContextMenu = (e: MouseEvent) => e.preventDefault();
     const onMouseDown = (e: MouseEvent) => {
+      // When interacting with plots, don't treat clicks as navigation.
+      const hit = (e.target as HTMLElement | null)?.closest<HTMLElement>(".node-timer, .node-sound");
+      if (hit && _isInsidePlot(hit, e.clientX, e.clientY)) return;
       // left click = back, right click = forward
       if (e.button === 0) {
         stepBack();

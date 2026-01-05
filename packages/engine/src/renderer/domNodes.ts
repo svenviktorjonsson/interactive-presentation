@@ -678,16 +678,15 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     wheelGroup.style.position = "absolute";
     wheelGroup.style.overflow = "visible";
     wheelGroup.style.pointerEvents = "auto";
-    wheelGroup.style.display = "none"; // results hidden by default; app layer toggles
+    // Always visible: presenter can animate it in/out if desired.
+    wheelGroup.style.display = "block";
 
     const { bar: controlsBar } = createControlBar({
       className: "choices-headerbar",
       buttonClass: "choices-btn",
       buttons: [
-        { label: "Start", action: "choices-startstop", primary: true },
-        { label: "Show results", action: "choices-showResults" },
-        { label: "Reset", action: "choices-reset" },
-        { label: "Test", action: "choices-test" }
+        { label: "Run", action: "choices-startstop", primary: true },
+        { label: "Reset", action: "choices-reset" }
       ]
     });
     // Buttons are NOT a standard editable element; keep them attached to the main choices node.
@@ -734,13 +733,21 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       el.dataset.textInsideLimit = String((n as any).textInsideLimit ?? (n as any).minInsidePct ?? (n as any).minInside ?? "");
       el.dataset.otherLabel = String((n as any).otherLabel ?? "");
       title.textContent = (n as any).question ?? "Poll";
-      // default hidden until Show results is pressed (app layer controls actual rendering)
-      if (!el.dataset.resultsVisible) el.dataset.resultsVisible = "0";
+      // Always show both bullets and wheel; animations can handle reveal/hide if desired.
+      el.dataset.resultsVisible = "1";
 
       // Apply composite geometries if provided.
       const byPath: any = (n as any).compositeGeometriesByPath ?? {};
       const rootGeoms = byPath[""] ?? {};
       const wheelGeoms = byPath["wheel"] ?? {};
+
+      // Default layout: bullets left, wheel right, wheel is square (same height as bullets).
+      // Use the *node's* aspect ratio so "square" is correct in world units:
+      // wheelWFrac = nodeH / nodeW  (clamped for reasonable layouts).
+      const tW = Number((n as any)?.transform?.w ?? 1);
+      const tH = Number((n as any)?.transform?.h ?? 1);
+      const wheelWFrac = Math.max(0.18, Math.min(0.55, tH / Math.max(1e-9, tW)));
+      const bulletsWFrac = Math.max(0.1, 1.0 - wheelWFrac);
 
       const apply = (sub: HTMLElement, gAny: any, fallback: any) => {
         const g = gAny ?? fallback;
@@ -764,10 +771,22 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
         sub.style.transform = `translate(${tx}, ${ty})`;
       };
 
-      // Bullets and wheel both default to full-frame; app layer toggles which one is visible.
-      apply(bullets, rootGeoms["bullets"], { x: 0.0, y: 0.0, w: 1.0, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
-      apply(wheelGroup, rootGeoms["wheel"], { x: 0.0, y: 0.0, w: 1.0, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
-      apply(pie, wheelGeoms["pie"], { x: 0.5, y: 0.5, w: 1.0, h: 1.0, anchor: "centerCenter", rotationDeg: 0 });
+      const isOk01 = (g: any) => {
+        const x = Number(g?.x ?? NaN);
+        const y = Number(g?.y ?? NaN);
+        const w = Number(g?.w ?? NaN);
+        const h = Number(g?.h ?? NaN);
+        if (![x, y, w, h].every((v) => Number.isFinite(v))) return false;
+        // Reject clearly broken legacy geoms (these cause overlap/selection issues).
+        if (w > 1.2 || h > 1.2) return false;
+        return true;
+      };
+
+      // Default: bullets left, wheel right.
+      apply(bullets, isOk01(rootGeoms["bullets"]) ? rootGeoms["bullets"] : null, { x: 0.0, y: 0.0, w: bulletsWFrac, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
+      apply(wheelGroup, isOk01(rootGeoms["wheel"]) ? rootGeoms["wheel"] : null, { x: 1.0, y: 0.0, w: wheelWFrac, h: 1.0, anchor: "topRight", rotationDeg: 0 });
+      // Pie should always fill the wheel box; ignore any out-of-range saved geom.
+      apply(pie, isOk01(wheelGeoms["pie"]) ? wheelGeoms["pie"] : null, { x: 0.5, y: 0.5, w: 1.0, h: 1.0, anchor: "centerCenter", rotationDeg: 0 });
     };
 
     update(node);
@@ -843,6 +862,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       setCommonStyles(el, n);
       if (n.type !== "timer") return;
       el.dataset.showTime = String(!!(n as any).showTime);
+      el.dataset.grid = String(!!(n as any).grid);
       el.dataset.barColor = (n as any).barColor ?? "orange";
       el.dataset.lineColor = (n as any).lineColor ?? "green";
       el.dataset.stat = (n as any).stat ?? "gaussian";
@@ -926,6 +946,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       }
       el.dataset.modelMode = modelMode;
       el.dataset.color = String((n as any).color ?? "white");
+      el.dataset.grid = String(!!(n as any).grid);
       if (typeof (n as any).windowS === "number") el.dataset.windowS = String((n as any).windowS);
       else delete (el.dataset as any).windowS;
     };
