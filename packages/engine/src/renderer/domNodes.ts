@@ -318,7 +318,12 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     table.className = "table-grid";
     table.style.width = "100%";
     table.style.height = "100%";
-    table.style.borderCollapse = "collapse";
+    // NOTE:
+    // With `border-collapse: collapse`, many browsers will render `double` borders as a single thick line
+    // due to border conflict resolution. We use `separate + borderSpacing=0` so `||` can reliably show
+    // as a true double line.
+    table.style.borderCollapse = "separate";
+    table.style.borderSpacing = "0";
     table.style.tableLayout = "fixed";
     const tbody = document.createElement("tbody");
     table.appendChild(tbody);
