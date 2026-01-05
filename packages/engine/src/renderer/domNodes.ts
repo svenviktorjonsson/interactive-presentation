@@ -572,7 +572,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "htmlFrame") return;
-      iframe.src = (n as any).src;
+      const nextSrc = String((n as any).src ?? "");
+      // Avoid reloading the iframe on every update tick.
+      if (iframe.src !== nextSrc) iframe.src = nextSrc;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -625,7 +627,10 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "image") return;
-      img.src = (n as any).src;
+      const nextSrc = String((n as any).src ?? "");
+      // Avoid re-triggering fetch/decode on every update tick.
+      // This is especially important when server sends Cache-Control: no-store.
+      if (img.src !== nextSrc) img.src = nextSrc;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -887,8 +892,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       buttons: [
         { label: "Run", action: "sound-toggle", primary: true },
         { label: "Reset", action: "sound-reset" },
-        { label: "Spectrum", action: "sound-mode-spectrum" },
-        { label: "Time", action: "sound-mode-pressure" },
+        { label: "As Time Series", action: "sound-mode-toggle" },
       ],
     });
     header.style.top = "calc(-44px * var(--ui-scale, var(--sound-scale, 1)))";
