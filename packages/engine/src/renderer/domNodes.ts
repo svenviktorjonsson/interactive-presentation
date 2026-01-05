@@ -574,7 +574,8 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       if (n.type !== "htmlFrame") return;
       const nextSrc = String((n as any).src ?? "");
       // Avoid reloading the iframe on every update tick.
-      if (iframe.src !== nextSrc) iframe.src = nextSrc;
+      // Use the attribute value to avoid absolute-vs-relative URL comparisons.
+      if (iframe.getAttribute("src") !== nextSrc) iframe.src = nextSrc;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -630,7 +631,8 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       const nextSrc = String((n as any).src ?? "");
       // Avoid re-triggering fetch/decode on every update tick.
       // This is especially important when server sends Cache-Control: no-store.
-      if (img.src !== nextSrc) img.src = nextSrc;
+      // Use the attribute value to avoid absolute-vs-relative URL comparisons.
+      if (img.getAttribute("src") !== nextSrc) img.src = nextSrc;
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -914,7 +916,15 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "sound") return;
-      el.dataset.mode = String((n as any).mode ?? "spectrum");
+      // Mode can be toggled locally (UI) without mutating the model.
+      // Do not clobber the UI-selected mode on each render tick.
+      const modelMode = String((n as any).mode ?? "spectrum");
+      const prevModelMode = el.dataset.modelMode;
+      // If UI hasn't overridden (mode matches previous model mode), follow model updates.
+      if (!el.dataset.mode || el.dataset.mode === prevModelMode) {
+        el.dataset.mode = modelMode;
+      }
+      el.dataset.modelMode = modelMode;
       el.dataset.color = String((n as any).color ?? "white");
       if (typeof (n as any).windowS === "number") el.dataset.windowS = String((n as any).windowS);
       else delete (el.dataset as any).windowS;
