@@ -10,6 +10,7 @@
     { "include": "#element-bullets" },
     { "include": "#element-choices" },
     { "include": "#element-timer" },
+    { "include": "#element-sound" },
     { "include": "#element-table" },
     { "include": "#element-generic" },
     { "include": "#content" }
@@ -91,6 +92,18 @@
         "6": { "name": "meta.content.pr" }
       }
     },
+    "element-sound": {
+      "name": "meta.element.sound.pr",
+      "match": "^(sound)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "meta.content.pr" }
+      }
+    },
     "element-table": {
       "name": "meta.element.table.pr",
       "begin": "^(table)(\\[)([^\\]]*)(\\])(\\s*:)\\s*$",
@@ -107,14 +120,6 @@
         {
           "name": "punctuation.separator.delimiter.pr",
           "match": ";"
-        },
-        {
-          "name": "constant.numeric.pr",
-          "match": "\\b-?[0-9]+(?:\\.[0-9]+)?\\b"
-        },
-        {
-          "name": "meta.content.pr",
-          "match": ".+"
         }
       ]
     },
@@ -352,7 +357,7 @@
 
     "content": {
       "name": "meta.content.pr",
-      "match": "^(?!#|screen|view|arrow|text|image|bullets|timer|choices|poll|button|input|video|audio|shape|group|table).+$"
+      "match": "^(?!#|screen|view|arrow|text|image|bullets|timer|sound|choices|poll|button|input|video|audio|shape|group|table).+$"
     }
   }
 }
