@@ -202,11 +202,11 @@ def sound_state_payload() -> dict[str, Any]:
         "seq": int(STATE.sound.seq),
         "sampleRateHz": int(STATE.sound.sample_rate_hz),
         "windowMs": int(STATE.sound.window_ms),
-        # If not running: do not send data arrays.
-        "pressure10ms": (STATE.sound.pressure_10ms[-3000:] if running else []),
+        # When paused: keep sending the last buffers so the frontend can keep showing the frozen plot.
+        "pressure10ms": STATE.sound.pressure_10ms[-3000:],
         "spectrum": {
-            "freqHz": (STATE.sound.spectrum_freq_hz if running else []),
-            "magDb": (STATE.sound.spectrum_mag if running else []),
+            "freqHz": STATE.sound.spectrum_freq_hz,
+            "magDb": STATE.sound.spectrum_mag,
         },
         "error": STATE.sound.last_error,
         "serverTimeMs": int(time.time() * 1000),

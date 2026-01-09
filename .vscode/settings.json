@@ -21,6 +21,10 @@
         "settings": { "foreground": "#FFA500" }
       },
       {
+        "scope": "punctuation.separator.delimiter.pr",
+        "settings": { "foreground": "#FF79C6" }
+      },
+      {
         "scope": "entity.other.attribute-name.pr",
         "settings": { "foreground": "#9CDCFE" }
       },

@@ -1,0 +1,14 @@
+# sound composite elements (draft)
+# Delete the whole `groups/<name>/` folder to regenerate defaults.
+
+# Axis labels (auto-updated via {{...}} binding, editable/positionable):
+text[name=x_label]: {{xLabel}}
+text[name=y_label]: {{yLabel}}
+
+# Default controls (non-editable chrome):
+buttons[name=sound1_buttons,orientation=h,labels=[{{runPauseResume}}, Reset, {{modeToggle}}],actions=[sound-toggle, sound-reset, sound-mode-toggle]]
+text[name=peak]: \mathrm{peak}={{peakHz}}\,\mathrm{Hz}
+
+# Default axis arrows (data-rect coords; origin is bottom-left of plot region):
+arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]
+arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]

@@ -12,7 +12,7 @@ type ControlButtonSpec = { label: string; action: string; primary?: boolean };
 
 function createControlBar(opts: { className: string; buttonClass: string; buttons: ControlButtonSpec[] }) {
   const bar = document.createElement("div");
-  bar.className = opts.className;
+  bar.className = `${opts.className} ip-controlbar`;
   bar.style.position = "absolute";
   bar.style.left = "0";
   bar.style.right = "0";
@@ -23,13 +23,78 @@ function createControlBar(opts: { className: string; buttonClass: string; button
   for (const b of opts.buttons) {
     const btn = document.createElement("button");
     btn.type = "button";
-    btn.className = `${opts.buttonClass}${b.primary ? " primary" : ""}`;
+    btn.className = `ip-controlbtn ${opts.buttonClass}${b.primary ? " primary" : ""}`;
     btn.dataset.action = b.action;
     btn.textContent = b.label;
     bar.appendChild(btn);
     buttons[b.action] = btn;
   }
   return { bar, buttons };
+}
+
+function parseInlineParams(s: string): Record<string, string> {
+  // Parse "a=b,c=d,labels=[x,y]" (no nested brackets beyond one level).
+  const out: Record<string, string> = {};
+  let buf = "";
+  let depth = 0;
+  let inQuotes = false;
+  const push = (part: string) => {
+    const t = part.trim();
+    if (!t) return;
+    const eq = t.indexOf("=");
+    if (eq < 0) return;
+    const k = t.slice(0, eq).trim();
+    const v = t.slice(eq + 1).trim();
+    if (k) out[k] = v;
+  };
+  for (const ch of s) {
+    if (ch === '"') inQuotes = !inQuotes;
+    if (!inQuotes) {
+      if (ch === "[") depth += 1;
+      if (ch === "]") depth = Math.max(0, depth - 1);
+    }
+    if (ch === "," && !inQuotes && depth === 0) {
+      push(buf);
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  push(buf);
+  return out;
+}
+
+function parseList(v: string | undefined): string[] {
+  if (!v) return [];
+  let s = v.trim();
+  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+  const out: string[] = [];
+  let buf = "";
+  let inQuotes = false;
+  let brace = 0;
+  for (const ch of s) {
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      buf += ch;
+      continue;
+    }
+    if (!inQuotes) {
+      if (ch === "{") brace += 1;
+      else if (ch === "}") brace = Math.max(0, brace - 1);
+    }
+    if (ch === "," && !inQuotes && brace === 0) {
+      if (buf.trim()) out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out.map((x) => {
+    let t = x.trim();
+    if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
+    return t;
+  });
 }
 
 function setCommonStyles(el: HTMLElement, node: NodeModel) {
@@ -433,62 +498,42 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     el.style.background = "transparent";
     setCommonStyles(el, node);
 
-    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-    svg.setAttribute("class", "arrow-svg");
-    svg.setAttribute("width", "100%");
-    svg.setAttribute("height", "100%");
-    svg.setAttribute("viewBox", "0 0 100 100");
-    svg.style.overflow = "visible";
-    svg.style.display = "block";
-
-    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-    marker.setAttribute("id", `arrowhead-${node.id}`);
-    marker.setAttribute("markerWidth", "10");
-    marker.setAttribute("markerHeight", "10");
-    marker.setAttribute("refX", "10");
-    marker.setAttribute("refY", "5");
-    marker.setAttribute("orient", "auto");
-    marker.setAttribute("markerUnits", "strokeWidth");
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
-    marker.appendChild(path);
-    defs.appendChild(marker);
-    svg.appendChild(defs);
-
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-    line.setAttribute("x1", "0");
-    line.setAttribute("y1", "50");
-    line.setAttribute("x2", "100");
-    line.setAttribute("y2", "50");
-    line.setAttribute("stroke-linecap", "round");
-    line.setAttribute("marker-end", `url(#arrowhead-${node.id})`);
-    svg.appendChild(line);
-    el.appendChild(svg);
+    // Visuals are rendered on the canvas for pixel-perfect consistency.
+    // This DOM node exists only for selection + editor handles.
 
     const update = (n: NodeModel) => {
       if (n.type !== "arrow") return;
       setCommonStyles(el, n);
       const fr = (n as any).from ?? { x: 0, y: 0.5 };
       const to = (n as any).to ?? { x: 1, y: 0.5 };
-      const x1 = Number(fr.x ?? 0) * 100;
-      const y1 = Number(fr.y ?? 0) * 100;
-      const x2 = Number(to.x ?? 1) * 100;
-      const y2 = Number(to.y ?? 0) * 100;
-      line.setAttribute("x1", String(x1));
-      line.setAttribute("y1", String(y1));
-      line.setAttribute("x2", String(x2));
-      line.setAttribute("y2", String(y2));
-      const col = String((n as any).color ?? "white");
-      line.setAttribute("stroke", col);
-      path.setAttribute("fill", col);
-      const w = Number((n as any).width ?? 2);
-      // If width<=1: interpret as fraction of min(nodePxW,nodePxH) at render time.
-      // Here we approximate using current box size in px (set by layout).
-      const pxW = el.getBoundingClientRect().width || 1;
-      const pxH = el.getBoundingClientRect().height || 1;
-      const strokePx = w <= 1 ? Math.max(1, w * Math.max(1, Math.min(pxW, pxH))) : Math.max(1, w);
-      line.setAttribute("stroke-width", String(strokePx));
+      // Expose endpoints for editor handles.
+      el.dataset.fromX = String(Number(fr.x ?? 0));
+      el.dataset.fromY = String(Number(fr.y ?? 0));
+      el.dataset.toX = String(Number(to.x ?? 1));
+      el.dataset.toY = String(Number(to.y ?? 0));
+    };
+    update(node);
+    return { id: node.id, el, update, destroy: () => el.remove() };
+  }
+
+  if (node.type === "line") {
+    const el = document.createElement("div");
+    el.classList.add("node-line");
+    el.style.boxSizing = "border-box";
+    el.style.overflow = "visible";
+    el.style.background = "transparent";
+    setCommonStyles(el, node);
+    // Visuals are rendered on the canvas; keep DOM for selection/handles only.
+
+    const update = (n: NodeModel) => {
+      if (n.type !== "line") return;
+      setCommonStyles(el, n);
+      const fr = (n as any).from ?? { x: 0, y: 0.5 };
+      const to = (n as any).to ?? { x: 1, y: 0.5 };
+      el.dataset.fromX = String(Number(fr.x ?? 0));
+      el.dataset.fromY = String(Number(fr.y ?? 0));
+      el.dataset.toX = String(Number(to.x ?? 1));
+      el.dataset.toY = String(Number(to.y ?? 0));
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
@@ -672,26 +717,77 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     bullets.style.pointerEvents = "auto";
     bullets.style.display = "block";
 
-    // Wrapper is not selectable; the wheel itself is the selectable group element (single bounding box).
+    // Wheel group: a single selectable bounding box that should be square (so the pie stays circular).
     const wheelGroup = document.createElement("div");
-    wheelGroup.className = "choices-sub choices-wheel-group";
+    wheelGroup.className = "choices-sub comp-sub comp-group choices-wheel-group";
+    wheelGroup.dataset.subId = "wheel";
+    wheelGroup.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
+    wheelGroup.dataset.groupPath = `${node.id}/wheel`; // children stored in groups/<id>/wheel/
     wheelGroup.style.position = "absolute";
     wheelGroup.style.overflow = "visible";
     wheelGroup.style.pointerEvents = "auto";
     // Always visible: presenter can animate it in/out if desired.
     wheelGroup.style.display = "block";
 
+    const debug = !!(node as any).debug;
+    // Buttons group: movable as a unit (like other comp-sub elements), but the buttons themselves
+    // are only clickable in Live mode (CSS disables button pointer-events in Edit mode).
+    const buttonsGroup = document.createElement("div");
+    buttonsGroup.className = "choices-sub comp-sub choices-buttons";
+    buttonsGroup.dataset.subId = "buttons";
+    buttonsGroup.dataset.compPath = `${node.id}`;
+    buttonsGroup.style.position = "absolute";
+    buttonsGroup.style.overflow = "visible";
+    buttonsGroup.style.pointerEvents = "auto";
+    buttonsGroup.style.display = "block";
+
+    // Allow authoring buttons via groups/<id>/elements.pr (same syntax as timer/sound):
+    // buttons[name=buttons,orientation=h|v,labels=[...],actions=[...]]
+    const elText = String((node as any).elementsText ?? "");
+    let btnOrient: "h" | "v" = "h";
+    let btnLabels: string[] = [];
+    let btnActions: string[] = [];
+    for (const ln0 of elText.split(/\r?\n/)) {
+      const ln = ln0.trim();
+      if (!ln || ln.startsWith("#")) continue;
+      const m = ln.match(/^buttons\[(?<params>[^\]]+)\]$/);
+      if (!m?.groups?.params) continue;
+      const params = parseInlineParams(m.groups.params);
+      const name = String(params.name ?? "").trim();
+      if (name && name !== "buttons") continue; // only apply to the default buttons slot
+      btnOrient = String(params.orientation ?? "h").trim().toLowerCase() === "v" ? "v" : "h";
+      btnLabels = parseList(params.labels);
+      btnActions = parseList(params.actions);
+      break;
+    }
+    if (btnLabels.length === 0 || btnActions.length === 0) {
+      btnLabels = ["Run", "Reset", ...(debug ? ["Test"] : [])];
+      btnActions = ["choices-startstop", "choices-reset", ...(debug ? ["choices-test"] : [])];
+    } else if (debug && !btnActions.includes("choices-test")) {
+      // Debug mode adds a test button if not authored.
+      btnLabels = [...btnLabels, "Test"];
+      btnActions = [...btnActions, "choices-test"];
+    }
+    const buttons: ControlButtonSpec[] = [];
+    const nBtn = Math.min(btnLabels.length, btnActions.length);
+    for (let i = 0; i < nBtn; i++) {
+      const action = String(btnActions[i] ?? "").trim();
+      if (!action) continue;
+      buttons.push({ label: String(btnLabels[i] ?? ""), action, primary: i === 0 });
+    }
+
     const { bar: controlsBar } = createControlBar({
       className: "choices-headerbar",
       buttonClass: "choices-btn",
-      buttons: [
-        { label: "Run", action: "choices-startstop", primary: true },
-        { label: "Reset", action: "choices-reset" }
-      ]
+      buttons,
     });
-    // Buttons are NOT a standard editable element; keep them attached to the main choices node.
-    // Let CSS position this headerbar so it stays consistent in both bullets+wheel views.
-    frame.appendChild(controlsBar);
+    // Fill the buttonsGroup box; sizing is controlled by the composite geom.
+    controlsBar.style.position = "absolute";
+    controlsBar.style.inset = "0";
+    // Match authored orientation.
+    controlsBar.style.flexDirection = btnOrient === "v" ? "column" : "row";
+    buttonsGroup.appendChild(controlsBar);
+    frame.appendChild(buttonsGroup);
 
     const title = document.createElement("div");
     title.className = "choices-question";
@@ -706,12 +802,12 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
 
     // --- wheel group children (stored under <id>/wheel) ---
     const pie = document.createElement("div");
-    // The wheel itself is the selectable group element.
-    pie.className = "choices-sub comp-sub comp-group choices-wheel";
-    pie.dataset.subId = "wheel";
-    pie.dataset.compPath = `${node.id}`; // stored in groups/<id>/geometries.csv
-    pie.dataset.groupPath = `${node.id}/wheel`; // children stored in groups/<id>/wheel/
+    // Not selectable (wheelGroup is the single bounding box).
+    pie.className = "choices-sub choices-wheel";
     pie.style.position = "absolute";
+    pie.style.inset = "0";
+    pie.style.width = "100%";
+    pie.style.height = "100%";
     pie.style.pointerEvents = "auto";
     const canvas = document.createElement("canvas");
     canvas.className = "choices-chart-canvas";
@@ -744,12 +840,23 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       const wheelGeoms = byPath["wheel"] ?? {};
 
       // Default layout: bullets left, wheel right, wheel is square (same height as bullets).
-      // Use the *node's* aspect ratio so "square" is correct in world units:
-      // wheelWFrac = nodeH / nodeW  (clamped for reasonable layouts).
+      // Wheel must remain a true circle, which means the wheel *box* must be pixel-square.
+      // Since composite geoms are normalized independently in X (by node width) and Y (by node height),
+      // a pixel-square wheel requires wFrac != hFrac when the node is not square.
       const tW = Number((n as any)?.transform?.w ?? 1);
       const tH = Number((n as any)?.transform?.h ?? 1);
-      const wheelWFrac = Math.max(0.18, Math.min(0.55, tH / Math.max(1e-9, tW)));
-      const bulletsWFrac = Math.max(0.1, 1.0 - wheelWFrac);
+      const nodeW = Math.max(1e-9, tW);
+      const nodeH = Math.max(1e-9, tH);
+      const aspect = nodeW / nodeH; // >1 means wide node
+
+      const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+
+      // Default target: ~92% of node height (clamped to a reasonable width share).
+      let wheelHPref = 0.92;
+      let wheelW = wheelHPref / Math.max(1e-9, aspect);
+      wheelW = clamp(wheelW, 0.18, 0.55);
+      const wheelH = clamp(wheelW * aspect, 0.18, 1.0);
+      const bulletsWFrac = Math.max(0.1, 1.0 - wheelW);
 
       const apply = (sub: HTMLElement, gAny: any, fallback: any) => {
         const g = gAny ?? fallback;
@@ -766,11 +873,23 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
         const anchor = String(g.anchor ?? "topLeft");
         sub.dataset.anchor = anchor;
         // Anchor transform (so x/y are anchor coordinates).
-        const tx =
-          anchor.endsWith("Right") ? "-100%" : anchor.endsWith("Center") ? "-50%" : "0%";
-        const ty =
-          anchor.startsWith("Bottom") ? "-100%" : anchor.startsWith("Center") ? "-50%" : "0%";
+        // IMPORTANT: anchors in the model are camelCase ("centerRight", "centerCenter", ...)
+        // so this must be case-insensitive.
+        const a = anchor.toLowerCase();
+        const tx = a.endsWith("right") ? "-100%" : a.endsWith("center") || a === "center" ? "-50%" : "0%";
+        const ty = a.startsWith("bottom") ? "-100%" : a.startsWith("center") || a === "center" ? "-50%" : "0%";
         sub.style.transform = `translate(${tx}, ${ty})`;
+      };
+
+      const topLeftFromAnchor = (g: any) => {
+        const x = Number(g?.x ?? 0);
+        const y = Number(g?.y ?? 0);
+        const w = Number(g?.w ?? 0);
+        const h = Number(g?.h ?? 0);
+        const a = String(g?.anchor ?? "topLeft");
+        const tlx = a.endsWith("Right") ? x - w : a.endsWith("Center") ? x - w / 2 : x;
+        const tly = a.startsWith("Bottom") ? y - h : a.startsWith("Center") ? y - h / 2 : y;
+        return { x: tlx, y: tly };
       };
 
       const isOk01 = (g: any) => {
@@ -786,10 +905,60 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
 
       // Default: bullets left, wheel right.
       apply(bullets, isOk01(rootGeoms["bullets"]) ? rootGeoms["bullets"] : null, { x: 0.0, y: 0.0, w: bulletsWFrac, h: 1.0, anchor: "topLeft", rotationDeg: 0 });
-      // Wheel wrapper fills the right column; wheel itself is square and centered within it.
-      apply(wheelGroup, null, { x: 1.0, y: 0.0, w: wheelWFrac, h: 1.0, anchor: "topRight", rotationDeg: 0 });
-      // The wheel element is square in the composite coordinate system (w==h) and centered vertically.
-      apply(pie, isOk01(rootGeoms["wheel"]) ? rootGeoms["wheel"] : null, { x: 1.0, y: 0.5, w: wheelWFrac, h: wheelWFrac, anchor: "centerRight", rotationDeg: 0 });
+      // Default: buttons above the node (movable).
+      // Match other composites (timer/sound): 0.86×0.10 button box above the node.
+      apply(
+        buttonsGroup,
+        isOk01(rootGeoms["buttons"]) ? rootGeoms["buttons"] : null,
+        { x: 0.5, y: -0.02, w: 0.86, h: 0.10, anchor: "topCenter", rotationDeg: 0 }
+      );
+
+      // Match timer/sound behavior: scale controls based on the *buttons box* height,
+      // so it stays consistent relative to the view window.
+      try {
+        const r = buttonsGroup.getBoundingClientRect();
+        if (r.height > 1) {
+          const fontPx = Math.max(12, r.height * 0.55);
+          const scale = Math.max(0.6, Math.min(3, fontPx / 16));
+          buttonsGroup.style.setProperty("--control-scale", String(scale));
+        }
+      } catch {
+        // ignore
+      }
+      // Wheel group must be pixel-square.
+      // If a saved geom exists, keep its CENTER but enforce a pixel-square box.
+      // This makes the selection box centered on the wheel (no weird offset anchor hacks).
+      const wheelSaved = isOk01(rootGeoms["wheel"]) ? rootGeoms["wheel"] : null;
+      const wheelGeom = wheelSaved
+        ? (() => {
+            const wFrac0 = Number(wheelSaved.w ?? wheelW);
+            const hFrac0 = Number(wheelSaved.h ?? wheelH);
+            const wPx0 = Math.max(1, wFrac0 * nodeW);
+            const hPx0 = Math.max(1, hFrac0 * nodeH);
+            const sPx = Math.max(1, Math.min(wPx0, hPx0));
+            const tl = topLeftFromAnchor({ ...wheelSaved, w: wFrac0, h: hFrac0 });
+            const center = { x: tl.x + wFrac0 / 2, y: tl.y + hFrac0 / 2 };
+            return {
+              x: center.x,
+              y: center.y,
+              w: sPx / nodeW,
+              h: sPx / nodeH,
+              anchor: "centerCenter",
+              rotationDeg: Number(wheelSaved.rotationDeg ?? 0),
+            };
+          })()
+        : null;
+      apply(wheelGroup, wheelGeom, {
+        x: bulletsWFrac + wheelW / 2,
+        // A bit higher by default (bullets content starts near the top).
+        y: 0.46,
+        w: wheelW,
+        h: wheelH,
+        anchor: "centerCenter",
+        rotationDeg: 0,
+      });
+      // Pie fills the wheel group; ignore any saved "pie" geom (the wheel must remain circular).
+      apply(pie, null, { x: 0.5, y: 0.5, w: 1.0, h: 1.0, anchor: "centerCenter", rotationDeg: 0 });
     };
 
     update(node);
@@ -834,13 +1003,14 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     overlayBg.style.pointerEvents = "none";
     overlay.append(overlayBg);
 
+    const debug = !!(node as any).debug;
     const { bar: header } = createControlBar({
       className: "timer-header",
       buttonClass: "timer-btn",
       buttons: [
-        { label: "Start", action: "timer-startstop", primary: true },
+        { label: "Run", action: "timer-startstop", primary: true },
         { label: "Reset", action: "timer-reset" },
-        { label: "Test", action: "timer-test" }
+        ...(debug ? [{ label: "Test", action: "timer-test" } as any] : [])
       ]
     });
     // Buttons should live outside the timer "data rect" overlay. Place them above.
@@ -1302,11 +1472,11 @@ export function layoutDomNodes(args: {
     if (nodeLayout.type === "choices") {
       const baseH = Math.max(1e-6, Number(nodeLayout.transform.h ?? 1));
       const zoomScale = px.h / baseH;
-      // `fontPx` on choices is treated as a baseline multiplier (24px == 1x).
-      // The editor corner-resize updates `fontPx` for choices to scale the internal bullets UI.
+      // Choices chrome (wheel + buttons) should scale like other widgets: only with zoom.
+      // `fontPx` is used ONLY for the bullets typography (see CSS var below).
       const fontPx = Number((nodeLayout as any).fontPx ?? 24);
-      const scale = zoomScale * Math.max(0.1, fontPx / 24);
-      handle.el.style.setProperty("--ui-scale", String(scale));
+      handle.el.style.setProperty("--ui-scale", String(zoomScale));
+      handle.el.style.setProperty("--choices-font-scale", String(Math.max(0.1, fontPx / 24)));
     }
 
     if (!handle.el.isConnected) overlayEl.appendChild(handle.el);

@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rotation-half-circle-left</title>
+    <style>
+      body {
+        margin: 0;
+        display: grid;
+        place-items: center;
+        height: 100vh;
+        background: #0b1020;
+      }
+      .wrap {
+        display: grid;
+        place-items: center;
+        width: 220px;
+        height: 220px;
+        border-radius: 16px;
+        border: 1px solid rgba(255,255,255,0.12);
+        background: rgba(255,255,255,0.04);
+      }
+      .row {
+        display: flex;
+        gap: 18px;
+        align-items: center;
+        justify-content: center;
+      }
+      .cell { display: grid; place-items: center; gap: 8px; }
+      .lbl { font: 12px/1.1 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; color: rgba(255,255,255,0.75); }
+      svg { width: 96px; height: 96px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="row">
+        <div class="cell">
+          <div class="lbl">base (half circle right, arrows left)</div>
+          <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" aria-label="rotation cursor base">
+            <!-- half circle on the right side -->
+            <path d="M 16.00 26.50
+                     C 21.80 26.50 26.50 21.80 26.50 16.00
+                     C 26.50 10.20 21.80 5.50 16.00 5.50"
+                  fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="4.7" stroke-linecap="round"/>
+            <path d="M 16.00 26.50
+                     C 21.80 26.50 26.50 21.80 26.50 16.00
+                     C 26.50 10.20 21.80 5.50 16.00 5.50"
+                  fill="none" stroke="rgba(255,255,255,0.92)" stroke-width="2.9" stroke-linecap="round"/>
+
+            <!-- arrowheads match resize cursor heads, pointing LEFT -->
+            <g transform="translate(16 26.5) rotate(180) translate(0 -3.6)">
+              <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)"/>
+              <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+            </g>
+            <g transform="translate(16 5.5) rotate(180) translate(0 -3.6)">
+              <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)"/>
+              <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+            </g>
+          </svg>
+        </div>
+
+        <div class="cell">
+          <div class="lbl">top-right example (+45° in math ⇒ -45° in SVG)</div>
+          <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" aria-label="rotation cursor rotated 45deg">
+            <g transform="rotate(-45 16 16)">
+              <path d="M 16.00 26.50
+                       C 21.80 26.50 26.50 21.80 26.50 16.00
+                       C 26.50 10.20 21.80 5.50 16.00 5.50"
+                    fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="4.7" stroke-linecap="round"/>
+              <path d="M 16.00 26.50
+                       C 21.80 26.50 26.50 21.80 26.50 16.00
+                       C 26.50 10.20 21.80 5.50 16.00 5.50"
+                    fill="none" stroke="rgba(255,255,255,0.92)" stroke-width="2.9" stroke-linecap="round"/>
+              <g transform="translate(16 26.5) rotate(180) translate(0 -3.6)">
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)"/>
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+              </g>
+              <g transform="translate(16 5.5) rotate(180) translate(0 -3.6)">
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)"/>
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+              </g>
+            </g>
+          </svg>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+

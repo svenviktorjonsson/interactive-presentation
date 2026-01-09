@@ -87,12 +87,11 @@ def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
                 wn = float(t.get("w", 0.1) or 0.1)
                 hn = float(t.get("h", 0.05) or 0.05)
             elif is_screen:
-                # Screen-space nodes: store as normalized screen coordinates (already 0-1 range)
-                # Screen coordinates are stored directly without view offset conversion
-                xn = float(t.get("x", 0.0) or 0.0) / design_h
-                yn = float(t.get("y", 0.0) or 0.0) / design_h
-                wn = float(t.get("w", 100.0) or 100.0) / design_h
-                hn = float(t.get("h", 50.0) or 50.0) / design_h
+                # Screen-space nodes: store normalized fractions in [0..1] relative to the runtime screen.
+                xn = float(t.get("x", 0.0) or 0.0)
+                yn = float(t.get("y", 0.0) or 0.0)
+                wn = float(t.get("w", 0.2) or 0.2)
+                hn = float(t.get("h", 0.1) or 0.1)
             else:
                 # Root node: convert world pixels -> view-relative normalized coords.
                 # We use the "design viewport" height as 1.0 unit.
@@ -254,6 +253,54 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                 lines.append(_safe_str(delim.join([str(c) for c in row])))
             lines.append("")
             return
+        if t == "arrow":
+            params = [f"name={node_id}"] + style_params(n)
+            fr = n.get("from") or {}
+            to = n.get("to") or {}
+            fx = float(fr.get("x", 0.0) or 0.0)
+            fy = float(fr.get("y", 0.5) or 0.5)
+            tx = float(to.get("x", 1.0) or 1.0)
+            ty = float(to.get("y", 0.5) or 0.5)
+            params.append(f"from=({_fmt_param_value(fx)},{_fmt_param_value(fy)})")
+            params.append(f"to=({_fmt_param_value(tx)},{_fmt_param_value(ty)})")
+            col = n.get("color") or n.get("stroke")
+            if isinstance(col, str) and col.strip():
+                params.append(f"color={_fmt_param_value(col.strip())}")
+            if isinstance(n.get("width"), (int, float)):
+                params.append(f"width={_fmt_param_value(n.get('width'))}")
+            lines.append(f"arrow[{','.join(params)}]")
+            return
+        if t == "line":
+            params = [f"name={node_id}"] + style_params(n)
+            fr = n.get("from") or {}
+            to = n.get("to") or {}
+            fx = float(fr.get("x", 0.0) or 0.0)
+            fy = float(fr.get("y", 0.5) or 0.5)
+            tx = float(to.get("x", 1.0) or 1.0)
+            ty = float(to.get("y", 0.5) or 0.5)
+            params.append(f"from=({_fmt_param_value(fx)},{_fmt_param_value(fy)})")
+            params.append(f"to=({_fmt_param_value(tx)},{_fmt_param_value(ty)})")
+            col = n.get("color") or n.get("stroke")
+            if isinstance(col, str) and col.strip():
+                params.append(f"color={_fmt_param_value(col.strip())}")
+            if isinstance(n.get("width"), (int, float)):
+                params.append(f"width={_fmt_param_value(n.get('width'))}")
+            lines.append(f"line[{','.join(params)}]")
+            return
+        if t == "sound":
+            params = [f"name={node_id}"] + style_params(n)
+            mode = n.get("mode")
+            if isinstance(mode, str) and mode.strip():
+                params.append(f"mode={_fmt_param_value(mode.strip())}")
+            if isinstance(n.get("windowS"), (int, float)):
+                params.append(f"windowS={_fmt_param_value(n.get('windowS'))}")
+            if bool(n.get("grid")):
+                params.append("grid=on")
+            col = n.get("color")
+            if isinstance(col, str) and col.strip():
+                params.append(f"color={_fmt_param_value(col.strip())}")
+            lines.append(f"sound[{','.join(params)}]")
+            return
         if t == "choices":
             params = [f"name={node_id}"] + style_params(n)
             chart = n.get("chart") or "pie"
@@ -302,6 +349,8 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             args = n.get("args") if isinstance(n.get("args"), dict) else {}
             if "showTime" not in args and "showTime" in n:
                 args["showTime"] = 1 if bool(n.get("showTime")) else 0
+            if "grid" not in args and "grid" in n:
+                args["grid"] = "on" if bool(n.get("grid")) else "off"
             if "barColor" not in args and n.get("barColor"):
                 args["barColor"] = n.get("barColor")
             if "lineColor" not in args and n.get("lineColor"):

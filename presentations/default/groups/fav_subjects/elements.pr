@@ -2,7 +2,14 @@
 # Sub-elements (editable via group edit + geometries.csv):
 # - bullets: an element (NOT a group) that renders question + options
 # - wheel: a group whose internals live in wheel/elements.pr + wheel/geometries.csv
+# - buttons: chrome controls (movable as a unit). Use timer/sound syntax:
+#   buttons[name=buttons,orientation=h|v,labels=[...],actions=[...]]
 #
-# Buttons are UI controls attached to the choices node, not editable elements.
-bullets[name=bullets]
-wheel[name=wheel]
+bullets[name=bullets,type=A]:
+Biologi
+Kemi
+Fysik
+Matematik
+Övrigt
+buttons[name=buttons,orientation=h,labels=[{{runPauseResume}}, Reset],actions=[choices-startstop, choices-reset]]
+wheel[name=wheel,type=A,otherLabel=Other,minLevel=3,textInsideLimit=6]

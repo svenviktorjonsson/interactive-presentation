@@ -8,6 +8,55 @@ from fastapi.responses import Response
 from ..config import PRESENTATION_DIR
 
 
+def _format_pr_list_commas(text: str) -> str:
+    """
+    Ensure a space after commas inside bracket-lists: `[a,b]` -> `[a, b]`.
+    Only affects commas at top-level inside `[...]` (not inside quotes or nested {}()/[]).
+    """
+    s = str(text or "")
+    out: list[str] = []
+    in_quotes = False
+    brace = 0
+    paren = 0
+    bracket = 0
+
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == '"':
+            in_quotes = not in_quotes
+            out.append(ch)
+            i += 1
+            continue
+        if not in_quotes:
+            if ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace = max(0, brace - 1)
+            elif ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren = max(0, paren - 1)
+            elif ch == "[":
+                bracket += 1
+            elif ch == "]":
+                bracket = max(0, bracket - 1)
+
+        if ch == "," and bracket > 0 and not in_quotes and brace == 0 and paren == 0:
+            out.append(ch)
+            j = i + 1
+            # If the next char is already whitespace or a closing bracket, keep as-is.
+            if j < len(s) and s[j] not in (" ", "\t", "\r", "\n", "]"):
+                out.append(" ")
+            i += 1
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
+
+
 def save_composite(payload: dict[str, Any]) -> dict | Response:
     """
     Generic composite save for any node that has a `groups/<compositeDir>/` folder.
@@ -38,12 +87,11 @@ def save_composite(payload: dict[str, Any]) -> dict | Response:
         comp_dir = comp_dir / part
     comp_dir.mkdir(parents=True, exist_ok=True)
     # Back-compat:
-    # - timer composite uses elements.txt
-    # - newer composites (e.g. choices/wheel) can use elements.pr
+    # - older clients may send `elementsText`; treat it as `.pr` content and save to elements.pr.
     if isinstance(elements_text, str):
-        (comp_dir / "elements.txt").write_text(elements_text, encoding="utf-8")
+        (comp_dir / "elements.pr").write_text(_format_pr_list_commas(elements_text), encoding="utf-8")
     if isinstance(elements_pr, str):
-        (comp_dir / "elements.pr").write_text(elements_pr, encoding="utf-8")
+        (comp_dir / "elements.pr").write_text(_format_pr_list_commas(elements_pr), encoding="utf-8")
 
     out_path = comp_dir / "geometries.csv"
     fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align", "parent"]

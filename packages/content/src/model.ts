@@ -8,6 +8,9 @@ export type NodeType =
   | "group"
   | "bullets"
   | "table"
+  | "arrow"
+  | "line"
+  | "sound"
   | "timer"
   | "choices";
 
@@ -117,9 +120,45 @@ export interface TableNodeModel extends BaseNodeModel {
   vstyle?: string;
 }
 
+export interface ArrowNodeModel extends BaseNodeModel {
+  type: "arrow";
+  from: { x: number; y: number };
+  to: { x: number; y: number };
+  color?: string;
+  /**
+   * If <= 1: treated as fraction of min(w,h) (in px at render time).
+   * If > 1: treated as stroke width in px.
+   */
+  width?: number;
+}
+
+export interface LineNodeModel extends BaseNodeModel {
+  type: "line";
+  from: { x: number; y: number };
+  to: { x: number; y: number };
+  color?: string;
+  /** Stroke width in CSS pixels. */
+  width?: number;
+}
+
+export interface SoundNodeModel extends BaseNodeModel {
+  type: "sound";
+  /** Initial view mode. */
+  mode?: "spectrum" | "pressure";
+  /** Visible time window in seconds for pressure mode (frontend). */
+  windowS?: number;
+  /** Show grid lines aligned to ticks. */
+  grid?: boolean;
+  color?: string;
+}
+
 export interface TimerNodeModel extends BaseNodeModel {
   type: "timer";
   showTime?: boolean;
+  /** Show grid lines aligned to ticks. */
+  grid?: boolean;
+  /** Debug-only features (e.g. "Test" button). */
+  debug?: boolean;
   barColor?: string;
   lineColor?: string;
   /** Canvas stroke width in CSS pixels (used for gaussian + ticks). */
@@ -144,6 +183,8 @@ export interface ChoiceOption {
 export interface ChoicesNodeModel extends BaseNodeModel {
   type: "choices";
   question: string;
+  /** Debug-only features (e.g. "Test" button). */
+  debug?: boolean;
   /** Options as defined in presentation.txt (order preserved). */
   options: ChoiceOption[];
   /** Rendering style; currently only "pie" is supported. */
@@ -169,6 +210,9 @@ export type NodeModel =
   | HtmlFrameNodeModel
   | BulletsNodeModel
   | TableNodeModel
+  | ArrowNodeModel
+  | LineNodeModel
+  | SoundNodeModel
   | TimerNodeModel
   | ChoicesNodeModel
   | GroupNodeModel

@@ -1,11 +1,11 @@
 import type { PresentationModel } from "@interactive/content";
-import { Engine, screenToWorld } from "@interactive/engine";
+import { Engine, screenToWorld, worldToScreen } from "@interactive/engine";
 import { DEBUG_ANIM, dlog, BACKEND } from "./config";
 import { fetchModel, preloadImageAssets, saveModel } from "./api/presentation";
 import { uploadImageToMedia, loadImageSize } from "./api/media";
 import { hydrateQrImages } from "./features/qr";
 import { hydrateTextMath, renderTextToElement, renderTextWithKatexToHtml } from "./features/textMath";
-import { drawTicksAndLabels, niceStepFromCandidates, prepareCanvas } from "./features/plot2d";
+import { drawGrid, drawTicksAndLabels, fixedTicks, mergeTickAnchors, niceTicks, prepareCanvas } from "./features/plot2d";
 import { buildShell } from "./ui/shell";
 
 
@@ -73,15 +73,61 @@ let __plotDrag:
   | null = null;
 
 const PLOT_FRACS = { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 };
+// Canonical composite layout: sound should match timer "base class" positions.
+const CANON_COMPOSITE_Y_LABEL = { x: -0.17038335565784135, y: 0.11719580843509136, anchor: "centerCenter", align: "center" };
+const CANON_COMPOSITE_STATS = { x: 0.5028738858079436, y: 0.055646919385237144, anchor: "topCenter", align: "center" };
+
+function _plotFracsForEl(el: HTMLElement) {
+  const lf = Number(el.dataset.plotLeftF ?? "NaN");
+  const rf = Number(el.dataset.plotRightF ?? "NaN");
+  const tf = Number(el.dataset.plotTopF ?? "NaN");
+  const bf = Number(el.dataset.plotBottomF ?? "NaN");
+  if ([lf, rf, tf, bf].every((v) => Number.isFinite(v))) {
+    // Clamp lightly to avoid hard breakage if user drags outside.
+    const leftF = Math.max(-2, Math.min(3, lf));
+    const rightF = Math.max(-2, Math.min(3, rf));
+    const topF = Math.max(-2, Math.min(3, tf));
+    const bottomF = Math.max(-2, Math.min(3, bf));
+    return { leftF, rightF, topF, bottomF };
+  }
+  return PLOT_FRACS;
+}
+
+function _pickSmallestCompositeSub(root: HTMLElement, clientX: number, clientY: number) {
+  // Search across the whole composite root, not just a specific layer:
+  // - allows selecting nested comp-subs (e.g. wheel labels)
+  // - allows selecting fully covered elements (smallest bbox wins)
+  const subs = Array.from(root.querySelectorAll<HTMLElement>(".comp-sub"));
+  let best: { el: HTMLElement; area: number; z: number; order: number } | null = null;
+  for (let i = 0; i < subs.length; i++) {
+    const el = subs[i];
+    // Ignore hidden/disabled nodes.
+    if (el.offsetParent === null) continue;
+    const r = el.getBoundingClientRect();
+    if (!(clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom)) continue;
+    const area = Math.max(1e-6, r.width * r.height);
+    const zRaw = window.getComputedStyle(el).zIndex;
+    const z = zRaw === "auto" ? 0 : Number(zRaw) || 0;
+    const cand = { el, area, z, order: i };
+    if (!best) best = cand;
+    else if (cand.area < best.area - 1e-6) best = cand;
+    else if (Math.abs(cand.area - best.area) <= 1e-6) {
+      if (cand.z > best.z) best = cand;
+      else if (cand.z === best.z && cand.order > best.order) best = cand; // later in DOM = on top
+    }
+  }
+  return best?.el ?? null;
+}
 
 function _plotRectCss(nodeEl: HTMLElement) {
   const r = nodeEl.getBoundingClientRect();
-  const ox = r.left + PLOT_FRACS.leftF * r.width;
-  const oy = r.top + PLOT_FRACS.bottomF * r.height;
-  const xLen = (PLOT_FRACS.rightF - PLOT_FRACS.leftF) * r.width;
-  const yLen = (PLOT_FRACS.bottomF - PLOT_FRACS.topF) * r.height;
-  const top = r.top + PLOT_FRACS.topF * r.height;
-  const bottom = r.top + PLOT_FRACS.bottomF * r.height;
+  const fr = _plotFracsForEl(nodeEl);
+  const ox = r.left + fr.leftF * r.width;
+  const oy = r.top + fr.bottomF * r.height;
+  const xLen = (fr.rightF - fr.leftF) * r.width;
+  const yLen = (fr.bottomF - fr.topF) * r.height;
+  const top = r.top + fr.topF * r.height;
+  const bottom = r.top + fr.bottomF * r.height;
   return { r, ox, oy, xLen, yLen, top, bottom };
 }
 
@@ -92,56 +138,6 @@ function _isInsidePlot(nodeEl: HTMLElement, clientX: number, clientY: number) {
 
 function _clamp(v: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, v));
-}
-
-function _niceTicks(
-  minV: number,
-  maxV: number,
-  targetTicks: number,
-  candidates: number[],
-  fmt: (v: number) => string
-): Array<{ frac: number; label: string; value: number }> {
-  const a = Number(minV);
-  const b = Number(maxV);
-  const span = Math.max(1e-12, b - a);
-  const step = niceStepFromCandidates(span, targetTicks, candidates);
-  // Use a stable tick start even for negative mins.
-  const start = Math.ceil((a - 1e-12) / step) * step;
-  const out: Array<{ frac: number; label: string; value: number }> = [];
-  for (let v = start; v <= b + 1e-9; v += step) {
-    const f = (v - a) / span;
-    out.push({ frac: f, label: fmt(v), value: v });
-    if (out.length > 200) break;
-  }
-  return out;
-}
-
-function _drawGrid(
-  ctx: CanvasRenderingContext2D,
-  plot: { ox: number; oy: number; xLen: number; yLen: number },
-  dpr: number,
-  xTicks: Array<{ xFrac: number }>,
-  yTicks: Array<{ yFrac: number }>
-) {
-  const { ox, oy, xLen, yLen } = plot;
-  ctx.save();
-  ctx.strokeStyle = "rgba(255,255,255,0.10)";
-  ctx.lineWidth = Math.max(1, 1 * dpr);
-  for (const t of xTicks) {
-    const x = ox + t.xFrac * xLen;
-    ctx.beginPath();
-    ctx.moveTo(x, oy);
-    ctx.lineTo(x, oy - yLen);
-    ctx.stroke();
-  }
-  for (const t of yTicks) {
-    const y = oy - t.yFrac * yLen;
-    ctx.beginPath();
-    ctx.moveTo(ox, y);
-    ctx.lineTo(ox + xLen, y);
-    ctx.stroke();
-  }
-  ctx.restore();
 }
 
 type SoundState = {
@@ -224,12 +220,26 @@ function bulletFor(idx: number, style: string) {
   return `${i}.`;
 }
 
+function runPauseResumeLabel(isRunning: boolean, hasRunOnce: boolean) {
+  if (isRunning) return "Pause";
+  return hasRunOnce ? "Resume" : "Run";
+}
+
+function _getHasRunOnce(el: HTMLElement) {
+  return String(el.dataset.hasRunOnce ?? "0") === "1";
+}
+
+function _setHasRunOnce(el: HTMLElement, v: boolean) {
+  el.dataset.hasRunOnce = v ? "1" : "0";
+}
+
 function drawChoicesPie(el: HTMLElement, opts: Array<{ color?: string; votes: number }>) {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas.choices-chart-canvas");
   if (!canvas) return;
   // Skip when hidden.
   if (el.offsetParent === null) return;
-  const r = el.getBoundingClientRect();
+  const wheel = canvas.closest<HTMLElement>(".choices-wheel") ?? el;
+  const r = wheel.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const size = Math.max(30, Math.min(r.width, r.height)) * dpr;
   const W = Math.max(2, Math.round(size));
@@ -245,7 +255,9 @@ function drawChoicesPie(el: HTMLElement, opts: Array<{ color?: string; votes: nu
   const total = Math.max(0, opts.reduce((s, o) => s + Math.max(0, o.votes || 0), 0));
   const cx = W / 2;
   const cy = H / 2;
-  const r0 = Math.max(10, Math.min(W, H) / 2 - 4);
+  // Make the wheel fill the selectable square more tightly
+  // (so the selection box visually matches the wheel).
+  const r0 = Math.max(10, Math.min(W, H) / 2 - 2);
   const borderW = Math.max(2, dpr * 4);
   const strokeCol = "rgba(255,255,255,0.92)";
   const ringCol = "rgba(255,255,255,0.92)";
@@ -299,13 +311,19 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
   const resetBtn = el.querySelector<HTMLButtonElement>('button[data-action="choices-reset"]');
 
   const accepting = !!state?.accepting;
-  const bullet = String(state?.bullets ?? (node?.bullets ?? "A"));
+  const choiceElText = String(node?.elementsText ?? "");
+  const bulletSpec = _parseChoicesBulletsSpec(choiceElText);
+  const wheelSpec = _parseChoicesWheelSpec(choiceElText);
+  const bullet = String(state?.bullets ?? bulletSpec.type ?? (node?.bullets ?? "A"));
   const optsFromNode: Array<any> = Array.isArray(node?.options) ? node.options : [];
   const resultsVisible = true;
   el.dataset.resultsVisible = "1";
 
   if (question) question.textContent = state?.question || node?.question || "Poll";
-  if (startBtn) startBtn.textContent = accepting ? "Stop" : "Run";
+  if (startBtn) {
+    const hasRunOnce = _getHasRunOnce(el);
+    startBtn.textContent = runPauseResumeLabel(accepting, hasRunOnce);
+  }
   if (resetBtn) resetBtn.disabled = !optsFromNode.length;
 
   const options: Array<ChoiceOptionState> = optsFromNode.map((opt: any) => {
@@ -331,24 +349,20 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
       label.className = "choices-label";
       const swatch = document.createElement("span");
       swatch.className = "choices-swatch";
-      if (opt.color) {
-        swatch.style.background = opt.color;
-        swatch.style.borderColor = opt.color;
+      // Allow wheel to override colors; keep bullets/wheel/pie consistent.
+      const wheelParsed = _parseWheelElementsPr(String(node?.wheelElementsPr ?? ""));
+      const col = wheelParsed.colors[String(opt.id ?? "")] ?? opt.color;
+      if (col) {
+        swatch.style.background = col;
+        swatch.style.borderColor = col;
       }
       const text = document.createElement("span");
-      text.textContent = `${bulletFor(idx, bullet)} ${opt.label ?? `Option ${idx + 1}`}`;
+      // Bullets are explicit rows in elements.pr (no templating here).
+      const rawItem = bulletSpec.items[idx] ?? String(opt.label ?? `Option ${idx + 1}`);
+      text.textContent = `${bulletFor(idx, bullet)} ${rawItem}`;
       label.append(swatch, text);
-
-      const meta = document.createElement("div");
-      meta.className = "choices-meta";
-      if (totalVotes <= 0) {
-        meta.textContent = "-";
-      } else {
-        const pct = Math.round(opt.percent ?? 0);
-        meta.textContent = `${opt.votes} vote${opt.votes === 1 ? "" : "s"} • ${pct}%`;
-      }
-
-      row.append(label, meta);
+      // No per-option vote/percent meta in the bullets list (keep it as regular bullets).
+      row.append(label);
       list.appendChild(row);
     });
   }
@@ -359,9 +373,27 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
   if (bulletsGroup) bulletsGroup.style.display = "flex";
   if (wheelGroup) wheelGroup.style.display = "block";
 
-  const includeLimit = Number(node?.includeLimit ?? node?.minPct ?? node?.min ?? el.dataset.includeLimit ?? "3");
-  const textInsideLimit = Number(node?.textInsideLimit ?? node?.minInsidePct ?? node?.minInside ?? el.dataset.textInsideLimit ?? "6");
-  const otherLabel = String(node?.otherLabel ?? el.dataset.otherLabel ?? "Other") || "Other";
+  const includeLimit = Number(
+    wheelSpec.minLevel ??
+      node?.includeLimit ??
+      node?.minPct ??
+      node?.min ??
+      el.dataset.includeLimit ??
+      "3"
+  );
+  const textInsideLimit = Number(
+    wheelSpec.textInsideLimit ??
+      node?.textInsideLimit ??
+      node?.minInsidePct ??
+      node?.minInside ??
+      el.dataset.textInsideLimit ??
+      "6"
+  );
+  const otherLabel = String(wheelSpec.otherLabel ?? node?.otherLabel ?? el.dataset.otherLabel ?? "Other") || "Other";
+
+  // Wheel sub-elements define templates + optional color overrides.
+  const wheelParsed = _parseWheelElementsPr(String(node?.wheelElementsPr ?? ""));
+  const resolveSliceColor = (id: string, fallback: string | undefined) => wheelParsed.colors[id] ?? fallback;
 
   // Bucket tiny slices into "Other"
   const big: Array<{ id: string; color?: string; votes: number; percent: number; label: string }> = [];
@@ -375,12 +407,103 @@ function renderChoicesNode(engine: Engine, el: HTMLElement, node: any, state: Ch
     } else {
       // If there are no votes yet, draw equal slices visually, but show "-" in labels.
       const v = totalVotes > 0 ? o.votes : 1;
-      big.push({ id: String(o.id ?? ""), color: o.color, votes: v, percent: totalVotes > 0 ? p : (NaN as any), label: o.label });
+      const id = String(o.id ?? "");
+      big.push({
+        id,
+        color: resolveSliceColor(id, o.color),
+        votes: v,
+        percent: totalVotes > 0 ? p : (NaN as any),
+        label: o.label
+      });
     }
   }
-  if (otherVotes > 0) big.push({ id: "other", color: "rgba(255,255,255,0.35)", votes: otherVotes, percent: otherPercent, label: otherLabel });
+  if (otherVotes > 0) {
+    big.push({
+      id: "other",
+      color: resolveSliceColor("other", "rgba(255,255,255,0.35)"),
+      votes: otherVotes,
+      percent: otherPercent,
+      label: otherLabel
+    });
+  }
   drawChoicesPie(el, big.map((o) => ({ color: o.color, votes: o.votes })));
   renderChoicesWheelOverlay(engine, String(node?.id ?? ""), big, { totalVotes, otherLabel, textInsideLimit });
+}
+
+function _parseChoicesBulletsSpec(elementsText: string): { type?: string; items: string[] } {
+  // Read bullets[...] spec + its content block from the choices root elementsText.
+  // Example:
+  //   bullets[name=bullets,type=A]:
+  //   Biologi
+  //   Kemi
+  const out: { type?: string; items: string[] } = { items: [] };
+  const lines = String(elementsText ?? "").split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const ln0 = lines[i] ?? "";
+    const ln = ln0.trim();
+    if (!ln || ln.startsWith("#")) continue;
+    const m = ln.match(/^bullets\[(?<params>[^\]]+)\](?<colon>\s*:)?\s*$/);
+    if (!m?.groups?.params) continue;
+    const params = _parseInlineParams(m.groups.params);
+    const name = String(params.name ?? "").trim();
+    if (name && name !== "bullets") continue;
+    const t = String(params.type ?? params.bullets ?? "").trim();
+    if (t) out.type = t;
+
+    if (m.groups.colon) {
+      const items: string[] = [];
+      for (let j = i + 1; j < lines.length; j++) {
+        const raw = lines[j] ?? "";
+        const s = raw.trim();
+        if (!s || s.startsWith("#")) continue;
+        // Stop at next element header.
+        if (/^[a-zA-Z_]\w*\[/.test(s)) break;
+        items.push(s);
+      }
+      out.items = items;
+    }
+    break;
+  }
+  return out;
+}
+
+function _parseChoicesWheelSpec(elementsText: string): { otherLabel?: string; minLevel?: number; textInsideLimit?: number } {
+  const out: { otherLabel?: string; minLevel?: number; textInsideLimit?: number } = {};
+  for (const ln0 of String(elementsText ?? "").split(/\r?\n/)) {
+    const ln = ln0.trim();
+    if (!ln || ln.startsWith("#")) continue;
+    const m = ln.match(/^wheel\[(?<params>[^\]]+)\]\s*$/);
+    if (!m?.groups?.params) continue;
+    const params = _parseInlineParams(m.groups.params);
+    const name = String(params.name ?? "").trim();
+    if (name && name !== "wheel") continue;
+    const ol = String(params.otherLabel ?? "").trim();
+    if (ol) out.otherLabel = ol;
+    const min = Number(params.minLevel ?? params.includeLimit ?? params.minPct ?? params.min ?? NaN);
+    if (Number.isFinite(min)) out.minLevel = min;
+    const ti = Number(params.textInsideLimit ?? params.minInsidePct ?? params.minInside ?? NaN);
+    if (Number.isFinite(ti)) out.textInsideLimit = ti;
+    break;
+  }
+  return out;
+}
+
+function _parseWheelElementsPr(elementsPr: string): { templates: Record<string, string>; colors: Record<string, string> } {
+  const templates: Record<string, string> = {};
+  const colors: Record<string, string> = {};
+  for (const ln0 of String(elementsPr ?? "").split(/\r?\n/)) {
+    const ln = ln0.trim();
+    if (!ln || ln.startsWith("#")) continue;
+    const mt = ln.match(/^text\[(?<params>[^\]]+)\]\s*:\s*(?<content>.*)$/);
+    if (!mt?.groups?.params) continue;
+    const params = _parseInlineParams(mt.groups.params);
+    const id = String(params.name ?? "").trim();
+    if (!id) continue;
+    templates[id] = mt.groups.content ?? "";
+    const col = String(params.color ?? "").trim();
+    if (col) colors[id] = col;
+  }
+  return { templates, colors };
 }
 
 function ensureChoicesWheelLayer(engine: Engine, pollId: string) {
@@ -390,6 +513,9 @@ function ensureChoicesWheelLayer(engine: Engine, pollId: string) {
   if (!node || !el) return null;
   const wheel = el.querySelector<HTMLElement>(".choices-wheel");
   if (!wheel) return null;
+  // Hard guarantee: the wheel element fills its parent wheelGroup box.
+  wheel.style.position = "absolute";
+  wheel.style.inset = "0";
 
   let layer = wheel.querySelector<HTMLElement>(":scope > .choices-wheel-layer");
   if (!layer) {
@@ -399,7 +525,6 @@ function ensureChoicesWheelLayer(engine: Engine, pollId: string) {
     layer.style.inset = "0";
     layer.style.overflow = "visible";
     layer.style.pointerEvents = "none";
-    wheel.style.position = wheel.style.position || "absolute";
     wheel.append(layer);
 
     const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -417,14 +542,9 @@ function ensureChoicesWheelLayer(engine: Engine, pollId: string) {
   const prev = String((layer as any).__elementsPr ?? "");
   if (elementsPr !== prev) {
     (layer as any).__elementsPr = elementsPr;
-    const templates: Record<string, string> = {};
-    for (const ln0 of elementsPr.split(/\r?\n/)) {
-      const ln = ln0.trim();
-      if (!ln || ln.startsWith("#")) continue;
-      const mt = ln.match(/^text\[name=(?<id>[a-zA-Z_]\w*)\]\s*:\s*(?<content>.*)$/);
-      if (mt?.groups) templates[mt.groups.id] = mt.groups.content ?? "";
-    }
-    (layer as any).__templates = templates;
+    const parsed = _parseWheelElementsPr(elementsPr);
+    (layer as any).__templates = parsed.templates;
+    (layer as any).__colors = parsed.colors;
   }
 
   // Geoms for wheel internals are stored in compositeGeometriesByPath["wheel"].
@@ -646,7 +766,8 @@ async function simulateTimerSubmissions(timerEl: HTMLElement, opts?: { users?: n
 function drawTimerNode(el: HTMLElement, state: TimerState) {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas.timer-canvas");
   if (!canvas) return;
-  const prep = prepareCanvas(el, canvas, { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 });
+  // Use shared plot rect fractions (same for all graph-like nodes).
+  const prep = prepareCanvas(el, canvas, _plotFracsForEl(el));
   if (!prep) return;
   const { ctx, dpr, rect: r, plot } = prep;
   const { ox, oy, xLen, yLen } = plot;
@@ -702,18 +823,24 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
     return s.replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
   };
 
-  const xTickVals = _niceTicks(xMin, xMax, 7, [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60], fmt);
+  const xTickVals = niceTicks(xMin, xMax, 7, [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 20, 30, 60], fmt);
   const xTicks = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
   const yTicks: Array<{ yFrac: number; label: string }> = [];
   // y is a fraction (0..1-ish). Show labels in %.
-  const yTickVals = _niceTicks(yMin, yMax, 6, [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1], (v) => {
+  const yTickVals = niceTicks(yMin, yMax, 6, [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1], (v) => {
     const p = v * 100;
     const s = Math.abs(p - Math.round(p)) < 1e-9 ? String(Math.round(p)) : p.toFixed(1);
     return s.replace(/\.0$/, "");
   });
   for (const t of yTickVals) yTicks.push({ yFrac: t.frac, label: t.label });
 
-  if (gridOn) _drawGrid(ctx, plot, dpr, xTicks, yTicks);
+  // Clip ALL data rendering to the plot rect (ticks/labels may extend outside).
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(ox, oy - yLen, xLen, yLen);
+  ctx.clip();
+
+  if (gridOn) drawGrid(ctx, plot, dpr, xTicks, yTicks);
 
   // Bars (draw in view coords)
   ctx.fillStyle = barColor;
@@ -730,8 +857,6 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
     ctx.fillRect(sx0 + sw * 0.08, oy - h, sw * 0.84, h);
   }
   ctx.globalAlpha = 1;
-
-  drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
 
   // Gaussian overlay normalized 0..1
   // Draw in the SAME units as the bars: expected probability mass per bin.
@@ -756,19 +881,22 @@ function drawTimerNode(el: HTMLElement, state: TimerState) {
     ctx.stroke();
   }
 
-  const startBtn = el.querySelector<HTMLButtonElement>('button[data-action="timer-startstop"]');
-  if (startBtn) startBtn.textContent = state.accepting ? "Stop" : "Start";
+  ctx.restore(); // end clip
+  // Draw ticks/labels OUTSIDE the clip so they can extend beyond the plot rect.
+  drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
 
-  // In global Edit mode, hide the timer overlay shading (data-rect background).
-  const mode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
-  const bg = el.querySelector<HTMLElement>(".timer-overlay-bg");
-  if (bg) bg.style.display = mode === "edit" ? "none" : "block";
+  const startBtn = el.querySelector<HTMLButtonElement>('button[data-action="timer-startstop"]');
+  if (startBtn) {
+    const hasRunOnce = _getHasRunOnce(el);
+    startBtn.textContent = runPauseResumeLabel(state.accepting, hasRunOnce);
+  }
 }
 
 function drawSoundNode(el: HTMLElement, state: SoundState) {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas.sound-canvas");
   if (!canvas) return;
-  const prep = prepareCanvas(el, canvas, { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 });
+  // Use shared plot rect fractions (same for all graph-like nodes).
+  const prep = prepareCanvas(el, canvas, _plotFracsForEl(el));
   if (!prep) return;
   const { ctx, dpr, rect: r, plot, H } = prep;
   const { ox, oy, xLen, yLen } = plot;
@@ -792,9 +920,9 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
     const nKeep = Math.max(2, Math.min(ys0.length, Math.round(windowS * 100)));
     const ys = ys0.slice(-nKeep);
     const n = ys.length;
-    if (n <= 1) return;
     // Keep a bit of headroom so it doesn't look pegged.
-    const maxYAuto = Math.max(1e-9, Math.max(...ys) * 1.05);
+    // If no data yet, treat it as a normalized 0..1 axis (so ticks show immediately).
+    const maxYAuto = n > 0 ? Math.max(1e-9, Math.max(...ys) * 1.05) : 1;
 
     const id = el.dataset.nodeId ?? "sound";
     const key = `sound:${id}:pressure`;
@@ -810,34 +938,99 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
       xMax = _clamp(xMax, xMin + 1e-6, windowS);
     }
     const yMin = pr0?.yMin ?? 0;
-    const yMax = pr0?.yMax ?? maxYAuto;
+    const yMax = pr0?.yMax ?? Math.max(1, maxYAuto);
     const xSpan = Math.max(1e-9, xMax - xMin);
     const ySpan = Math.max(1e-9, yMax - yMin);
+    // Clip ALL data rendering to plot rect.
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox, oy - yLen, xLen, yLen);
+    ctx.clip();
+
+    // Time series should keep a fixed window [0..windowS] and "wrap" like an oscilloscope:
+    // - before it is filled, it grows to the right (does not stretch to fill full x)
+    // - once filled, new samples overwrite from left again (no sliding x-axis)
+    const dtS = 0.01; // 10ms resolution
+    const N = Math.max(2, Math.round(windowS / dtS));
+    const seq = Number((state as any).seq ?? 0);
+
     ctx.strokeStyle = col;
     ctx.lineWidth = Math.max(1, 2 * dpr);
-    ctx.beginPath();
-    for (let i = 0; i < n; i++) {
-      const xVal = (i / (n - 1)) * windowS;
-      const xf = (xVal - xMin) / xSpan;
-      const x = ox + xf * xLen;
-      const yv = (ys[i] - yMin) / ySpan;
-      const y = oy - yv * yLen;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+
+    const drawSegment = (i0: number, i1: number, yArr: number[]) => {
+      let started = false;
+      ctx.beginPath();
+      for (let i = i0; i <= i1; i++) {
+        const yRaw = yArr[i];
+        if (!Number.isFinite(yRaw)) continue;
+        const xVal = i * dtS;
+        // Respect current pan/zoom x-range.
+        if (xVal < xMin || xVal > xMax) continue;
+        const xf = (xVal - xMin) / xSpan;
+        const x = ox + xf * xLen;
+        const yv = (yRaw - yMin) / ySpan;
+        const y = oy - yv * yLen;
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      if (started) ctx.stroke();
+    };
+
+    if (ys.length < N) {
+      // Not filled: plot only actual samples at their true x positions.
+      if (ys.length >= 2) drawSegment(0, ys.length - 1, ys);
+    } else {
+      // Filled: map last N samples into a ring indexed by (seq % N).
+      const ring: number[] = new Array(N).fill(Number.NaN);
+      const k = Math.min(N, ys.length);
+      const startPos = (((seq - k) % N) + N) % N; // ring pos of ys[0]
+      for (let i = 0; i < k; i++) {
+        ring[(startPos + i) % N] = ys[i];
+      }
+      const writePos = ((seq % N) + N) % N; // next write position; wrap point in plot
+      // Draw two segments so we don't connect across the wrap discontinuity.
+      if (writePos <= N - 1) drawSegment(writePos, N - 1, ring);
+      if (writePos > 0) drawSegment(0, writePos - 1, ring);
     }
-    ctx.stroke();
 
     // Timer-like ticks/labels
     const lineWidthPx = 2;
     const fmtS = (v: number) => String(Math.round(v * 100) / 100).replace(/\.0+$/, "");
-    const xTickVals = _niceTicks(xMin, xMax, 6, [0.5, 1, 2, 5, 10, 15, 30, 60], fmtS);
+    const user = !!pr0?.user;
+    // Default behavior: show fixed "start view" ticks immediately (even before data arrives).
+    // When user pans/zooms, switch to adaptive ticks based on the current view range.
+    const xTickVals = user
+      ? mergeTickAnchors(niceTicks(xMin, xMax, 6, [0.5, 1, 2, 5, 10, 15, 30, 60], fmtS), xMin, xMax, [0], fmtS)
+      : fixedTicks(0, windowS, 1, (v) => String(Math.round(v)));
     const xTicks: Array<{ xFrac: number; label: string }> = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
-    const yTickVals = _niceTicks(yMin, yMax, 6, [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1], (v) => {
-      const s = v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
-      return s || "0";
-    });
+
+    const fmtAmp = (v: number) => {
+      const s = (Math.round(v * 10) / 10).toFixed(1).replace(/\.0$/, "");
+      return s;
+    };
+    const yTickVals = user
+      ? mergeTickAnchors(
+          niceTicks(yMin, yMax, 6, [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1], (v) => {
+            const s = v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+            return s || "0";
+          }),
+          yMin,
+          yMax,
+          [0],
+          (v) => {
+            const s = v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+            return s || "0";
+          }
+        )
+      : fixedTicks(0, 1, 0.1, fmtAmp);
     const yTicks: Array<{ yFrac: number; label: string }> = yTickVals.map((t) => ({ yFrac: t.frac, label: t.label }));
-    if (gridOn) _drawGrid(ctx, plot, dpr, xTicks, yTicks);
+
+    if (gridOn) drawGrid(ctx, plot, dpr, xTicks, yTicks);
+    ctx.restore(); // end clip
     drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
     return;
   }
@@ -846,9 +1039,8 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
   const f = state.spectrum?.freqHz ?? [];
   const m = state.spectrum?.magDb ?? [];
   const n2 = Math.min(f.length, m.length);
-  if (n2 <= 1) return;
   // Show up to 8kHz by default (good for speech); clamp if SR is lower.
-  const maxHzAuto = Math.min(8000, Math.max(...f));
+  const maxHzAuto = Math.min(8000, Math.max(1, ...f.map((x) => Number(x) || 0)));
   const minDbAuto = -120;
   const maxDbAuto = 0;
 
@@ -865,35 +1057,44 @@ function drawSoundNode(el: HTMLElement, state: SoundState) {
   yMax = _clamp(yMax, yMin + 1e-6, maxDbAuto);
   const xSpan = Math.max(1e-9, xMax - xMin);
   const ySpan = Math.max(1e-9, yMax - yMin);
+  // Clip ALL data rendering to plot rect.
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(ox, oy - yLen, xLen, yLen);
+  ctx.clip();
+
   ctx.strokeStyle = col;
   ctx.lineWidth = Math.max(1, 2 * dpr);
-  ctx.beginPath();
-  let started = false;
-  for (let i = 0; i < n2; i++) {
-    const hz = f[i];
-    if (hz < xMin || hz > xMax) continue;
-    const t = (hz - xMin) / xSpan;
-    const x = ox + t * xLen;
-    const db = Math.max(yMin, Math.min(yMax, m[i]));
-    const yv = (db - yMin) / ySpan;
-    const y = oy - yv * yLen;
-    if (!started) {
-      ctx.moveTo(x, y);
-      started = true;
-    } else {
-      ctx.lineTo(x, y);
+  if (n2 >= 2) {
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < n2; i++) {
+      const hz = f[i];
+      if (hz < xMin || hz > xMax) continue;
+      const t = (hz - xMin) / xSpan;
+      const x = ox + t * xLen;
+      const db = Math.max(yMin, Math.min(yMax, m[i]));
+      const yv = (db - yMin) / ySpan;
+      const y = oy - yv * yLen;
+      if (!started) {
+        ctx.moveTo(x, y);
+        started = true;
+      } else {
+        ctx.lineTo(x, y);
+      }
     }
+    ctx.stroke();
   }
-  ctx.stroke();
 
   // Spectrum ticks (timer-like)
   {
     const lineWidthPx = 2;
-    const xTickVals = _niceTicks(xMin, xMax, 6, [50, 100, 200, 500, 1000, 2000, 4000, 8000, 16000], (v) => String(Math.round(v)));
+    const xTickVals = niceTicks(xMin, xMax, 6, [50, 100, 200, 500, 1000, 2000, 4000, 8000, 16000], (v) => String(Math.round(v)));
     const xTicks: Array<{ xFrac: number; label: string }> = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
-    const yTickVals = _niceTicks(yMin, yMax, 6, [5, 10, 20, 30, 40, 60], (v) => String(Math.round(v)));
+    const yTickVals = niceTicks(yMin, yMax, 6, [5, 10, 20, 30, 40, 60], (v) => String(Math.round(v)));
     const yTicks: Array<{ yFrac: number; label: string }> = yTickVals.map((t) => ({ yFrac: t.frac, label: t.label }));
-    if (gridOn) _drawGrid(ctx, plot, dpr, xTicks, yTicks);
+    if (gridOn) drawGrid(ctx, plot, dpr, xTicks, yTicks);
+    ctx.restore(); // end clip
     drawTicksAndLabels({ ctx, plot, rectCss: r, dpr, lineWidthPx, xTicks, yTicks });
   }
 }
@@ -1124,6 +1325,7 @@ function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
         body: JSON.stringify(accepting ? { pollId } : { pollId, reset: true }),
       });
       __choicesState[pollId] = await fetchChoicesState(pollId);
+      if (!accepting && nodeEl) _setHasRunOnce(nodeEl, true);
       ev.preventDefault();
       return;
     }
@@ -1133,6 +1335,22 @@ function attachChoicesHandlers(stage: HTMLElement, engine: Engine) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ pollId }),
       });
+      __choicesState[pollId] = await fetchChoicesState(pollId);
+      if (nodeEl) _setHasRunOnce(nodeEl, false);
+      ev.preventDefault();
+      return;
+    }
+    if (action === "choices-test") {
+      // Debug-only: simulate votes without starting the poll.
+      const model = engine.getModel();
+      const node = model?.nodes.find((n: any) => n.id === pollId);
+      if (!node || !(node as any).debug) return;
+      btn.disabled = true;
+      try {
+        await simulateChoicesVotes(pollId, { users: 30 });
+      } finally {
+        btn.disabled = false;
+      }
       __choicesState[pollId] = await fetchChoicesState(pollId);
       ev.preventDefault();
       return;
@@ -1175,12 +1393,14 @@ function attachTimerNodeHandlers(stage: HTMLElement) {
       await fetch(`${BACKEND}/api/timer/${accepting ? "stop" : "start"}`, { method: "POST" });
       __timerState = await fetchTimerState();
       __timerPollingEnabled = !accepting;
+      if (!accepting && timerEl) _setHasRunOnce(timerEl, true);
       ev.preventDefault();
       return;
     }
     if (action === "timer-reset") {
       await fetch(`${BACKEND}/api/timer/reset`, { method: "POST" });
       __timerState = await fetchTimerState();
+      if (timerEl) _setHasRunOnce(timerEl, false);
       ev.preventDefault();
       return;
     }
@@ -1218,7 +1438,8 @@ function attachSoundNodeHandlers(stage: HTMLElement) {
       // Instant UI feedback (optimistic), but also reconcile with backend state.
       if (running) {
         (__soundState as any) = { ...st0, enabled: false };
-        btn.textContent = (st0.seq ?? 0) > 0 ? "Resume" : "Run";
+        const hasRunOnce = _getHasRunOnce(nodeEl) || (st0.seq ?? 0) > 0;
+        btn.textContent = runPauseResumeLabel(false, hasRunOnce);
         void fetch(`${BACKEND}/api/sound/pause`, { method: "POST" }).finally(async () => {
           const st = await fetchSoundState();
           if (st) __soundState = st;
@@ -1226,6 +1447,7 @@ function attachSoundNodeHandlers(stage: HTMLElement) {
       } else {
         (__soundState as any) = { ...st0, enabled: true, error: null };
         btn.textContent = "Pause";
+        _setHasRunOnce(nodeEl, true);
         // Ensure backend computes the active mode when we start.
         void fetch(`${BACKEND}/api/sound/mode`, {
           method: "POST",
@@ -1250,6 +1472,7 @@ function attachSoundNodeHandlers(stage: HTMLElement) {
       const prev = (__soundState as SoundState | null) ?? null;
       const st0 = ensureSoundStateDefaults(prev);
       (__soundState as any) = { ...st0, enabled: false, seq: 0, pressure10ms: [], spectrum: { freqHz: [], magDb: [] }, error: null };
+      _setHasRunOnce(nodeEl, false);
       const toggleBtn = nodeEl.querySelector<HTMLButtonElement>('button[data-action="sound-toggle"]');
       if (toggleBtn) toggleBtn.textContent = "Run";
       void fetch(`${BACKEND}/api/sound/reset`, { method: "POST" }).finally(async () => {
@@ -1287,6 +1510,84 @@ function applyDataBindings(template: string, data: Record<string, string | numbe
   });
 }
 
+function _parseInlineParams(s: string): Record<string, string> {
+  // Split on commas, but NOT inside quotes or balanced groups.
+  const out: Record<string, string> = {};
+  let buf = "";
+  let inQuotes = false;
+  let brace = 0;
+  let bracket = 0;
+  let paren = 0;
+  const parts: string[] = [];
+  for (const ch of String(s ?? "")) {
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      buf += ch;
+      continue;
+    }
+    if (!inQuotes) {
+      if (ch === "{") brace += 1;
+      else if (ch === "}") brace = Math.max(0, brace - 1);
+      else if (ch === "[") bracket += 1;
+      else if (ch === "]") bracket = Math.max(0, bracket - 1);
+      else if (ch === "(") paren += 1;
+      else if (ch === ")") paren = Math.max(0, paren - 1);
+    }
+    if (ch === "," && !inQuotes && brace === 0 && bracket === 0 && paren === 0) {
+      if (buf.trim()) parts.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) parts.push(buf.trim());
+
+  for (const p of parts) {
+    const eq = p.indexOf("=");
+    if (eq < 0) continue;
+    const k = p.slice(0, eq).trim();
+    let v = p.slice(eq + 1).trim();
+    if (v.length >= 2 && v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+    out[k] = v;
+  }
+  return out;
+}
+
+function _parseList(raw: string | undefined): string[] {
+  let s = String(raw ?? "").trim();
+  // Strip surrounding braces/brackets generously (handles {{...}}, {...}, [...])
+  while (s && (s[0] === "{" || s[0] === "[") && (s[s.length - 1] === "}" || s[s.length - 1] === "]")) {
+    s = s.slice(1, -1).trim();
+  }
+  const out: string[] = [];
+  let buf = "";
+  let inQuotes = false;
+  let brace = 0;
+  for (const ch of s) {
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      buf += ch;
+      continue;
+    }
+    if (!inQuotes) {
+      if (ch === "{") brace += 1;
+      else if (ch === "}") brace = Math.max(0, brace - 1);
+    }
+    if (ch === "," && !inQuotes && brace === 0) {
+      if (buf.trim()) out.push(buf.trim());
+      buf = "";
+      continue;
+    }
+    buf += ch;
+  }
+  if (buf.trim()) out.push(buf.trim());
+  return out.map((x) => {
+    let t = x.trim();
+    if (t.length >= 2 && t.startsWith('"') && t.endsWith('"')) t = t.slice(1, -1);
+    return t;
+  });
+}
+
 function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
   const m = engine.getModel();
   const node = m?.nodes.find((n) => n.id === timerId) as any;
@@ -1317,7 +1618,49 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     svg.style.pointerEvents = "none";
     layer.append(svg);
 
+    // Plot/ticks/ticklabels region: special non-editable component, movable as one in group edit.
+    const plot = document.createElement("div");
+    plot.className = "timer-sub timer-sub-plot comp-sub";
+    plot.dataset.subId = "plot";
+    plot.dataset.compPath = timerId;
+    plot.dataset.kind = "plot-region";
+    plot.style.position = "absolute";
+    plot.style.pointerEvents = "none";
+    plot.style.zIndex = "10";
+    plot.style.background = "rgba(255,255,255,0.03)";
+    layer.append(plot);
+
+    // Hit layers for axis arrows (editable in group edit mode) - one per arrow id.
+    // These map 1:1 to arrow[...] specs (not special graphics).
+    const mkArrowHit = (arrowId: string) => {
+      const layerEl = layer!;
+      const h = document.createElement("div");
+      h.className = "timer-sub timer-sub-arrow-hit comp-sub";
+      h.dataset.subId = arrowId;
+      h.dataset.compPath = timerId;
+      h.dataset.kind = "plot-arrow";
+      h.dataset.arrowId = arrowId;
+      h.style.position = "absolute";
+      // Sized by renderTimerCompositeArrows() (tight bbox).
+      h.style.pointerEvents = "none";
+      h.style.zIndex = "20";
+      layerEl.append(h);
+      return h;
+    };
+    mkArrowHit("x_axis");
+    mkArrowHit("y_axis");
+
     const geoms: Record<string, any> = node.compositeGeometries ?? {};
+    // Default plot region = the canonical plot rect used by the renderer.
+    geoms["plot"] = geoms["plot"] ?? {
+      x: PLOT_FRACS.leftF,
+      y: PLOT_FRACS.topF,
+      w: PLOT_FRACS.rightF - PLOT_FRACS.leftF,
+      h: PLOT_FRACS.bottomF - PLOT_FRACS.topF,
+      rotationDeg: 0,
+      anchor: "topLeft",
+      align: "left",
+    };
     const text = String(node.elementsText ?? "");
     const lines = text.split(/\r?\n/);
     const arrowSpecs: Array<{
@@ -1367,6 +1710,7 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
         d.style.color = "rgba(255,255,255,0.92)";
         d.style.userSelect = "none";
         d.style.pointerEvents = "none";
+        d.style.zIndex = "30";
         d.style.whiteSpace = "nowrap";
         // Match global text nodes (KaTeX roman)
         d.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
@@ -1375,6 +1719,101 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
         const rot = Number(g.rotationDeg ?? 0);
         if (rot) d.style.rotate = `${rot}deg`;
         layer.append(d);
+        continue;
+      }
+
+      // buttons[name=...,orientation=h|v,labels=[...]]
+      const mb = ln.match(/^buttons\[(?<params>[^\]]+)\]$/);
+      if (mb?.groups?.params) {
+        const params = _parseInlineParams(mb.groups.params);
+        const sid = String(params.name ?? "").trim();
+        if (!sid) continue;
+        const orient = (String(params.orientation ?? "h").trim().toLowerCase() === "v" ? "v" : "h") as "h" | "v";
+        const labels = _parseList(params.labels);
+        const actions = _parseList(params.actions);
+        const g = geoms[sid] ?? { x: 0.5, y: 0.5, w: 0.55, h: 0.10, rotationDeg: 0, anchor: "centerCenter", align: "center" };
+
+        const boxEl = document.createElement("div");
+        // Buttons are special chrome by default: not editable in group edit.
+        // Movable chrome: editable as a unit in group edit mode.
+        boxEl.className = "timer-sub timer-sub-buttons comp-chrome comp-sub";
+        boxEl.dataset.subId = sid;
+        boxEl.dataset.compPath = timerId;
+        boxEl.dataset.orientation = orient;
+        boxEl.dataset.templates = JSON.stringify(labels);
+        boxEl.dataset.actions = JSON.stringify(actions);
+
+        boxEl.style.position = "absolute";
+        boxEl.style.left = `${(g.x ?? 0.5) * 100}%`;
+        boxEl.style.top = `${(g.y ?? 0.5) * 100}%`;
+        boxEl.style.width = `${(g.w ?? 0.55) * 100}%`;
+        boxEl.style.height = `${(g.h ?? 0.10) * 100}%`;
+        boxEl.style.transform = "translate(-50%, -50%)";
+        boxEl.style.padding = "0";
+        boxEl.style.border = "none";
+        boxEl.style.background = "transparent";
+        boxEl.style.pointerEvents = "auto"; // clickable in live
+        boxEl.style.zIndex = "40";
+        boxEl.style.userSelect = "none";
+
+        const row = document.createElement("div");
+        row.className = "ip-buttons-row";
+        row.style.display = "flex";
+        row.style.flexDirection = orient === "v" ? "column" : "row";
+        row.style.gap = "10px";
+        row.style.alignItems = "center";
+        row.style.justifyContent = "center";
+        row.style.width = "100%";
+        row.style.height = "100%";
+
+        labels.forEach((tpl, idx) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "ip-controlbtn";
+          btn.dataset.idx = String(idx + 1);
+          btn.dataset.template = String(tpl ?? "");
+          const contentEl = document.createElement("div");
+          contentEl.className = "ip-button-content";
+          btn.appendChild(contentEl);
+          btn.addEventListener("click", async (ev) => {
+            // Disable interaction while group editing.
+            if (getAppMode() !== "live" || (window as any).__ip_compositeEditing) {
+              return;
+            }
+            const evName = `${sid}-${idx + 1}`;
+            window.dispatchEvent(new CustomEvent(evName, { detail: { id: sid, index: idx + 1, compPath: timerId } }));
+
+            // Optional built-in action dispatch (reuses existing behavior).
+            const action = actions[idx] ?? "";
+            if (action === "timer-startstop") {
+              const timerEl = engine.getNodeElement(timerId);
+              const accepting = !!__timerState?.accepting;
+              await fetch(`${BACKEND}/api/timer/${accepting ? "stop" : "start"}`, { method: "POST" });
+              __timerState = await fetchTimerState();
+              __timerPollingEnabled = !accepting;
+              if (!accepting && timerEl) _setHasRunOnce(timerEl, true);
+            } else if (action === "timer-reset") {
+              const timerEl = engine.getNodeElement(timerId);
+              await fetch(`${BACKEND}/api/timer/reset`, { method: "POST" });
+              __timerState = await fetchTimerState();
+              if (timerEl) _setHasRunOnce(timerEl, false);
+            } else if (action === "timer-test") {
+              const timerEl = engine.getNodeElement(timerId);
+              if (timerEl) {
+                btn.disabled = true;
+                try {
+                  __timerPollingEnabled = true;
+                  await simulateTimerSubmissions(timerEl, { users: 30, durationMs: 5000 });
+                } finally {
+                  btn.disabled = false;
+                }
+              }
+            }
+          });
+          row.appendChild(btn);
+        });
+        boxEl.appendChild(row);
+        layer.appendChild(boxEl);
         continue;
       }
 
@@ -1398,7 +1837,68 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     }
     (layer as any).__arrowSpecs = arrowSpecs;
     (layer as any).__textGeoms = geoms;
-    (layer as any).__elementsText = text;
+    // This is .pr content (single-line "text[name=...]: ..." etc).
+    (layer as any).__elementsPr = text;
+  }
+
+  // Ensure per-axis hit layers exist even if the layer was created before we added them.
+  const ensureHit = (arrowId: string) => {
+    if (layer.querySelector<HTMLElement>(`:scope > .timer-sub-arrow-hit[data-arrow-id="${arrowId}"]`)) return;
+    const h = document.createElement("div");
+    h.className = "timer-sub timer-sub-arrow-hit comp-sub";
+    h.dataset.subId = arrowId;
+    h.dataset.compPath = timerId;
+    h.dataset.kind = "plot-arrow";
+    h.dataset.arrowId = arrowId;
+    h.style.position = "absolute";
+    // Sized by renderTimerCompositeArrows() (tight bbox).
+    h.style.pointerEvents = "none";
+    h.style.zIndex = "20";
+    layer.append(h);
+  };
+  ensureHit("x_axis");
+  ensureHit("y_axis");
+
+  // Ensure plot region sub-element exists for older layers.
+  let plotEl = layer.querySelector<HTMLElement>(":scope > .timer-sub-plot[data-sub-id=\"plot\"]");
+  if (!plotEl) {
+    plotEl = document.createElement("div");
+    plotEl.className = "timer-sub timer-sub-plot comp-sub";
+    plotEl.dataset.subId = "plot";
+    plotEl.dataset.compPath = timerId;
+    plotEl.dataset.kind = "plot-region";
+    plotEl.style.position = "absolute";
+    plotEl.style.pointerEvents = "none";
+    plotEl.style.zIndex = "10";
+    plotEl.style.background = "rgba(255,255,255,0.03)";
+    layer.append(plotEl);
+  }
+
+  // Sync plot region geom -> DOM box + dataset fracs so canvas/ticks follow it.
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? (node.compositeGeometries ?? {});
+  const pg = (geoms["plot"] ??= {
+    x: PLOT_FRACS.leftF,
+    y: PLOT_FRACS.topF,
+    w: PLOT_FRACS.rightF - PLOT_FRACS.leftF,
+    h: PLOT_FRACS.bottomF - PLOT_FRACS.topF,
+    rotationDeg: 0,
+    anchor: "topLeft",
+    align: "left",
+  });
+  const ptl = anchorToTopLeftWorld({ x: Number(pg.x), y: Number(pg.y), w: Number(pg.w), h: Number(pg.h), anchor: String(pg.anchor ?? "topLeft") } as any);
+  const leftF = ptl.x;
+  const topF = ptl.y;
+  const rightF = leftF + Number(pg.w);
+  const bottomF = topF + Number(pg.h);
+  el.dataset.plotLeftF = String(leftF);
+  el.dataset.plotRightF = String(rightF);
+  el.dataset.plotTopF = String(topF);
+  el.dataset.plotBottomF = String(bottomF);
+  if (plotEl) {
+    plotEl.style.left = `${leftF * 100}%`;
+    plotEl.style.top = `${topF * 100}%`;
+    plotEl.style.width = `${Number(pg.w) * 100}%`;
+    plotEl.style.height = `${Number(pg.h) * 100}%`;
   }
 
   return layer;
@@ -1432,7 +1932,8 @@ function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, dat
     t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
 
     // Font size scales with the element height on screen (use fractional rect height to avoid jitter).
-    const fontPx = Math.max(16, timerBox.height * h * 0.85);
+    // Allow scaling all the way down to 1px (requested).
+    const fontPx = Math.max(1, timerBox.height * h * 0.85);
     t.style.fontSize = `${fontPx}px`;
     t.style.lineHeight = `${fontPx}px`;
 
@@ -1445,6 +1946,41 @@ function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, dat
       const contentEl = t.querySelector<HTMLElement>(":scope .timer-sub-content");
       if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
     }
+  }
+}
+
+function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .timer-sub-buttons"));
+  const hPx = Number(timerEl.dataset.timerHpx ?? "0");
+  const wPx = Number(timerEl.dataset.timerWpx ?? "0");
+  const timerBox =
+    hPx > 0 && wPx > 0
+      ? { width: wPx, height: hPx }
+      : timerEl.getBoundingClientRect();
+  const isGroupEditing = timerEl.dataset.compositeEditing === "1";
+  for (const boxEl of els) {
+    const sid = boxEl.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const h = Number(g.h ?? 0.10);
+    const fontPx = Math.max(12, timerBox.height * h * 0.55);
+    const scale = Math.max(0.6, Math.min(3, fontPx / 16));
+    boxEl.style.setProperty("--control-scale", String(scale));
+    boxEl.style.opacity = isGroupEditing ? "0.35" : "1";
+    boxEl.style.pointerEvents = isGroupEditing ? "none" : "auto";
+
+    for (const btn of Array.from(boxEl.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
+      const tpl = btn.dataset.template ?? "";
+      const resolved = applyDataBindings(tpl, data);
+      const prev = btn.dataset.rawText ?? "";
+      if (prev !== resolved) {
+        btn.dataset.rawText = resolved;
+        const contentEl = btn.querySelector<HTMLElement>(":scope > .ip-button-content");
+        if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+      }
+    }
+    // Hide the legacy headerbar when composite buttons are present (avoid duplicates).
+    timerEl.querySelector<HTMLElement>(".timer-header")?.setAttribute("style", "display:none !important");
   }
 }
 
@@ -1463,7 +1999,7 @@ function layoutTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement) {
     const g = geoms[sid] ?? {};
     const h = Number(g.h ?? 0.1);
     // Keep font sizing in sync with on-screen timer rect continuously (fractional px, no rounding).
-    const fontPx = Math.max(16, timerBox.height * h * 0.85);
+    const fontPx = Math.max(1, timerBox.height * h * 0.85);
     t.style.fontSize = `${fontPx}px`;
     t.style.lineHeight = `${fontPx}px`;
   }
@@ -1522,14 +2058,11 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
   // Map arrow coordinates in "data-rect space":
   // u in [0..1] across x, v in [0..1] up y. Allow >1 to extend beyond the rect.
   // This matches the plot area used by drawTimerNode().
-  const leftF = 0.08;
-  const rightF = 0.92;
-  const topF = 0.10;
-  const bottomF = 0.90;
-  const ox = leftF * w;
-  const oy = bottomF * h;
-  const xLen = (rightF - leftF) * w;
-  const yLen = (bottomF - topF) * h;
+  const fr = _plotFracsForEl(timerEl);
+  const ox = fr.leftF * w;
+  const oy = fr.bottomF * h;
+  const xLen = (fr.rightF - fr.leftF) * w;
+  const yLen = (fr.bottomF - fr.topF) * h;
   const mapX = (u: number) => ox + u * xLen;
   const mapY = (vUp: number) => oy - vUp * yLen;
 
@@ -1546,6 +2079,20 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
     const y1 = mapY(Number(a.y0 ?? 0));
     const x2 = mapX(Number(a.x1 ?? 1));
     const y2 = mapY(Number(a.y1 ?? 1));
+
+    // Keep a per-arrow hitbox in sync with the rendered arrow (smallest bbox wins in selection).
+    const hit = layer.querySelector<HTMLElement>(`:scope > .timer-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`);
+    if (hit) {
+      const padPx = 24;
+      const minX = Math.min(x1, x2) - padPx;
+      const maxX = Math.max(x1, x2) + padPx;
+      const minY = Math.min(y1, y2) - padPx;
+      const maxY = Math.max(y1, y2) + padPx;
+      hit.style.left = `${(minX / w) * 100}%`;
+      hit.style.top = `${(minY / h) * 100}%`;
+      hit.style.width = `${((maxX - minX) / w) * 100}%`;
+      hit.style.height = `${((maxY - minY) / h) * 100}%`;
+    }
 
     const markerId = `arrowhead-${timerId}-${a.id}`;
     const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
@@ -1610,13 +2157,17 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
               return (v / 1000).toFixed(2);
             };
             const countN = st && Number.isFinite(st.stats.n) ? Number(st.stats.n) : 0;
+            const hasRunOnce = _getHasRunOnce(el);
+            const accepting = !!st?.accepting;
             const data: Record<string, string | number> = {
               name: n.id,
               mean: countN > 0 && st ? fmtS(st.stats.meanMs) : "-",
               sigma: countN > 1 && st ? fmtS(st.stats.sigmaMs) : "-",
               count: countN > 0 ? String(countN) : "-",
+              runPauseResume: runPauseResumeLabel(accepting, hasRunOnce),
             };
             renderTimerCompositeTexts(el, layer, data);
+            renderTimerCompositeButtons(el, layer, data);
           }
         }
       }
@@ -1632,15 +2183,19 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
     if (__timerDrawRafStarted) return;
     __timerDrawRafStarted = true;
     const rafDraw = () => {
-      const st = __timerState;
-      if (st) {
-        const cur = engine.getModel();
-        if (cur) {
-          for (const n of cur.nodes) {
-            if (n.type !== "timer") continue;
-            const el = engine.getNodeElement(n.id);
-            if (el) drawTimerNode(el, st);
-          }
+      // Always draw: ticks/labels should be visible even before the timer is started
+      // (and even when the backend is offline / not yet polled).
+      const st: TimerState = __timerState ?? {
+        accepting: false,
+        samplesMs: [],
+        stats: { n: 0, meanMs: null, sigmaMs: null },
+      };
+      const cur = engine.getModel();
+      if (cur) {
+        for (const n of cur.nodes) {
+          if (n.type !== "timer") continue;
+          const el = engine.getNodeElement(n.id);
+          if (el) drawTimerNode(el, st);
         }
       }
       window.requestAnimationFrame(rafDraw);
@@ -1679,6 +2234,7 @@ function ensureTimerPolling(engine: Engine, model: PresentationModel, stage: HTM
           count: countN > 0 ? String(countN) : "-"
         };
         renderTimerCompositeTexts(el, layer, data);
+        renderTimerCompositeButtons(el, layer, data);
       }
     }
   };
@@ -1691,6 +2247,14 @@ function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: H
   if (__soundStreamStarted) return;
   __soundStreamStarted = true;
   attachSoundNodeHandlers(stage);
+
+  const setSoundUnavailable = (reason: string) => {
+    const prev = (__soundState as SoundState | null) ?? null;
+    const base = ensureSoundStateDefaults(prev);
+    // Don't overwrite a real running state; only set helpful diagnostics.
+    if (base.enabled) return;
+    (__soundState as any) = { ...base, enabled: false, error: reason };
+  };
 
   // Draw loop
   let rafStarted = false;
@@ -1749,7 +2313,12 @@ function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: H
                   modeNow === "pressure"
                     ? { xLabel: "Time (s)", yLabel: "Pressure (RMS)", peakHz: "-" }
                     : { xLabel: "Frequency (Hz)", yLabel: "Magnitude (dB)", peakHz: String(peakHz) };
+                const hasRunOnce = _getHasRunOnce(el) || (st?.seq ?? 0) > 0;
+                (data as any).runPauseResume = runPauseResumeLabel(!!st?.enabled, hasRunOnce);
+                const nextMode = modeNow === "pressure" ? "spectrum" : "pressure";
+                (data as any).modeToggle = nextMode === "pressure" ? "As Time Series" : "As Spectrum";
                 renderSoundCompositeTexts(el, layer, data);
+                renderSoundCompositeButtons(el, layer, data);
               }
             }
           }
@@ -1775,14 +2344,43 @@ function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: H
       // fallback: poll slowly if SSE fails
       const st = await fetchSoundState();
       if (st) __soundState = st;
+      else {
+        setSoundUnavailable(
+          `Sound is not available (backend unreachable).\n` +
+            `If you are running from GitHub Pages, the backend APIs do not exist.\n` +
+            `Run the backend locally and point BACKEND to it.\n` +
+            `BACKEND=${BACKEND}`
+        );
+      }
     };
   } catch {
     // fallback to polling
     window.setInterval(async () => {
       const st = await fetchSoundState();
       if (st) __soundState = st;
+      else {
+        setSoundUnavailable(
+          `Sound is not available (backend unreachable).\n` +
+            `If you are running from GitHub Pages, the backend APIs do not exist.\n` +
+            `Run the backend locally and point BACKEND to it.\n` +
+            `BACKEND=${BACKEND}`
+        );
+      }
     }, 200);
   }
+
+  // Proactive diagnostic: if we never receive any sound state shortly after boot,
+  // show a user-friendly message instead of a blank plot.
+  window.setTimeout(() => {
+    if (!__soundState) {
+      setSoundUnavailable(
+        `Sound is not available (no backend response).\n` +
+          `If you are running from GitHub Pages, the backend APIs do not exist.\n` +
+          `Run the backend locally and point BACKEND to it.\n` +
+          `BACKEND=${BACKEND}`
+      );
+    }
+  }, 1500);
 }
 
 function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
@@ -1814,7 +2412,53 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
     svg.style.pointerEvents = "none";
     layer.append(svg);
 
+    // Plot/ticks/ticklabels region: special non-editable component, movable as one in group edit.
+    const plot = document.createElement("div");
+    plot.className = "sound-sub sound-sub-plot comp-sub";
+    plot.dataset.subId = "plot";
+    plot.dataset.compPath = soundId;
+    plot.dataset.kind = "plot-region";
+    plot.style.position = "absolute";
+    plot.style.pointerEvents = "none";
+    plot.style.zIndex = "10";
+    plot.style.background = "rgba(255,255,255,0.03)";
+    layer.append(plot);
+
+    // Hit layers for axis arrows (editable in group edit mode) - one per arrow id.
+    // These are *not* special graphics; they map 1:1 to arrow[...] specs.
+    // Positioned over the plot rect only, so selection outlines aren't huge.
+    const mkArrowHit = (arrowId: string) => {
+      const layerEl = layer!;
+      const h = document.createElement("div");
+      h.className = "sound-sub sound-sub-arrow-hit comp-sub";
+      h.dataset.subId = arrowId;
+      h.dataset.compPath = soundId;
+      h.dataset.kind = "plot-arrow";
+      h.dataset.arrowId = arrowId;
+      h.style.position = "absolute";
+      // Sized by renderSoundCompositeArrows() (tight bbox).
+      h.style.pointerEvents = "none";
+      h.style.zIndex = "20";
+      layerEl.append(h);
+      return h;
+    };
+    mkArrowHit("x_axis");
+    mkArrowHit("y_axis");
+
     const geoms: Record<string, any> = node.compositeGeometries ?? {};
+    // Enforce canonical positions for y_label + peak so sound matches timer.
+    geoms["y_label"] = { ...(geoms["y_label"] ?? {}), ...CANON_COMPOSITE_Y_LABEL };
+    geoms["peak"] = { ...(geoms["peak"] ?? {}), ...CANON_COMPOSITE_STATS };
+    // Default plot region = the canonical plot rect used by the renderer.
+    geoms["plot"] = geoms["plot"] ?? {
+      x: PLOT_FRACS.leftF,
+      y: PLOT_FRACS.topF,
+      w: PLOT_FRACS.rightF - PLOT_FRACS.leftF,
+      h: PLOT_FRACS.bottomF - PLOT_FRACS.topF,
+      rotationDeg: 0,
+      anchor: "topLeft",
+      align: "left",
+    };
     const text = String(node.elementsText ?? "");
     const lines = text.split(/\r?\n/);
     const arrowSpecs: Array<{ id: string; x0: number; y0: number; x1: number; y1: number; color: string; width: number }> = [];
@@ -1852,6 +2496,7 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
         d.style.color = "rgba(255,255,255,0.92)";
         d.style.userSelect = "none";
         d.style.pointerEvents = "none";
+        d.style.zIndex = "30";
         d.style.whiteSpace = "nowrap";
         d.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
         d.style.fontWeight = "400";
@@ -1859,6 +2504,80 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
         const rot = Number(g.rotationDeg ?? 0);
         if (rot) d.style.rotate = `${rot}deg`;
         layer.append(d);
+        continue;
+      }
+
+      // buttons[name=...,orientation=h|v,labels=[...]]
+      const mb = ln.match(/^buttons\[(?<params>[^\]]+)\]$/);
+      if (mb?.groups?.params) {
+        const params = _parseInlineParams(mb.groups.params);
+        const sid = String(params.name ?? "").trim();
+        if (!sid) continue;
+        const orient = (String(params.orientation ?? "h").trim().toLowerCase() === "v" ? "v" : "h") as "h" | "v";
+        const labels = _parseList(params.labels);
+        const actions = _parseList(params.actions);
+        const g = geoms[sid] ?? { x: 0.5, y: 0.5, w: 0.55, h: 0.10, rotationDeg: 0, anchor: "centerCenter", align: "center" };
+
+        const boxEl = document.createElement("div");
+        // Movable chrome: editable as a unit in group edit mode.
+        boxEl.className = "sound-sub sound-sub-buttons comp-chrome comp-sub";
+        boxEl.dataset.subId = sid;
+        boxEl.dataset.compPath = soundId;
+        boxEl.dataset.orientation = orient;
+        boxEl.dataset.templates = JSON.stringify(labels);
+        boxEl.dataset.actions = JSON.stringify(actions);
+
+        boxEl.style.position = "absolute";
+        boxEl.style.left = `${(g.x ?? 0.5) * 100}%`;
+        boxEl.style.top = `${(g.y ?? 0.5) * 100}%`;
+        boxEl.style.width = `${(g.w ?? 0.55) * 100}%`;
+        boxEl.style.height = `${(g.h ?? 0.10) * 100}%`;
+        boxEl.style.transform = "translate(-50%, -50%)";
+        boxEl.style.padding = "0";
+        boxEl.style.border = "none";
+        boxEl.style.background = "transparent";
+        boxEl.style.pointerEvents = "auto";
+        boxEl.style.zIndex = "40";
+        boxEl.style.userSelect = "none";
+
+        const row = document.createElement("div");
+        row.className = "ip-buttons-row";
+        row.style.display = "flex";
+        row.style.flexDirection = orient === "v" ? "column" : "row";
+        row.style.gap = "10px";
+        row.style.alignItems = "center";
+        row.style.justifyContent = "center";
+        row.style.width = "100%";
+        row.style.height = "100%";
+
+        labels.forEach((tpl, idx) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "ip-controlbtn";
+          btn.dataset.idx = String(idx + 1);
+          btn.dataset.template = String(tpl ?? "");
+          const contentEl = document.createElement("div");
+          contentEl.className = "ip-button-content";
+          btn.appendChild(contentEl);
+          btn.addEventListener("click", (ev) => {
+            if (getAppMode() !== "live" || (window as any).__ip_compositeEditing) {
+              return;
+            }
+            const evName = `${sid}-${idx + 1}`;
+            window.dispatchEvent(new CustomEvent(evName, { detail: { id: sid, index: idx + 1, compPath: soundId } }));
+
+            const action = actions[idx] ?? "";
+            if (!action) return;
+            // Reuse the existing button-action handlers by synthesizing a click on the hidden header buttons when present.
+            const root = engine.getNodeElement(soundId);
+            if (!root) return;
+            const btn2 = root.querySelector<HTMLButtonElement>(`button[data-action="${action}"]`);
+            btn2?.click();
+          });
+          row.appendChild(btn);
+        });
+        boxEl.appendChild(row);
+        layer.appendChild(boxEl);
         continue;
       }
 
@@ -1881,8 +2600,70 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
     }
     (layer as any).__arrowSpecs = arrowSpecs;
     (layer as any).__textGeoms = geoms;
-    (layer as any).__elementsText = text;
+    // This is .pr content (single-line "text[name=...]: ..." etc).
+    (layer as any).__elementsPr = text;
   }
+
+  // Ensure per-axis hit layers exist even if the layer was created before we added them.
+  const ensureHit = (arrowId: string) => {
+    if (layer.querySelector<HTMLElement>(`:scope > .sound-sub-arrow-hit[data-arrow-id="${arrowId}"]`)) return;
+    const h = document.createElement("div");
+    h.className = "sound-sub sound-sub-arrow-hit comp-sub";
+    h.dataset.subId = arrowId;
+    h.dataset.compPath = soundId;
+    h.dataset.kind = "plot-arrow";
+    h.dataset.arrowId = arrowId;
+    h.style.position = "absolute";
+    // Sized by renderSoundCompositeArrows() (tight bbox).
+    h.style.pointerEvents = "none";
+    h.style.zIndex = "20";
+    layer.append(h);
+  };
+  ensureHit("x_axis");
+  ensureHit("y_axis");
+
+  // Ensure plot region sub-element exists for older layers.
+  let plotEl = layer.querySelector<HTMLElement>(':scope > .sound-sub-plot[data-sub-id="plot"]');
+  if (!plotEl) {
+    plotEl = document.createElement("div");
+    plotEl.className = "sound-sub sound-sub-plot comp-sub";
+    plotEl.dataset.subId = "plot";
+    plotEl.dataset.compPath = soundId;
+    plotEl.dataset.kind = "plot-region";
+    plotEl.style.position = "absolute";
+    plotEl.style.pointerEvents = "none";
+    plotEl.style.zIndex = "10";
+    plotEl.style.background = "rgba(255,255,255,0.03)";
+    layer.append(plotEl);
+  }
+
+  // Sync plot region geom -> DOM box + dataset fracs so canvas/ticks follow it.
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? (node.compositeGeometries ?? {});
+  const pg = (geoms["plot"] ??= {
+    x: PLOT_FRACS.leftF,
+    y: PLOT_FRACS.topF,
+    w: PLOT_FRACS.rightF - PLOT_FRACS.leftF,
+    h: PLOT_FRACS.bottomF - PLOT_FRACS.topF,
+    rotationDeg: 0,
+    anchor: "topLeft",
+    align: "left",
+  });
+  const ptl = anchorToTopLeftWorld({ x: Number(pg.x), y: Number(pg.y), w: Number(pg.w), h: Number(pg.h), anchor: String(pg.anchor ?? "topLeft") } as any);
+  const leftF = ptl.x;
+  const topF = ptl.y;
+  const rightF = leftF + Number(pg.w);
+  const bottomF = topF + Number(pg.h);
+  el.dataset.plotLeftF = String(leftF);
+  el.dataset.plotRightF = String(rightF);
+  el.dataset.plotTopF = String(topF);
+  el.dataset.plotBottomF = String(bottomF);
+  if (plotEl) {
+    plotEl.style.left = `${leftF * 100}%`;
+    plotEl.style.top = `${topF * 100}%`;
+    plotEl.style.width = `${Number(pg.w) * 100}%`;
+    plotEl.style.height = `${Number(pg.h) * 100}%`;
+  }
+
   return layer;
 }
 
@@ -1929,6 +2710,38 @@ function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, dat
   }
 }
 
+function renderSoundCompositeButtons(soundEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .sound-sub-buttons"));
+  const hPx = Number(soundEl.dataset.soundHpx ?? "0");
+  const wPx = Number(soundEl.dataset.soundWpx ?? "0");
+  const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
+  const isGroupEditing = soundEl.dataset.compositeEditing === "1";
+  for (const boxEl of els) {
+    const sid = boxEl.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const h = Number(g.h ?? 0.10);
+    const fontPx = Math.max(12, box.height * h * 0.55);
+    const scale = Math.max(0.6, Math.min(3, fontPx / 16));
+    boxEl.style.setProperty("--control-scale", String(scale));
+    // In group edit, treat buttons as non-editable chrome: visible but disabled.
+    boxEl.style.opacity = isGroupEditing ? "0.35" : "1";
+    boxEl.style.pointerEvents = isGroupEditing ? "none" : "auto";
+    for (const btn of Array.from(boxEl.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
+      const tpl = btn.dataset.template ?? "";
+      const resolved = applyDataBindings(tpl, data);
+      const prev = btn.dataset.rawText ?? "";
+      if (prev !== resolved) {
+        btn.dataset.rawText = resolved;
+        const contentEl = btn.querySelector<HTMLElement>(":scope > .ip-button-content");
+        if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+      }
+    }
+  }
+  // Hide the legacy headerbar when composite buttons are present (avoid duplicates).
+  soundEl.querySelector<HTMLElement>(".sound-header")?.setAttribute("style", "display:none !important");
+}
+
 function layoutSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement) {
   const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
   const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .sound-sub-text"));
@@ -1963,14 +2776,11 @@ function renderSoundCompositeArrows(soundEl: HTMLElement, layer: HTMLElement) {
   const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
   const soundId = layer.dataset.soundId ?? "sound";
 
-  const leftF = 0.08;
-  const rightF = 0.92;
-  const topF = 0.10;
-  const bottomF = 0.90;
-  const ox = leftF * w;
-  const oy = bottomF * h;
-  const xLen = (rightF - leftF) * w;
-  const yLen = (bottomF - topF) * h;
+  const fr = _plotFracsForEl(soundEl);
+  const ox = fr.leftF * w;
+  const oy = fr.bottomF * h;
+  const xLen = (fr.rightF - fr.leftF) * w;
+  const yLen = (fr.bottomF - fr.topF) * h;
   const mapX = (u: number) => ox + u * xLen;
   const mapY = (vUp: number) => oy - vUp * yLen;
   const dataMin = Math.max(1, Math.min(xLen, yLen));
@@ -1984,6 +2794,20 @@ function renderSoundCompositeArrows(soundEl: HTMLElement, layer: HTMLElement) {
     const y1 = mapY(Number(a.y0 ?? 0));
     const x2 = mapX(Number(a.x1 ?? 1));
     const y2 = mapY(Number(a.y1 ?? 1));
+
+    const hit = layer.querySelector<HTMLElement>(`:scope > .sound-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`);
+    if (hit) {
+      const padPx = 24;
+      const minX = Math.min(x1, x2) - padPx;
+      const maxX = Math.max(x1, x2) + padPx;
+      const minY = Math.min(y1, y2) - padPx;
+      const maxY = Math.max(y1, y2) + padPx;
+      hit.style.left = `${(minX / w) * 100}%`;
+      hit.style.top = `${(minY / h) * 100}%`;
+      hit.style.width = `${((maxX - minX) / w) * 100}%`;
+      hit.style.height = `${((maxY - minY) / h) * 100}%`;
+    }
+
     const markerId = `arrowhead-${soundId}-${a.id}`;
     const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
     marker.setAttribute("id", markerId);
@@ -2026,7 +2850,143 @@ function gridSpacingForZoom(zoom: number, baseWorld = 100) {
   return { spacing0, spacing1, t };
 }
 
-type DragMode = "none" | "move" | "resize" | "rotate";
+type DragMode = "none" | "move" | "resize" | "rotate" | "line";
+
+const _cursorSvgCss = (svg: string, hotX: number, hotY: number, fallback: string) => {
+  const encoded = encodeURIComponent(svg).replace(/'/g, "%27").replace(/"/g, "%22");
+  return `url("data:image/svg+xml,${encoded}") ${hotX} ${hotY}, ${fallback}`;
+};
+
+const _clampDeg360 = (deg: number) => {
+  let d = deg % 360;
+  if (d < 0) d += 360;
+  return d;
+};
+
+const _cursorSvgHeader = (w: number, h: number) =>
+  `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}" viewBox="0 0 ${w} ${h}">`;
+
+const _doubleArrowPath = (opts: { headL: number; headW: number }) => `M0 0 L${opts.headL} ${opts.headW / 2} L0 ${opts.headW} Z`;
+
+const resizeCursorCss = (() => {
+  // Custom resize cursor: double-headed arrow. We rotate it so it matches the node's local axis.
+  // 32x32, centered hotspot.
+  const cache = new Map<number, string>();
+  const svgForDeg = (deg: number) => {
+    const d = _clampDeg360(deg);
+    const cx = 16;
+    const cy = 16;
+    const stroke = "rgba(255,255,255,0.92)";
+    const strokeOutline = "rgba(0,0,0,0.65)";
+    const strokeW = 2.9;
+    // Arrow geometry (horizontal base, then rotate).
+    const x0 = 6.5;
+    const x1 = 25.5;
+    const headL = 6.2;
+    const headW = 7.2;
+    const tri = _doubleArrowPath({ headL, headW });
+    return `${_cursorSvgHeader(32, 32)}
+  <g transform="rotate(${d.toFixed(2)} ${cx} ${cy})">
+    <line x1="${x0}" y1="${cy}" x2="${x1}" y2="${cy}" stroke="${strokeOutline}" stroke-width="${strokeW + 1.8}" stroke-linecap="round"/>
+    <line x1="${x0}" y1="${cy}" x2="${x1}" y2="${cy}" stroke="${stroke}" stroke-width="${strokeW}" stroke-linecap="round"/>
+    <g transform="translate(${x0} ${cy}) rotate(180) translate(0 ${-headW / 2})">
+      <path d="${tri}" fill="${strokeOutline}"/>
+      <path d="${tri}" fill="${stroke}" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+    </g>
+    <g transform="translate(${x1} ${cy}) rotate(0) translate(0 ${-headW / 2})">
+      <path d="${tri}" fill="${strokeOutline}"/>
+      <path d="${tri}" fill="${stroke}" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+    </g>
+  </g>
+</svg>`;
+  };
+  return (deg: number) => {
+    const bucket = Math.round(_clampDeg360(deg) / 5) * 5;
+    const cached = cache.get(bucket);
+    if (cached) return cached;
+    const svg = svgForDeg(bucket);
+    const css = _cursorSvgCss(svg, 16, 16, "default");
+    cache.set(bucket, css);
+    return css;
+  };
+})();
+
+const rotationCursorCss = (() => {
+  // Custom cursor (SVG) so the rotation cursor can be rotated with the element.
+  // Shape: a HALF CIRCLE with arrowheads at both ends (arrowheads point left in local cursor coords).
+  const cache = new Map<string, string>();
+  const clampDeg = (deg: number) => {
+    let d = deg % 360;
+    if (d < 0) d += 360;
+    return d;
+  };
+  const svgForDeg = (deg: number, mirrorX: boolean) => {
+    const d = clampDeg(deg);
+    const cx = 16;
+    const cy = 16;
+    const r = 10.5;
+    const stroke = "rgba(255,255,255,0.92)";
+    const strokeOutline = "rgba(0,0,0,0.65)";
+    const strokeW = 2.9;
+    // Match the straight resize cursor heads.
+    const headL = 6.2;
+    const headW = 7.2;
+    const tri = _doubleArrowPath({ headL, headW });
+
+    // Half-circle on the RIGHT side: from bottom -> top using 2 cubic Beziers.
+    // This makes the arrowheads/tangents unambiguous and avoids SVG arc sweep ambiguity.
+    const k = 0.5522847498 * r;
+    const xC = cx;
+    const yTop = cy - r;
+    const yBot = cy + r;
+    const xRight = cx + r;
+
+    const p0 = { x: xC, y: yBot };
+    const c1 = { x: xC + k, y: yBot };
+    const c2 = { x: xRight, y: cy + k };
+    const p1 = { x: xRight, y: cy };
+    const c3 = { x: xRight, y: cy - k };
+    const c4 = { x: xC + k, y: yTop };
+    const p2 = { x: xC, y: yTop };
+
+    // IMPORTANT: only ONE transform attribute; combine rotate+mirror into a single transform string.
+    // (Duplicate attributes break the SVG and the browser falls back to the cursor fallback.)
+    const tf = mirrorX ? `rotate(${d.toFixed(2)} ${cx} ${cy}) translate(32 0) scale(-1 1)` : `rotate(${d.toFixed(2)} ${cx} ${cy})`;
+    return `${_cursorSvgHeader(32, 32)}
+  <g transform="${tf}">
+    <path d="M ${p0.x.toFixed(2)} ${p0.y.toFixed(2)}
+             C ${c1.x.toFixed(2)} ${c1.y.toFixed(2)} ${c2.x.toFixed(2)} ${c2.y.toFixed(2)} ${p1.x.toFixed(2)} ${p1.y.toFixed(2)}
+             C ${c3.x.toFixed(2)} ${c3.y.toFixed(2)} ${c4.x.toFixed(2)} ${c4.y.toFixed(2)} ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}"
+          fill="none" stroke="${strokeOutline}" stroke-width="${strokeW + 1.8}" stroke-linecap="round"/>
+    <path d="M ${p0.x.toFixed(2)} ${p0.y.toFixed(2)}
+             C ${c1.x.toFixed(2)} ${c1.y.toFixed(2)} ${c2.x.toFixed(2)} ${c2.y.toFixed(2)} ${p1.x.toFixed(2)} ${p1.y.toFixed(2)}
+             C ${c3.x.toFixed(2)} ${c3.y.toFixed(2)} ${c4.x.toFixed(2)} ${c4.y.toFixed(2)} ${p2.x.toFixed(2)} ${p2.y.toFixed(2)}"
+          fill="none" stroke="${stroke}" stroke-width="${strokeW}" stroke-linecap="round"/>
+
+    <!-- Arrowheads at both ends, pointing LEFT in local cursor coords -->
+    <g transform="translate(${p0.x.toFixed(2)} ${p0.y.toFixed(2)}) rotate(180) translate(0 ${-(headW / 2).toFixed(2)})">
+      <path d="${tri}" fill="${strokeOutline}"/>
+      <path d="${tri}" fill="${stroke}" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+    </g>
+    <g transform="translate(${p2.x.toFixed(2)} ${p2.y.toFixed(2)}) rotate(180) translate(0 ${-(headW / 2).toFixed(2)})">
+      <path d="${tri}" fill="${strokeOutline}"/>
+      <path d="${tri}" fill="${stroke}" transform="translate(0 0) scale(0.92) translate(0.2 0.3)"/>
+    </g>
+  </g>
+</svg>`;
+  };
+  return (deg: number, opts?: { mirrorX?: boolean }) => {
+    const mirrorX = !!opts?.mirrorX;
+    const bucket = Math.round(clampDeg(deg) / 5) * 5;
+    const key = `${bucket}:${mirrorX ? "mx" : "n"}`;
+    const cached = cache.get(key);
+    if (cached) return cached;
+    const svg = svgForDeg(bucket, mirrorX);
+    const css = _cursorSvgCss(svg, 16, 16, "grab");
+    cache.set(key, css);
+    return css;
+  };
+})();
 
 function getAppMode(): "edit" | "live" {
   const raw =
@@ -2036,6 +2996,18 @@ function getAppMode(): "edit" | "live" {
   return raw.toLowerCase() === "live" ? "live" : "edit";
 }
 
+function ipDebugEnabled(flag: string) {
+  try {
+    return (
+      (localStorage.getItem(flag) === "1" ||
+        (window as any)[flag] === true ||
+        String((window as any)[flag] ?? "") === "1") ?? false
+    );
+  } catch {
+    return false;
+  }
+}
+
 function ensureHandles(el: HTMLElement) {
   // Safety: never show transform UI in Live mode.
   if (getAppMode() !== "edit") {
@@ -2043,6 +3015,15 @@ function ensureHandles(el: HTMLElement) {
     return null;
   }
   let handles = el.querySelector<HTMLDivElement>(":scope > .handles");
+
+  // Special-case: arrows/lines are edited via control points, not bounding-box resize/rotate.
+  const isSegment = el.classList.contains("node-arrow") || el.classList.contains("node-line");
+  if (isSegment) {
+    // Simplest UX: no visible handle points ("rings").
+    // Endpoints are draggable by proximity (see stage pointerdown handler).
+    el.querySelector(":scope > .handles")?.remove();
+    return null;
+  }
 
   const normalizeAnchor = (a: string | undefined) => {
     if (!a) return "topLeft";
@@ -2061,12 +3042,97 @@ function ensureHandles(el: HTMLElement) {
     }
   };
 
+  // Rotate cursor directions with the node rotation (fixes e.g. rotated y-label edge cursors).
+  const parseRotateDeg = (cssTransform: string | null | undefined) => {
+    const s = String(cssTransform ?? "");
+    const m = s.match(/rotate\(\s*([\-0-9.]+)\s*deg\s*\)/i);
+    if (!m) return 0;
+    const v = Number(m[1]);
+    return Number.isFinite(v) ? v : 0;
+  };
+  const normDeg = (deg: number) => {
+    let d = deg % 360;
+    if (d < 0) d += 360;
+    return d;
+  };
+  const rotVec = (x: number, y: number, deg: number) => {
+    const a = (normDeg(deg) * Math.PI) / 180;
+    const cos = Math.cos(a);
+    const sin = Math.sin(a);
+    // Coordinate system: x right, y down. Positive deg is clockwise (CSS rotate()).
+    return { x: x * cos - y * sin, y: x * sin + y * cos };
+  };
+  const cursorForHandleRotated = (handle: string, rotDeg: number) => {
+    if (!handle) return "";
+    // Note: SVG/CSS rotation is clockwise in screen coords (y down).
+    // The UX spec here is in the usual math convention (CCW positive),
+    // so we flip the sign for these corner offsets.
+    if (handle === "rot-tr") return rotationCursorCss(rotDeg - 45);
+    // Top-left should be counter-clockwise vs top-right in the user's convention
+    // (i.e. -90° in SVG/CSS coords relative to top-right), so use -135° total.
+    // IMPORTANT: do NOT mirror here; mirroring flips the perceived direction.
+    if (handle === "rot-tl") return rotationCursorCss(rotDeg - 135);
+    if (handle === "rot" || handle.startsWith("rot-")) return rotationCursorCss(rotDeg);
+    if (handle === "n" || handle === "s" || handle === "e" || handle === "w") {
+      // Local axis angle (deg) + node rotation.
+      // Our double-arrow cursor is drawn horizontally by default (0deg).
+      const axis = handle === "n" || handle === "s" ? 90 : 0;
+      return resizeCursorCss(rotDeg + axis);
+    }
+    if (handle === "nw" || handle === "ne" || handle === "sw" || handle === "se") {
+      // Diagonal axis in local space, then rotate with the node.
+      // se/nw => 45deg; sw/ne => 135deg (in screen coords with y down).
+      const axis = handle === "se" || handle === "nw" ? 45 : 135;
+      return resizeCursorCss(rotDeg + axis);
+    }
+    return "";
+  };
+  const updateHandleCursors = (root: HTMLElement) => {
+    const rotDeg = parseRotateDeg(el.style.transform);
+    for (const h of Array.from(root.querySelectorAll<HTMLElement>(".handle"))) {
+      const name = String(h.dataset.handle ?? "");
+      const c = cursorForHandleRotated(name, rotDeg);
+      if (c) h.style.setProperty("cursor", c, "important");
+    }
+  };
+
   if (handles) {
-    updateAnchorDots(handles);
+    if (!isSegment) {
+      updateAnchorDots(handles);
+      updateHandleCursors(handles);
+      return handles;
+    }
+    // Update segment control point positions from dataset (set by renderer update).
+    const fx = Number(el.dataset.fromX ?? "0");
+    const fy = Number(el.dataset.fromY ?? "0.5");
+    const tx = Number(el.dataset.toX ?? "1");
+    const ty = Number(el.dataset.toY ?? "0.5");
+    const mx = (fx + tx) / 2;
+    const my = (fy + ty) / 2;
+    const p1 = handles.querySelector<HTMLElement>(':scope > .handle.point[data-handle="p1"]');
+    const p2 = handles.querySelector<HTMLElement>(':scope > .handle.point[data-handle="p2"]');
+    const pm = handles.querySelector<HTMLElement>(':scope > .handle.point[data-handle="mid"]');
+    if (p1) {
+      p1.style.left = `${fx * 100}%`;
+      p1.style.top = `${fy * 100}%`;
+    }
+    if (p2) {
+      p2.style.left = `${tx * 100}%`;
+      p2.style.top = `${ty * 100}%`;
+    }
+    if (pm) {
+      pm.style.left = `${mx * 100}%`;
+      pm.style.top = `${my * 100}%`;
+    }
     return handles;
   }
   handles = document.createElement("div");
-  handles.className = "handles";
+  handles.className = isSegment ? "handles handles-line" : "handles";
+
+  if (isSegment) {
+    // unreachable due to early return above; keep for safety
+    return null;
+  }
   const mk = (name: string, left: string, top: string, cls = "") => {
     const h = document.createElement("div");
     h.className = `handle ${cls}`.trim();
@@ -2077,12 +3143,17 @@ function ensureHandles(el: HTMLElement) {
     return h;
   };
   // Hover regions (in the node's local coordinate system; they rotate with the node):
-  // - strips located 5..20px outside each edge for resize
-  // - squares located 5..20px outside corners:
-  //   - top corners: rotate
-  //   - bottom corners: scale (diagonal)
-  const px15 = "15px";
-  const px20 = "20px";
+  // - anchor dots: "finger" (pointer) ONLY when directly over the dot element
+  // - resize/rotate: within 20px on either side of the selection outline (inside + outside)
+  //
+  // This is implemented as invisible hit-regions centered on the outline:
+  // - edges: a 40px thick band, positioned -20..+20 around each edge
+  // - corners: a 40x40 square, centered on each corner
+  const HIT_HALF_PX = 20;
+  const pxHalf = `${HIT_HALF_PX}px`;
+  const pxBand = `${HIT_HALF_PX * 2}px`;
+  // Exclude corner squares so corners always win (uniform scale/rotate).
+  const edgeLen = `calc(100% - (${pxHalf} * 2))`;
   const mkStrip = (name: string, left: string, top: string, w: string, h: string, cls = "") => {
     const d = document.createElement("div");
     d.className = `handle ${cls}`.trim();
@@ -2100,24 +3171,48 @@ function ensureHandles(el: HTMLElement) {
     d.dataset.handle = name;
     d.style.left = left;
     d.style.top = top;
-    d.style.width = px15;
-    d.style.height = px15;
+    d.style.width = pxBand;
+    d.style.height = pxBand;
     d.style.transform = "none";
+    return d;
+  };
+  const mkMid = (name: string, left: string, top: string, cls = "") => {
+    const d = document.createElement("div");
+    d.className = `handle ${cls}`.trim();
+    d.dataset.handle = name;
+    d.style.left = left;
+    d.style.top = top;
+    d.style.width = pxBand;
+    d.style.height = pxBand;
+    d.style.transform = "translate(-50%, -50%)";
     return d;
   };
 
   handles.append(
-    // edge resize strips (outside)
-    mkStrip("n", "0", `-${px20}`, "100%", px15, "edge edge-n"),
-    mkStrip("e", "calc(100% + 5px)", "0", px15, "100%", "edge edge-e"),
-    mkStrip("s", "0", "calc(100% + 5px)", "100%", px15, "edge edge-s"),
-    mkStrip("w", `-${px20}`, "0", px15, "100%", "edge edge-w"),
+    // edge resize strips (centered on the outline: -20..+20 px)
+    mkStrip("n", pxHalf, `-${pxHalf}`, edgeLen, pxBand, "edge edge-n"),
+    mkStrip("e", `calc(100% - ${pxHalf})`, pxHalf, pxBand, edgeLen, "edge edge-e"),
+    mkStrip("s", pxHalf, `calc(100% - ${pxHalf})`, edgeLen, pxBand, "edge edge-s"),
+    mkStrip("w", `-${pxHalf}`, pxHalf, pxBand, edgeLen, "edge edge-w"),
 
-    // corner squares (outside)
-    mkCorner("rot-tl", `-${px20}`, `-${px20}`, "corner rot rot-tl"),
-    mkCorner("rot-tr", "calc(100% + 5px)", `-${px20}`, "corner rot rot-tr"),
-    mkCorner("sw", `-${px20}`, "calc(100% + 5px)", "corner scale scale-sw"),
-    mkCorner("se", "calc(100% + 5px)", "calc(100% + 5px)", "corner scale scale-se")
+    // corner squares (centered on each corner: -20..+20 px)
+    mkCorner("rot-tl", `-${pxHalf}`, `-${pxHalf}`, "corner rot rot-tl"),
+    mkCorner("rot-tr", `calc(100% - ${pxHalf})`, `-${pxHalf}`, "corner rot rot-tr"),
+    mkCorner("sw", `-${pxHalf}`, `calc(100% - ${pxHalf})`, "corner scale scale-sw"),
+    mkCorner("se", `calc(100% - ${pxHalf})`, `calc(100% - ${pxHalf})`, "corner scale scale-se")
+  );
+
+  // Edge-center hit zones (same 20px rule): these ensure that even for very thin boxes,
+  // hovering near the *middle* of an edge yields the horizontal/vertical resize cursor,
+  // instead of being dominated by overlapping corner hit zones.
+  //
+  // They intentionally reuse the same handles ("n/e/s/w") so pointerdown resize behavior is unchanged.
+  // Appended AFTER corners so they win in stacking order.
+  handles.append(
+    mkMid("n", "50%", `-${pxHalf}`, "edge edge-n"),
+    mkMid("s", "50%", `calc(100% - ${pxHalf})`, "edge edge-s"),
+    mkMid("w", `-${pxHalf}`, "50%", "edge edge-w"),
+    mkMid("e", `calc(100% - ${pxHalf})`, "50%", "edge edge-e")
   );
 
   const mkAnchor = (anchor: string, left: string, top: string) => {
@@ -2143,6 +3238,7 @@ function ensureHandles(el: HTMLElement) {
 
   el.appendChild(handles);
   updateAnchorDots(handles);
+  updateHandleCursors(handles);
   return handles;
 }
 
@@ -2210,16 +3306,35 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const selected = new Set<string>();
   let lastContextWorld: { x: number; y: number } | null = null;
   let activeViewId: string = stage.dataset.viewId || "home";
+  // Used for paste placement (Ctrl+V): keep last pointer position in client coords.
+  // Stored on window so the key handler can access it without threading state through every closure.
+  (window as any).__ip_lastMouseX = (window as any).__ip_lastMouseX ?? null;
+  (window as any).__ip_lastMouseY = (window as any).__ip_lastMouseY ?? null;
+  stage.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (getAppMode() !== "edit") return;
+      (window as any).__ip_lastMouseX = ev.clientX;
+      (window as any).__ip_lastMouseY = ev.clientY;
+    },
+    { passive: true }
+  );
 
   // Simple top toolbox (edit mode): pick what to place.
-  let tool: "select" | "text" | "bullets" | "arrow" = "select";
-  let arrowDraft:
+  let tool: "select" | "text" | "bullets" | "arrow" | "line" = "select";
+  let segmentDraft:
     | null
     | {
+        // Start/end are in the chosen model space (world or screen).
         start: { x: number; y: number };
         space: "world" | "screen";
-        previewEl: HTMLElement;
+        // For preview we render in screen pixels (overlay space), regardless of model space.
+        startScreen: { x: number; y: number };
+        previewSvg: SVGSVGElement;
         lineEl: SVGLineElement;
+        startDot: SVGCircleElement;
+        endDot: SVGCircleElement;
+        kind: "arrow" | "line";
       } = null;
   const toolbox = document.createElement("div");
   toolbox.className = "edit-toolbox";
@@ -2281,13 +3396,17 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     arrow: `<svg width="22" height="18" viewBox="0 0 22 18" fill="none" aria-hidden="true">
       <path d="M2 9h14" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
       <path d="M12 4l6 5-6 5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`,
+    line: `<svg width="22" height="18" viewBox="0 0 22 18" fill="none" aria-hidden="true">
+      <path d="M2 9h18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
     </svg>`
   };
   toolbox.append(
     mkToolBtn("select", "Select", ICON.select),
     mkToolBtn("text", "Text", ICON.text),
     mkToolBtn("bullets", "Bullets", ICON.bullets),
-    mkToolBtn("arrow", "Arrow", ICON.arrow)
+    mkToolBtn("arrow", "Arrow", ICON.arrow),
+    mkToolBtn("line", "Line", ICON.line)
   );
   // Default active button
   (toolbox.querySelector<HTMLButtonElement>("button") as any)?.click?.();
@@ -2372,26 +3491,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
   };
 
-  // Context menu (edit mode): add nodes / group selection.
-  const menu = document.createElement("div");
-  menu.className = "ctx-menu";
-  menu.style.position = "fixed";
-  menu.style.zIndex = "99999";
-  menu.style.minWidth = "180px";
-  menu.style.padding = "6px";
-  menu.style.borderRadius = "10px";
-  menu.style.border = "1px solid rgba(255,255,255,0.16)";
-  menu.style.background = "rgba(15,17,24,0.96)";
-  menu.style.boxShadow = "0 12px 40px rgba(0,0,0,0.45)";
-  menu.style.display = "none";
-  const hideMenu = () => (menu.style.display = "none");
-  document.body.append(menu);
-  window.addEventListener("pointerdown", (ev) => {
-    if (menu.style.display !== "none" && !menu.contains(ev.target as any)) hideMenu();
-  });
-  window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") hideMenu();
-  });
+  // Context menu removed (toolbar replaces it).
 
   const addTextAt = async (
     pos: { x: number; y: number },
@@ -2551,17 +3651,29 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const id = nextId("arrow");
     const space = opts?.space === "screen" ? "screen" : "world";
 
-    const minSize = 10;
-    const x0 = Math.min(from.x, to.x);
-    const y0 = Math.min(from.y, to.y);
-    const w0 = Math.max(minSize, Math.abs(to.x - from.x));
-    const h0 = Math.max(minSize, Math.abs(to.y - from.y));
+    // Fit a bbox around the two clicked points, with padding, so the clicked points are
+    // the true endpoints even when we need a minimum bbox thickness (avoids the "always diagonal" feel).
+    const wPx = 4; // default stroke px
+    const cam = engine.getCamera();
+    const scr = engine.getScreen();
+    const padPx = 24; // visual padding so endpoints aren't stuck on bbox edges
+    const pad = space === "world" ? padPx / Math.max(1e-9, cam.zoom) : padPx;
+    const minSize = space === "world" ? 10 : 10; // in the same units as from/to
+
+    const cx = (from.x + to.x) / 2;
+    const cy = (from.y + to.y) / 2;
+    const dx = Math.abs(to.x - from.x);
+    const dy = Math.abs(to.y - from.y);
+    const w0 = Math.max(minSize, dx + 2 * pad);
+    const h0 = Math.max(minSize, dy + 2 * pad);
+    const x0 = cx - w0 / 2;
+    const y0 = cy - h0 / 2;
+
     const fx = (from.x - x0) / w0;
     const fy = (from.y - y0) / h0;
     const tx = (to.x - x0) / w0;
     const ty = (to.y - y0) / h0;
 
-    const scr = engine.getScreen();
     const xN = space === "screen" ? x0 / Math.max(1, scr.w) : x0;
     const yN = space === "screen" ? y0 / Math.max(1, scr.h) : y0;
     const wN = space === "screen" ? w0 / Math.max(1, scr.w) : w0;
@@ -2574,7 +3686,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       from: { x: fx, y: fy },
       to: { x: tx, y: ty },
       color: "white",
-      width: 0.02,
+      width: wPx,
       transform: { x: xN, y: yN, w: wN, h: hN, anchor: "topLeft", rotationDeg: 0 }
     };
     model.nodes.push(node);
@@ -2596,12 +3708,174 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     await commit(before);
   };
 
+  const addLineFromTo = async (
+    from: { x: number; y: number },
+    to: { x: number; y: number },
+    opts?: { space?: "world" | "screen" }
+  ) => {
+    const model = engine.getModel();
+    if (!model) return;
+    const before = cloneModel(model);
+    const id = nextId("line");
+    const space = opts?.space === "screen" ? "screen" : "world";
+
+    const wPx = 4; // default stroke px
+    const cam = engine.getCamera();
+    const scr = engine.getScreen();
+    const padPx = 24;
+    const pad = space === "world" ? padPx / Math.max(1e-9, cam.zoom) : padPx;
+    const minSize = space === "world" ? 10 : 10;
+
+    const cx = (from.x + to.x) / 2;
+    const cy = (from.y + to.y) / 2;
+    const dx = Math.abs(to.x - from.x);
+    const dy = Math.abs(to.y - from.y);
+    const w0 = Math.max(minSize, dx + 2 * pad);
+    const h0 = Math.max(minSize, dy + 2 * pad);
+    const x0 = cx - w0 / 2;
+    const y0 = cy - h0 / 2;
+
+    const fx = (from.x - x0) / w0;
+    const fy = (from.y - y0) / h0;
+    const tx = (to.x - x0) / w0;
+    const ty = (to.y - y0) / h0;
+
+    const xN = space === "screen" ? x0 / Math.max(1, scr.w) : x0;
+    const yN = space === "screen" ? y0 / Math.max(1, scr.h) : y0;
+    const wN = space === "screen" ? w0 / Math.max(1, scr.w) : w0;
+    const hN = space === "screen" ? h0 / Math.max(1, scr.h) : h0;
+
+    const node: any = {
+      id,
+      type: "line",
+      space,
+      from: { x: fx, y: fy },
+      to: { x: tx, y: ty },
+      color: "white",
+      width: wPx,
+      transform: { x: xN, y: yN, w: wN, h: hN, anchor: "topLeft", rotationDeg: 0 }
+    };
+    model.nodes.push(node);
+
+    if (space === "screen") {
+      for (const v of model.views) {
+        if (!v.show.includes(id)) v.show.push(id);
+      }
+    } else {
+      const viewId = getActiveViewId();
+      const view = model.views.find((v) => v.id === viewId) ?? model.views[0];
+      if (view && !view.show.includes(id)) view.show.push(id);
+    }
+    engine.setModel(cloneModel(model));
+    hydrateTextMath(engine, model);
+    selected.clear();
+    selected.add(id);
+    applySelection();
+    await commit(before);
+  };
+
+  const getOverlayEl = () =>
+    stage.querySelector<HTMLElement>(".overlay") ?? stage;
+
+  const snapWorldPoint = (p: { x: number; y: number }, cam: any) => {
+    const { spacing0, spacing1, t } = gridSpacingForZoom(Number(cam?.zoom ?? 1));
+    const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
+    const snap = (v: number) => Math.round(v / snapSpacing) * snapSpacing;
+    return { x: snap(p.x), y: snap(p.y) };
+  };
+
+  const makeSegmentPreview = (kind: "arrow" | "line", overlay: HTMLElement) => {
+    const WHITE = "rgba(255,255,255,0.92)";
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.style.position = "absolute";
+    svg.style.inset = "0";
+    svg.style.width = "100%";
+    svg.style.height = "100%";
+    svg.style.overflow = "visible";
+    svg.style.pointerEvents = "none";
+    // Keep preview coordinates 1:1 with overlay pixels (no aspect letterboxing).
+    svg.setAttribute("preserveAspectRatio", "none");
+
+    const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+    if (kind === "arrow") {
+      const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+      marker.setAttribute("id", "arrowhead-preview");
+      // Match engine arrow sizing:
+      // - head height == 4 * strokeWidth  (stroke=4 => 16px)
+      // - head length == 5 * strokeWidth  (stroke=4 => 20px)
+      marker.setAttribute("markerUnits", "strokeWidth");
+      marker.setAttribute("markerWidth", "5");
+      marker.setAttribute("markerHeight", "4");
+      marker.setAttribute("refX", "5");
+      marker.setAttribute("refY", "2");
+      marker.setAttribute("orient", "auto");
+      const pth = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      pth.setAttribute("d", "M 0 0 L 5 2 L 0 4 z");
+      pth.setAttribute("fill", WHITE);
+      marker.appendChild(pth);
+      defs.appendChild(marker);
+    }
+    svg.appendChild(defs);
+
+    const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    ln.setAttribute("x1", "0");
+    ln.setAttribute("y1", "0");
+    ln.setAttribute("x2", "0");
+    ln.setAttribute("y2", "0");
+    ln.setAttribute("stroke", WHITE);
+    ln.setAttribute("stroke-width", "4");
+    ln.setAttribute("stroke-linecap", "round");
+    ln.setAttribute("stroke-dasharray", "10 10");
+    ln.setAttribute("vector-effect", "non-scaling-stroke");
+    if (kind === "arrow") ln.setAttribute("marker-end", "url(#arrowhead-preview)");
+    svg.appendChild(ln);
+
+    const mkDot = () => {
+      const c = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      c.setAttribute("cx", "0");
+      c.setAttribute("cy", "0");
+      c.setAttribute("r", "6");
+      c.setAttribute("fill", "rgba(15,17,24,0.35)");
+      c.setAttribute("stroke", WHITE);
+      c.setAttribute("stroke-width", "2");
+      c.setAttribute("vector-effect", "non-scaling-stroke");
+      svg.appendChild(c);
+      return c;
+    };
+    const startDot = mkDot();
+    const endDot = mkDot();
+
+    // Keep viewBox in sync with overlay pixels to avoid angle distortion.
+    const syncViewBox = () => {
+      const w = Math.max(1, overlay.clientWidth);
+      const h = Math.max(1, overlay.clientHeight);
+      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    };
+    syncViewBox();
+
+    overlay.appendChild(svg);
+    return { svg, lineEl: ln, startDot, endDot, syncViewBox };
+  };
+
+  const updateSegmentPreview = (draft: NonNullable<typeof segmentDraft>, endScreen: { x: number; y: number }) => {
+    draft.lineEl.setAttribute("x1", String(draft.startScreen.x));
+    draft.lineEl.setAttribute("y1", String(draft.startScreen.y));
+    draft.lineEl.setAttribute("x2", String(endScreen.x));
+    draft.lineEl.setAttribute("y2", String(endScreen.y));
+    draft.startDot.setAttribute("cx", String(draft.startScreen.x));
+    draft.startDot.setAttribute("cy", String(draft.startScreen.y));
+    draft.endDot.setAttribute("cx", String(endScreen.x));
+    draft.endDot.setAttribute("cy", String(endScreen.y));
+  };
+
   // Placement tool handler (capture) so it runs before selection/pan handlers.
   stage.addEventListener(
     "pointerdown",
     (ev) => {
       if (getAppMode() !== "edit") return;
       if (tool === "select") return;
+      // Only left click should start/commit drawing. Right click cancels (handled by contextmenu).
+      if (ev.button !== 0) return;
       const t = ev.target as HTMLElement;
       // Don’t interfere with normal manipulation when clicking nodes/handles/UI.
       if (
@@ -2609,7 +3883,6 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         t.closest(".node") ||
         t.closest(".handles") ||
         t.closest(".modal") ||
-        t.closest(".ctx-menu") ||
         t.closest(".mode-toggle")
       )
         return;
@@ -2619,7 +3892,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const scr = engine.getScreen();
       const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
       const space: "world" | "screen" = screenEditMode ? "screen" : "world";
-      const pos = space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
+      let pos = space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
 
       if (tool === "text") {
         void addTextAt(pos, { space });
@@ -2633,57 +3906,48 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         (ev as any).stopImmediatePropagation?.();
         return;
       }
-      if (tool === "arrow") {
-        // Create a lightweight preview overlay (not part of the model).
-        const preview = document.createElement("div");
-        preview.style.position = "absolute";
-        preview.style.left = `${pos.x}px`;
-        preview.style.top = `${pos.y}px`;
-        preview.style.width = "1px";
-        preview.style.height = "1px";
-        preview.style.pointerEvents = "none";
-        preview.style.overflow = "visible";
+      if (tool === "arrow" || tool === "line") {
+        const kind: "arrow" | "line" = tool === "line" ? "line" : "arrow";
+        const overlay = getOverlayEl();
 
-        const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-        svg.setAttribute("width", "1");
-        svg.setAttribute("height", "1");
-        svg.setAttribute("viewBox", "0 0 100 100");
-        (svg.style as any).overflow = "visible";
+        // Snap point placement to grid ONLY while Shift is held and only in world space.
+        if (space === "world" && ev.shiftKey) pos = snapWorldPoint(pos, cam as any);
 
-        const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-        const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-        marker.setAttribute("id", "arrowhead-preview");
-        marker.setAttribute("markerWidth", "10");
-        marker.setAttribute("markerHeight", "10");
-        marker.setAttribute("refX", "10");
-        marker.setAttribute("refY", "5");
-        marker.setAttribute("orient", "auto");
-        marker.setAttribute("markerUnits", "strokeWidth");
-        const pth = document.createElementNS("http://www.w3.org/2000/svg", "path");
-        pth.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
-        pth.setAttribute("fill", "white");
-        marker.appendChild(pth);
-        defs.appendChild(marker);
-        svg.appendChild(defs);
+        const posScreen = space === "screen" ? pos : worldToScreen(pos, cam as any, scr as any);
 
-        const ln = document.createElementNS("http://www.w3.org/2000/svg", "line");
-        ln.setAttribute("x1", "0");
-        ln.setAttribute("y1", "0");
-        ln.setAttribute("x2", "100");
-        ln.setAttribute("y2", "0");
-        ln.setAttribute("stroke", "white");
-        ln.setAttribute("stroke-width", "2");
-        ln.setAttribute("stroke-linecap", "round");
-        ln.setAttribute("marker-end", "url(#arrowhead-preview)");
-        svg.appendChild(ln);
-
-        preview.appendChild(svg);
-        // Use overlay for consistent positioning.
-        const overlay = engine.getNodeElement("__nonexistent__")?.parentElement ?? stage.querySelector<HTMLElement>(".overlay") ?? stage;
-        overlay.appendChild(preview);
-
-        arrowDraft = { start: pos, space, previewEl: preview, lineEl: ln };
-        (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+        if (!segmentDraft) {
+          // First click: set the base anchor and start showing dashed hover preview.
+          const { svg, lineEl, startDot, endDot, syncViewBox } = makeSegmentPreview(kind, overlay);
+          segmentDraft = {
+            start: pos,
+            startScreen: posScreen,
+            space,
+            previewSvg: svg,
+            lineEl,
+            startDot,
+            endDot,
+            kind
+          };
+          syncViewBox();
+          updateSegmentPreview(segmentDraft, posScreen);
+        } else {
+          // Second click: commit node to the model and remove preview.
+          if (segmentDraft.kind !== kind || segmentDraft.space !== space) {
+            // If the user switched tool/space mid-draft, cancel and restart cleanly.
+            segmentDraft.previewSvg.remove();
+            segmentDraft = null;
+            const { svg, lineEl, startDot, endDot, syncViewBox } = makeSegmentPreview(kind, overlay);
+            segmentDraft = { start: pos, startScreen: posScreen, space, previewSvg: svg, lineEl, startDot, endDot, kind };
+            syncViewBox();
+            updateSegmentPreview(segmentDraft, posScreen);
+          } else {
+            const start = segmentDraft.start;
+            segmentDraft.previewSvg.remove();
+            segmentDraft = null;
+            if (kind === "line") void addLineFromTo(start, pos, { space });
+            else void addArrowFromTo(start, pos, { space });
+          }
+        }
         ev.preventDefault();
         (ev as any).stopImmediatePropagation?.();
       }
@@ -2694,42 +3958,49 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   stage.addEventListener(
     "pointermove",
     (ev) => {
-      if (!arrowDraft) return;
+      if (!segmentDraft) return;
       const r = stage.getBoundingClientRect();
       const cam = engine.getCamera();
       const scr = engine.getScreen();
       const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
-      const pos = arrowDraft.space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
-      const dx = pos.x - arrowDraft.start.x;
-      const dy = pos.y - arrowDraft.start.y;
-      const len = Math.max(1, Math.hypot(dx, dy));
-      const ux = (dx / len) * 100;
-      const uy = (dy / len) * 100;
-      arrowDraft.lineEl.setAttribute("x2", String(ux));
-      arrowDraft.lineEl.setAttribute("y2", String(uy));
+      let pos = segmentDraft.space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
+      if (segmentDraft.space === "world" && ev.shiftKey) pos = snapWorldPoint(pos, cam as any);
+      const posScreen = segmentDraft.space === "screen" ? pos : worldToScreen(pos, cam as any, scr as any);
+      // Keep preview stroke matching final canvas stroke scaling (world space scales with zoom).
+      const z = segmentDraft.space === "world" ? Number(cam.zoom ?? 1) : 1;
+      const previewStroke = 4 * z;
+      segmentDraft.lineEl.setAttribute("stroke-width", String(previewStroke));
+      segmentDraft.lineEl.setAttribute("stroke-dasharray", `${10 * z} ${10 * z}`);
+      // Keep viewBox stable with overlay resizing.
+      const overlay = getOverlayEl();
+      const w = Math.max(1, overlay.clientWidth);
+      const h = Math.max(1, overlay.clientHeight);
+      segmentDraft.previewSvg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      updateSegmentPreview(segmentDraft, posScreen);
     },
     { capture: true }
   );
 
-  stage.addEventListener(
-    "pointerup",
-    (ev) => {
-      if (!arrowDraft) return;
-      const r = stage.getBoundingClientRect();
-      const cam = engine.getCamera();
-      const scr = engine.getScreen();
-      const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
-      const end = arrowDraft.space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
-      const start = arrowDraft.start;
-      arrowDraft.previewEl.remove();
-      const space = arrowDraft.space;
-      arrowDraft = null;
-      void addArrowFromTo(start, end, { space });
-      ev.preventDefault();
-      (ev as any).stopImmediatePropagation?.();
-    },
-    { capture: true }
-  );
+  // Cancel draft on Escape (keep editor responsive).
+  window.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if (segmentDraft) {
+      segmentDraft.previewSvg.remove();
+      segmentDraft = null;
+    }
+  });
+
+  // Right click: cancel any in-progress preview placement and clear selection.
+  // (Toolbar replaces the right-click context menu.)
+  stage.addEventListener("contextmenu", (ev) => {
+    if (getAppMode() !== "edit") return;
+    ev.preventDefault();
+    if (segmentDraft) {
+      segmentDraft.previewSvg.remove();
+      segmentDraft = null;
+    }
+    clearSelection();
+  });
 
   const addImageAt = async (
     pos: { x: number; y: number },
@@ -2869,106 +4140,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     await commit(before);
   };
 
-  stage.addEventListener("contextmenu", (ev) => {
-    const mode = (document.querySelector<HTMLElement>(".mode-toggle")?.dataset.mode ?? "edit").toLowerCase();
-    if (mode !== "edit") return;
-    ev.preventDefault();
-
-    activeViewId = getActiveViewId();
-
-    const r = stage.getBoundingClientRect();
-    const cam = engine.getCamera();
-    const scr = engine.getScreen();
-    if (screenEditMode) {
-      lastContextScreen = { x: ev.clientX - r.left, y: ev.clientY - r.top };
-      lastContextWorld = null;
-    } else {
-      lastContextWorld = screenToWorld({ x: ev.clientX - r.left, y: ev.clientY - r.top }, cam as any, scr as any);
-      lastContextScreen = null;
-    }
-
-    const target = ev.target as HTMLElement;
-    const nodeEl = target.closest<HTMLElement>(".node");
-    if (nodeEl?.dataset.nodeId) {
-      const id = resolveSelectableId(nodeEl.dataset.nodeId);
-      if (!selected.has(id)) {
-        selected.clear();
-        selected.add(id);
-        applySelection();
-      }
-    }
-
-    menu.replaceChildren();
-    const mkItem = (label: string, enabled: boolean, onClick: () => Promise<void> | void) => {
-      const b = document.createElement("button");
-      b.type = "button";
-      b.textContent = label;
-      b.style.width = "100%";
-      b.style.textAlign = "left";
-      b.style.padding = "10px 10px";
-      b.style.border = "0";
-      b.style.borderRadius = "8px";
-      b.style.background = enabled ? "transparent" : "rgba(255,255,255,0.06)";
-      b.style.color = enabled ? "rgba(255,255,255,0.92)" : "rgba(255,255,255,0.40)";
-      b.style.cursor = enabled ? "pointer" : "not-allowed";
-      b.addEventListener("click", async () => {
-        if (!enabled) return;
-        hideMenu();
-        await onClick();
-      });
-      b.addEventListener("pointerenter", () => {
-        if (!enabled) return;
-        b.style.background = "rgba(255,255,255,0.08)";
-      });
-      b.addEventListener("pointerleave", () => {
-        b.style.background = enabled ? "transparent" : "rgba(255,255,255,0.06)";
-      });
-      return b;
-    };
-
-    const canAdd = screenEditMode ? !!lastContextScreen : !!lastContextWorld;
-
-    menu.append(
-      mkItem(
-        "Add text",
-        canAdd,
-        () =>
-          addTextAt(
-            (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
-            { space: screenEditMode ? "screen" : "world" }
-          )
-      ),
-      mkItem(
-        "Add bullets",
-        canAdd,
-        () =>
-          addBulletsAt(
-            (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
-            { space: screenEditMode ? "screen" : "world" }
-          )
-      ),
-      mkItem(
-        "Add table",
-        canAdd,
-        () =>
-          addTableAt(
-            (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
-            { space: screenEditMode ? "screen" : "world" }
-          )
-      ),
-      mkItem("Add image…", canAdd, async () => {
-        (window as any).__ip_pickImage?.(
-          (screenEditMode ? lastContextScreen : lastContextWorld) || { x: 0, y: 0 },
-          screenEditMode ? "screen" : "world"
-        );
-      }),
-      mkItem("Group selection", selected.size >= 2, () => groupSelection())
-    );
-
-    menu.style.left = `${ev.clientX}px`;
-    menu.style.top = `${ev.clientY}px`;
-    menu.style.display = "block";
-  });
+  // (context menu removed)
 
   // Drag-and-drop image upload (edit mode)
   stage.addEventListener("dragover", (ev) => {
@@ -3005,6 +4177,27 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   let startNodesById: Record<string, any> | null = null;
   let startAngleRad = 0;
   let startRotationDeg = 0;
+  // For composite-heavy nodes (timer/sound) we delay starting drag until the user actually moves,
+  // otherwise the immediate pointerdown preventDefault can suppress native dblclick.
+  let pendingCompositeDrag:
+    | null
+    | {
+        pointerId: number;
+        id: string;
+        node: any;
+        nodeEl: HTMLElement;
+        startClientX: number;
+        startClientY: number;
+        hnd: string | null;
+      } = null;
+  let lastCompositeClick:
+    | null
+    | {
+        id: string;
+        tMs: number;
+        x: number;
+        y: number;
+      } = null;
 
   const cursorForHandle = (h: string | null) => {
     if (!h) return "";
@@ -3015,17 +4208,779 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (h === "ne" || h === "sw") return "nesw-resize";
     return "";
   };
-  const setBodyCursor = (c: string) => {
-    document.documentElement.style.cursor = c || "";
+  const cursorForHandleWithRotation = (h: string | null, rotDeg: number) => {
+    if (!h) return "";
+    if (h === "rot-tr") return rotationCursorCss(rotDeg - 45);
+    if (h === "rot-tl") return rotationCursorCss(rotDeg - 135);
+    if (h === "rot" || h.startsWith("rot-")) return rotationCursorCss(rotDeg);
+    const norm = (deg: number) => {
+      let d = deg % 360;
+      if (d < 0) d += 360;
+      return d;
+    };
+    const rotVec = (x: number, y: number, deg: number) => {
+      const a = (norm(deg) * Math.PI) / 180;
+      const cos = Math.cos(a);
+      const sin = Math.sin(a);
+      return { x: x * cos - y * sin, y: x * sin + y * cos };
+    };
+    if (h === "n" || h === "s" || h === "e" || h === "w") {
+      const axis = h === "n" || h === "s" ? 90 : 0;
+      return resizeCursorCss(rotDeg + axis);
+    }
+    if (h === "nw" || h === "ne" || h === "sw" || h === "se") {
+      const axis = h === "se" || h === "nw" ? 45 : 135;
+      return resizeCursorCss(rotDeg + axis);
+    }
+    return cursorForHandle(h);
   };
+  const setBodyCursor = (c: string) => {
+    // IMPORTANT: element-level cursor (e.g. stage) overrides document cursor.
+    // Keep them in sync so "closed hand" shows while dragging even when the pointer is over the stage.
+    const cur = c || "";
+    document.documentElement.style.cursor = cur;
+    stage.style.cursor = cur;
+  };
+
+  // Composite selection box for composite-heavy nodes whose internal elements can extend outside the root rect.
+  // This is the REAL bbox (union of all group elements), not a "proxy".
+  let compositeSelBoxEl: HTMLDivElement | null = null;
+  const ensureCompositeSelBoxEl = () => {
+    if (compositeSelBoxEl) return compositeSelBoxEl;
+    const d = document.createElement("div");
+    d.className = "ip-composite-selection";
+    // NOTE: This overlay must live INSIDE `stage` so pointer events bubble to the
+    // stage-level editor handlers. If it's attached to `document.body`, parts of a
+    // composite bbox that extend outside the stage won't be draggable/hoverable.
+    d.style.position = "fixed";
+    // IMPORTANT: this overlay must not swallow pointer events meant for composite sub-elements.
+    // Handles remain interactive (they set pointer-events: auto).
+    d.style.pointerEvents = "none";
+    d.style.zIndex = "99997";
+    d.style.display = "none";
+    d.style.border = "2px solid rgba(110,168,255,0.65)";
+    d.style.borderRadius = "6px";
+    d.style.boxShadow = "0 0 0 1px rgba(0,0,0,0.35)";
+    d.style.transformOrigin = "50% 50%";
+    stage.appendChild(d);
+    compositeSelBoxEl = d;
+    return d;
+  };
+  const hideCompositeSelBox = () => {
+    if (!compositeSelBoxEl) return;
+    compositeSelBoxEl.style.display = "none";
+  };
+
+  // Composite selection box is a fixed-position overlay, so it must be updated when the viewport/camera changes.
+  // Normal nodes don't need this because their handles live inside the node DOM subtree.
+  let compositeOverlayRaf: number | null = null;
+  const refreshCompositeSelectionBoxOnce = () => {
+    if (!compositeSelBoxEl) return;
+    if (compositeEditTimerId) return;
+    if (getAppMode() !== "edit") return;
+    if (selected.size !== 1) return;
+    const model = engine.getModel();
+    if (!model) return;
+    const id = Array.from(selected)[0];
+    const node: any = model.nodes.find((n: any) => String(n.id) === String(id));
+    if (!node || (node.type !== "timer" && node.type !== "sound")) return;
+    const el = engine.getNodeElement(String(id));
+    if (!el) return;
+    const eff = effectiveNodeRectClient(el, node);
+    if (!eff || !(eff.width > 2 && eff.height > 2)) return;
+    const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    compositeSelBoxEl.style.display = "block";
+    compositeSelBoxEl.style.left = `${eff.left}px`;
+    compositeSelBoxEl.style.top = `${eff.top}px`;
+    compositeSelBoxEl.style.width = `${eff.width}px`;
+    compositeSelBoxEl.style.height = `${eff.height}px`;
+    compositeSelBoxEl.style.transform = `rotate(${rotDeg}deg)`;
+    compositeSelBoxEl.dataset.anchor = String((node as any)?.transform?.anchor ?? "centerCenter");
+    // Keep per-handle cursor rotation in sync (ensureHandles updates cursors based on `el.style.transform`).
+    ensureHandles(compositeSelBoxEl);
+  };
+  const startCompositeSelectionBoxRaf = () => {
+    if (compositeOverlayRaf != null) return;
+    const loop = () => {
+      compositeOverlayRaf = window.requestAnimationFrame(loop);
+      // Only refresh while a composite root is selected in root edit.
+      if (!compositeSelBoxEl || compositeSelBoxEl.style.display === "none") return;
+      refreshCompositeSelectionBoxOnce();
+    };
+    compositeOverlayRaf = window.requestAnimationFrame(loop);
+  };
+  const stopCompositeSelectionBoxRaf = () => {
+    if (compositeOverlayRaf == null) return;
+    window.cancelAnimationFrame(compositeOverlayRaf);
+    compositeOverlayRaf = null;
+  };
+  window.addEventListener("resize", () => {
+    // Ensure the overlay doesn't drift after viewport resizes.
+    refreshCompositeSelectionBoxOnce();
+  });
+
+  const updateStageCursorFromClientPoint = (clientX: number, clientY: number) => {
+    if (getAppMode() !== "edit") {
+      stage.style.cursor = "";
+      return;
+    }
+    if (dragMode !== "none") return;
+    if (tool !== "select") {
+      stage.style.cursor = "";
+      return;
+    }
+    const elAt = document.elementFromPoint(clientX, clientY) as HTMLElement | null;
+    if (!elAt) {
+      stage.style.cursor = "";
+      return;
+    }
+    if (elAt.closest(".edit-toolbox") || elAt.closest(".modal") || elAt.closest(".mode-toggle")) {
+      stage.style.cursor = "";
+      return;
+    }
+    const anchorEl = elAt.closest<HTMLElement>(".anchor-dot");
+    if (anchorEl) {
+      stage.style.cursor = "pointer";
+      return;
+    }
+
+    const model = engine.getModel();
+
+    // Prefer showing "grab" when hovering ANY node body, even if not selected.
+    const hoveredNodeEl = elAt.closest<HTMLElement>(".node");
+    if (hoveredNodeEl?.dataset.nodeId && model) {
+      const rawId = hoveredNodeEl.dataset.nodeId;
+      const id = resolveSelectableId(rawId);
+      const node: any = model.nodes.find((n: any) => n.id === id);
+      if (node) {
+        if (node.type === "arrow" || node.type === "line") {
+          const seg = hitTestSegmentHandle(hoveredNodeEl, clientX, clientY);
+          stage.style.cursor = seg ? "grab" : "";
+          return;
+        }
+
+        // If hovering the selected node, keep handle cursors + interior grab.
+        if (selected.size === 1 && selected.has(id)) {
+          const hnd = hitTestTransformHandleForNode(hoveredNodeEl, node, clientX, clientY);
+          if (hnd) {
+            stage.style.cursor = cursorForHandleWithRotation(hnd, Number(node?.transform?.rotationDeg ?? 0));
+            return;
+          }
+          stage.style.cursor = isPointInsideNodeInteriorForNode(hoveredNodeEl, node, clientX, clientY) ? "grab" : "";
+          return;
+        }
+
+        // Unselected node: show grab anywhere inside its rect.
+        const eff = effectiveNodeRectClient(hoveredNodeEl, node);
+        if (eff) {
+          stage.style.cursor = isPointInRotatedRectClient(eff, Number(node?.transform?.rotationDeg ?? 0), clientX, clientY) ? "grab" : "";
+        } else {
+          const { lx, ly, hw, hh } = localPtForRect(hoveredNodeEl.getBoundingClientRect(), Number(node?.transform?.rotationDeg ?? 0), clientX, clientY);
+          stage.style.cursor = Math.abs(lx) <= hw && Math.abs(ly) <= hh ? "grab" : "";
+        }
+        return;
+      }
+    }
+
+    // Fallback: if you're hovering OUTSIDE the selected node but within the 20px handle band,
+    // still show handle cursors.
+    if (selected.size === 1 && model) {
+      const id = Array.from(selected)[0];
+      const node: any = model.nodes.find((n: any) => n.id === id);
+      const nodeEl = engine.getNodeElement(id);
+      if (node && nodeEl) {
+        if (node.type === "arrow" || node.type === "line") {
+          const seg = hitTestSegmentHandle(nodeEl, clientX, clientY);
+          stage.style.cursor = seg ? "grab" : "";
+          return;
+        }
+        const hnd = hitTestTransformHandleForNode(nodeEl, node, clientX, clientY);
+        if (hnd) {
+          stage.style.cursor = cursorForHandleWithRotation(hnd, Number(node?.transform?.rotationDeg ?? 0));
+          return;
+        }
+        // If inside the effective composite rect (even if not over the inner `.node`), show grab.
+        const eff = effectiveNodeRectClient(nodeEl, node);
+        if (eff) {
+          stage.style.cursor = isPointInRotatedRectClient(eff, Number(node?.transform?.rotationDeg ?? 0), clientX, clientY) ? "grab" : "";
+          return;
+        }
+        stage.style.cursor = "";
+        return;
+      }
+    }
+
+    stage.style.cursor = "";
+  };
+
+  const localPtForRect = (rect: { left: number; top: number; width: number; height: number }, rotDeg: number, clientX: number, clientY: number) => {
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+    const a = (-rotDeg * Math.PI) / 180; // inverse (screen -> local)
+    const cos = Math.cos(a);
+    const sin = Math.sin(a);
+    const lx = dx * cos - dy * sin;
+    const ly = dx * sin + dy * cos;
+    return { lx, ly, hw: rect.width / 2, hh: rect.height / 2, cx, cy };
+  };
+
+  const isPointInRotatedRectClient = (rect: { left: number; top: number; right: number; bottom: number; width: number; height: number }, rotDeg: number, clientX: number, clientY: number) => {
+    const { lx, ly, hw, hh } = localPtForRect(rect, rotDeg, clientX, clientY);
+    return Math.abs(lx) <= hw && Math.abs(ly) <= hh;
+  };
+
+  const pickCompositeRootAtClientPoint = (model: any, x: number, y: number) => {
+    let best: { id: string; kind: "timer" | "sound" | "choices"; area: number } | null = null;
+    for (const n of model?.nodes ?? []) {
+      const kind = String(n?.type ?? "");
+      if (kind !== "timer" && kind !== "sound" && kind !== "choices") continue;
+      const el = engine.getNodeElement(String(n.id));
+      if (!el) continue;
+      const rotDeg = Number(n?.transform?.rotationDeg ?? 0) || 0;
+      const eff = kind === "choices" ? null : effectiveNodeRectClient(el, n);
+      const r = eff ?? (el.getBoundingClientRect() as any);
+      const rc: any = { left: r.left, top: r.top, right: r.right ?? r.left + r.width, bottom: r.bottom ?? r.top + r.height, width: r.width, height: r.height };
+      if (!isPointInRotatedRectClient(rc, rotDeg, x, y)) continue;
+      const area = Math.max(1, rc.width * rc.height);
+      if (!best || area < best.area) best = { id: String(n.id), kind: kind as any, area };
+    }
+    return best;
+  };
+
+  function collectCompositeRectsClient(type: "timer" | "sound", nodeEl: HTMLElement, layer: HTMLElement): DOMRect[] {
+    const rects: DOMRect[] = [];
+    rects.push(nodeEl.getBoundingClientRect());
+
+    // Composite sub-elements rendered in the overlay layer.
+    for (const sub of Array.from(layer.querySelectorAll<HTMLElement>(".comp-sub"))) {
+      const sr = sub.getBoundingClientRect();
+      if (!(sr.width > 0.5 && sr.height > 0.5)) continue;
+      rects.push(sr);
+      for (const btn of Array.from(sub.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
+        const br = btn.getBoundingClientRect();
+        if (!(br.width > 0.5 && br.height > 0.5)) continue;
+        rects.push(br);
+      }
+    }
+
+    // Legacy header bar (present when composite buttons are not used).
+    const headerSel = type === "timer" ? ".timer-header" : ".sound-header";
+    const headerEl = nodeEl.querySelector<HTMLElement>(headerSel);
+    if (headerEl) {
+      const hr = headerEl.getBoundingClientRect();
+      if (hr.width > 0.5 && hr.height > 0.5) rects.push(hr);
+      for (const btn of Array.from(headerEl.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
+        const br = btn.getBoundingClientRect();
+        if (!(br.width > 0.5 && br.height > 0.5)) continue;
+        rects.push(br);
+      }
+    }
+
+    // Fallback: include any control buttons inside the root node (covers future layout tweaks).
+    for (const btn of Array.from(nodeEl.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
+      const br = btn.getBoundingClientRect();
+      if (!(br.width > 0.5 && br.height > 0.5)) continue;
+      rects.push(br);
+    }
+
+    return rects;
+  }
+
+  function orientedUnionRectClient(nodeEl: HTMLElement, rotDeg: number, rects: DOMRect[]) {
+    const rr = nodeEl.getBoundingClientRect();
+    const cx0 = rr.left + rr.width / 2;
+    const cy0 = rr.top + rr.height / 2;
+    const a = (-rotDeg * Math.PI) / 180; // client -> local
+    const cos = Math.cos(a);
+    const sin = Math.sin(a);
+
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const addPt = (x: number, y: number) => {
+      const dx = x - cx0;
+      const dy = y - cy0;
+      const lx = dx * cos - dy * sin;
+      const ly = dx * sin + dy * cos;
+      minX = Math.min(minX, lx);
+      minY = Math.min(minY, ly);
+      maxX = Math.max(maxX, lx);
+      maxY = Math.max(maxY, ly);
+    };
+
+    for (const r of rects) {
+      addPt(r.left, r.top);
+      addPt(r.right, r.top);
+      addPt(r.right, r.bottom);
+      addPt(r.left, r.bottom);
+    }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+      return { left: rr.left, top: rr.top, width: rr.width, height: rr.height, right: rr.right, bottom: rr.bottom };
+    }
+
+    const w = Math.max(1, maxX - minX);
+    const h = Math.max(1, maxY - minY);
+    const cxl = (minX + maxX) / 2;
+    const cyl = (minY + maxY) / 2;
+
+    // local -> client
+    const af = (rotDeg * Math.PI) / 180;
+    const cosf = Math.cos(af);
+    const sinf = Math.sin(af);
+    const dcx = cxl * cosf - cyl * sinf;
+    const dcy = cxl * sinf + cyl * cosf;
+    const cx = cx0 + dcx;
+    const cy = cy0 + dcy;
+
+    const left = cx - w / 2;
+    const top = cy - h / 2;
+    return { left, top, width: w, height: h, right: left + w, bottom: top + h };
+  }
+
+  const effectiveNodeRectClient = (nodeEl: HTMLElement, node: any) => {
+    // For timer/sound, include all internal comp-sub elements that may extend outside the root.
+    // For other nodes, return null (use nodeEl rect).
+    const type = String(node?.type ?? "");
+    if (type !== "timer" && type !== "sound") return null;
+    const rootId = String(node?.id ?? nodeEl.dataset.nodeId ?? "");
+    if (!rootId) return null;
+    const layer =
+      type === "timer"
+        ? ensureTimerCompositeLayer(engine, rootId)
+        : ensureSoundCompositeLayer(engine, rootId);
+    if (!layer) return null;
+    const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    const rects = collectCompositeRectsClient(type as any, nodeEl, layer);
+    const u = orientedUnionRectClient(nodeEl, rotDeg, rects);
+    return { ...u, layer };
+  };
+
+  const isPointInsideNodeInteriorForNode = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
+    const R = 20;
+    const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    const eff = effectiveNodeRectClient(nodeEl, node);
+    const rect = eff ?? nodeEl.getBoundingClientRect();
+    const { lx, ly, hw, hh } = localPtForRect(rect, rotDeg, clientX, clientY);
+    return Math.abs(lx) <= hw - R && Math.abs(ly) <= hh - R;
+  };
+
+  const hitTestTransformHandleForNode = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
+    const eff = effectiveNodeRectClient(nodeEl, node);
+    if (!eff) return hitTestTransformHandle(nodeEl, node, clientX, clientY);
+    // Re-run the same math as hitTestTransformHandle but against the effective rect size/center.
+    const R = 20;
+    const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    const { lx, ly, hw, hh } = localPtForRect(eff, rotDeg, clientX, clientY);
+    type Cand = { handle: string; d: number };
+    const cands: Cand[] = [];
+    const addCorner = (handle: string, x: number, y: number) => {
+      const d = Math.hypot(lx - x, ly - y);
+      if (d <= R) cands.push({ handle, d });
+    };
+    addCorner("rot-tl", -hw, -hh);
+    addCorner("rot-tr", hw, -hh);
+    addCorner("sw", -hw, hh);
+    addCorner("se", hw, hh);
+    const xMin = -hw + R;
+    const xMax = hw - R;
+    const yMin = -hh + R;
+    const yMax = hh - R;
+    if (xMax >= xMin) {
+      const dt = Math.abs(ly - (-hh));
+      if (dt <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "n", d: dt });
+      const db = Math.abs(ly - hh);
+      if (db <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "s", d: db });
+    }
+    if (yMax >= yMin) {
+      const dl = Math.abs(lx - (-hw));
+      if (dl <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "w", d: dl });
+      const dr = Math.abs(lx - hw);
+      if (dr <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "e", d: dr });
+    }
+    if (cands.length === 0) return null;
+    cands.sort((a, b) => a.d - b.d);
+    return cands[0].handle;
+  };
+
+  // Arrow/line hit-testing (screen space):
+  // - endpoint balls: radius 20px around each endpoint
+  // - translate region: within 20px of the segment, excluding the endpoint balls
+  // - closest wins
+  const hitTestSegmentHandle = (nodeEl: HTMLElement, clientX: number, clientY: number) => {
+    const R = 20;
+    const r = nodeEl.getBoundingClientRect();
+    const fx = Number(nodeEl.dataset.fromX ?? "0");
+    const fy = Number(nodeEl.dataset.fromY ?? "0.5");
+    const tx = Number(nodeEl.dataset.toX ?? "1");
+    const ty = Number(nodeEl.dataset.toY ?? "0.5");
+    const p1 = { x: r.left + fx * r.width, y: r.top + fy * r.height };
+    const p2 = { x: r.left + tx * r.width, y: r.top + ty * r.height };
+
+    const d1 = Math.hypot(clientX - p1.x, clientY - p1.y);
+    const d2 = Math.hypot(clientX - p2.x, clientY - p2.y);
+
+    type Cand = { handle: "p1" | "p2" | "mid"; d: number };
+    const cands: Cand[] = [];
+    if (d1 <= R) cands.push({ handle: "p1", d: d1 });
+    if (d2 <= R) cands.push({ handle: "p2", d: d2 });
+
+    const vx = p2.x - p1.x;
+    const vy = p2.y - p1.y;
+    const len = Math.hypot(vx, vy);
+    if (len > 1e-6) {
+      // closest distance to segment
+      let t = ((clientX - p1.x) * vx + (clientY - p1.y) * vy) / (len * len);
+      t = Math.max(0, Math.min(1, t));
+      const proj = { x: p1.x + vx * t, y: p1.y + vy * t };
+      const dLine = Math.hypot(clientX - proj.x, clientY - proj.y);
+      const tMin = Math.min(0.5, R / len);
+      const tMax = Math.max(0.5, 1 - R / len);
+      if (dLine <= R && t >= tMin && t <= tMax) cands.push({ handle: "mid", d: dLine });
+    }
+
+    if (cands.length === 0) return null;
+    cands.sort((a, b) => a.d - b.d);
+    return cands[0].handle;
+  };
+
+  const localPtForNode = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
+    const w = Math.max(1, nodeEl.clientWidth);
+    const h = Math.max(1, nodeEl.clientHeight);
+    const rect = nodeEl.getBoundingClientRect();
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    const dx = clientX - cx;
+    const dy = clientY - cy;
+    const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    const a = (-rotDeg * Math.PI) / 180; // inverse (screen -> local)
+    const cos = Math.cos(a);
+    const sin = Math.sin(a);
+    const lx = dx * cos - dy * sin;
+    const ly = dx * sin + dy * cos;
+    return { lx, ly, hw: w / 2, hh: h / 2, rotDeg };
+  };
+
+  const isPointInsideNodeInterior = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
+    // "Interior" excludes the 20px border band used for resize/rotate hit-testing.
+    const R = 20;
+    const { lx, ly, hw, hh } = localPtForNode(nodeEl, node, clientX, clientY);
+    return Math.abs(lx) <= hw - R && Math.abs(ly) <= hh - R;
+  };
+
+  // Hit-test the selection outline in the node's LOCAL (rotated) coordinate system.
+  // Rules:
+  // - Corner "balls": radius 20px around each corner
+  //   - top corners => rotation handles (rot-tl/rot-tr)
+  //   - bottom corners => scale handles (sw/se)
+  // - Edges: within 20px inside/outside the border (a 40px band centered on the edge line),
+  //          but ONLY inside a segment tangential to the corner balls (exclude the end balls).
+  // - If multiple regions overlap, the closest one wins.
+  const hitTestTransformHandle = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
+    const R = 20; // px
+    const { lx, ly, hw, hh } = localPtForNode(nodeEl, node, clientX, clientY);
+
+    type Cand = { handle: string; d: number };
+    const cands: Cand[] = [];
+
+    const addCorner = (handle: string, x: number, y: number) => {
+      const d = Math.hypot(lx - x, ly - y);
+      if (d <= R) cands.push({ handle, d });
+    };
+    // Corners
+    addCorner("rot-tl", -hw, -hh);
+    addCorner("rot-tr", hw, -hh);
+    addCorner("sw", -hw, hh);
+    addCorner("se", hw, hh);
+
+    // Edge segments exclude the corner balls: tangent points are at +/-R along each edge.
+    const xMin = -hw + R;
+    const xMax = hw - R;
+    const yMin = -hh + R;
+    const yMax = hh - R;
+    if (xMax >= xMin) {
+      const dt = Math.abs(ly - (-hh));
+      if (dt <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "n", d: dt });
+      const db = Math.abs(ly - hh);
+      if (db <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "s", d: db });
+    }
+    if (yMax >= yMin) {
+      const dl = Math.abs(lx - (-hw));
+      if (dl <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "w", d: dl });
+      const dr = Math.abs(lx - hw);
+      if (dr <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "e", d: dr });
+    }
+
+    if (cands.length === 0) return null;
+    cands.sort((a, b) => a.d - b.d);
+    return cands[0].handle;
+  };
+
+  // Capture-phase intent handler: if the pointer is over a selected node's interaction region,
+  // force that action and prevent background pan handlers from starting.
+  stage.addEventListener(
+    "pointerdown",
+    (ev) => {
+      if (getAppMode() !== "edit") return;
+      if (tool !== "select") return;
+      if (ev.button !== 0) return;
+      if (dragMode !== "none") return;
+
+      const anchorEl = (ev.target as HTMLElement).closest?.(".anchor-dot");
+      if (anchorEl) return; // let anchor click logic handle it
+
+      const model = engine.getModel();
+      if (!model) return;
+
+      // Prefer the node directly under the pointer (supports "mousedown selects + drags" for unselected text).
+      let hoveredNodeEl = (ev.target as HTMLElement).closest<HTMLElement>(".node");
+      let hoveredRawId = hoveredNodeEl?.dataset.nodeId ?? "";
+      let hoveredId = hoveredRawId ? resolveSelectableId(hoveredRawId) : "";
+      let hasHovered = !!hoveredId;
+
+      // If we didn't hit a `.node` element, try composite hit-testing against their effective outer rects.
+      if (!hasHovered) {
+        const best = pickCompositeRootAtClientPoint(model as any, ev.clientX, ev.clientY);
+        if (best) {
+          hoveredId = best.id;
+          hoveredNodeEl = engine.getNodeElement(best.id);
+          hoveredRawId = hoveredId;
+          hasHovered = !!hoveredId && !!hoveredNodeEl;
+        }
+      }
+
+      const selectId = () => {
+        if (!hoveredId) return;
+        if (ev.ctrlKey || ev.shiftKey) return; // preserve multi-select semantics
+        if (!(selected.size === 1 && selected.has(hoveredId))) {
+          selectOne(hoveredId);
+        }
+      };
+
+      if (hasHovered) selectId();
+
+      // Determine which node we're acting on:
+      // - if pointer is over a node element, act on that node
+      // - else, fall back to the currently selected node (so the 20px outside-border band still works)
+      const activeId =
+        hasHovered ? hoveredId : selected.size === 1 ? Array.from(selected)[0] : "";
+      if (!activeId) return;
+
+      const node: any = model.nodes.find((n: any) => n.id === activeId);
+      const nodeEl = hasHovered ? hoveredNodeEl! : engine.getNodeElement(activeId);
+      if (!node || !nodeEl) return;
+
+      // Composite roots: implement our own "double click" detection (native dblclick can be suppressed by pointer handling).
+      if (!compositeEditTimerId && (node.type === "timer" || node.type === "sound" || node.type === "choices")) {
+        const now = performance.now();
+        const prev = lastCompositeClick;
+        const dt = prev && prev.id === activeId ? now - prev.tMs : Infinity;
+        const d = prev && prev.id === activeId ? Math.hypot(ev.clientX - prev.x, ev.clientY - prev.y) : Infinity;
+        const isDouble = dt <= 350 && d <= 6;
+        lastCompositeClick = { id: activeId, tMs: now, x: ev.clientX, y: ev.clientY };
+
+        const dbg = ipDebugEnabled("ip_debug_dblclick");
+        if (dbg) {
+          // eslint-disable-next-line no-console
+          console.log("[ip][dblclick] pointerdown composite", { id: activeId, type: node.type, dt, d, isDouble });
+        }
+
+        if (isDouble) {
+          lastCompositeClick = null;
+          if (node.type === "timer") enterTimerCompositeEdit(activeId);
+          else if (node.type === "sound") enterSoundCompositeEdit(activeId);
+          else enterChoicesCompositeEdit(activeId);
+          ev.preventDefault();
+          (ev as any).stopImmediatePropagation?.();
+          return;
+        }
+      }
+
+      // Arrow/line: only act if we're in the segment hit region.
+      if (node.type === "arrow" || node.type === "line") {
+        const seg = hitTestSegmentHandle(nodeEl, ev.clientX, ev.clientY);
+        if (!seg) return;
+        // Start drag immediately (blocks pan).
+        startSnapshot = cloneModel(model);
+        startNodesById = { [activeId]: JSON.parse(JSON.stringify(node)) };
+        start = { x: ev.clientX, y: ev.clientY };
+        activeHandle = seg;
+        dragMode = "line";
+        setBodyCursor("grabbing");
+        stage.setPointerCapture?.(ev.pointerId);
+        ev.preventDefault();
+        (ev as any).stopImmediatePropagation?.();
+        return;
+      }
+
+      // Boxes: if inside interior OR on handle band, start manipulation and block pan.
+      const hnd = hitTestTransformHandleForNode(nodeEl, node, ev.clientX, ev.clientY);
+      const inside = (() => {
+        // Use the effective bbox for composites so the "outer box" behaves like a normal node.
+        const eff = effectiveNodeRectClient(nodeEl, node);
+        if (eff) return isPointInRotatedRectClient(eff as any, Number(node?.transform?.rotationDeg ?? 0) || 0, ev.clientX, ev.clientY);
+        const { lx, ly, hw, hh } = localPtForRect(nodeEl.getBoundingClientRect(), Number(node?.transform?.rotationDeg ?? 0) || 0, ev.clientX, ev.clientY);
+        return Math.abs(lx) <= hw && Math.abs(ly) <= hh;
+      })();
+      if (!hnd && !inside) return;
+
+      // Composite roots: block pan, but DO NOT start drag immediately (lets native dblclick fire).
+      if ((node.type === "timer" || node.type === "sound") && !compositeEditTimerId) {
+        pendingCompositeDrag = {
+          pointerId: ev.pointerId,
+          id: activeId,
+          node,
+          nodeEl,
+          startClientX: ev.clientX,
+          startClientY: ev.clientY,
+          hnd
+        };
+        // Still block background pan.
+        ev.preventDefault();
+        // Capture the pointer immediately so subsequent moves are routed through the stage,
+        // which is required for our stage-level drag handlers to work reliably.
+        try {
+          stage.setPointerCapture?.(ev.pointerId);
+        } catch {}
+        (ev as any).stopImmediatePropagation?.();
+        return;
+      }
+
+      startSnapshot = cloneModel(model);
+      startNodesById = { [activeId]: JSON.parse(JSON.stringify(node)) };
+      start = { x: ev.clientX, y: ev.clientY };
+
+      if (hnd) {
+        activeHandle = hnd;
+        dragMode = activeHandle.startsWith("rot-") ? "rotate" : "resize";
+        setBodyCursor(cursorForHandleWithRotation(activeHandle, Number(node?.transform?.rotationDeg ?? 0)));
+        if (dragMode === "rotate") {
+          const eff = effectiveNodeRectClient(nodeEl, node);
+          const r = (eff as any) ?? nodeEl.getBoundingClientRect();
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          startAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+          startRotationDeg = Number(node?.transform?.rotationDeg ?? 0);
+        }
+      } else {
+        activeHandle = null;
+        dragMode = "move";
+        setBodyCursor("grabbing");
+      }
+
+      stage.setPointerCapture?.(ev.pointerId);
+      ev.preventDefault();
+      (ev as any).stopImmediatePropagation?.();
+    },
+    { capture: true }
+  );
+
+  // If a composite root is pending drag, wait until the user actually moves before starting drag.
+  window.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (!pendingCompositeDrag) return;
+      if (getAppMode() !== "edit") return;
+      if (tool !== "select") return;
+      if (dragMode !== "none") return;
+      // IMPORTANT: do not start a drag after the mouse button was released.
+      if (!(ev.buttons & 1)) return;
+      if (ev.pointerId !== pendingCompositeDrag.pointerId) return;
+
+      const dx = ev.clientX - pendingCompositeDrag.startClientX;
+      const dy = ev.clientY - pendingCompositeDrag.startClientY;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 3) return;
+
+      const model = engine.getModel();
+      if (!model) return;
+      const id = pendingCompositeDrag.id;
+      const node: any = model.nodes.find((n: any) => n.id === id) ?? pendingCompositeDrag.node;
+      const nodeEl = engine.getNodeElement(id) ?? pendingCompositeDrag.nodeEl;
+      if (!node || !nodeEl) return;
+
+      // Start drag now (and suppress native click/dblclick from this point).
+      startSnapshot = cloneModel(model);
+      startNodesById = { [id]: JSON.parse(JSON.stringify(node)) };
+      start = { x: pendingCompositeDrag.startClientX, y: pendingCompositeDrag.startClientY };
+
+      const hnd = pendingCompositeDrag.hnd;
+      if (hnd) {
+        activeHandle = hnd;
+        dragMode = activeHandle.startsWith("rot-") ? "rotate" : "resize";
+        setBodyCursor(cursorForHandleWithRotation(activeHandle, Number(node?.transform?.rotationDeg ?? 0)));
+        if (dragMode === "rotate") {
+          const eff = effectiveNodeRectClient(nodeEl, node);
+          const r = (eff as any) ?? nodeEl.getBoundingClientRect();
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          startAngleRad = Math.atan2(start.y - cy, start.x - cx);
+          startRotationDeg = Number(node?.transform?.rotationDeg ?? 0);
+        }
+      } else {
+        activeHandle = null;
+        dragMode = "move";
+        setBodyCursor("grabbing");
+      }
+
+      pendingCompositeDrag = null;
+      ev.preventDefault();
+      (ev as any).stopImmediatePropagation?.();
+    },
+    { capture: true }
+  );
+
+  const finishDrag = async () => {
+    // Always clear pending composite drag.
+    pendingCompositeDrag = null;
+    if (dragMode === "none" && !startSnapshot) return;
+    dragMode = "none";
+    activeHandle = null;
+    setBodyCursor("");
+    startNodesById = null;
+    const before = startSnapshot;
+    startSnapshot = null;
+    await commit(before);
+    // If the mouse hasn't moved since a snapped rotation, refresh hover cursor immediately.
+    const mx = (window as any).__ip_lastMouseX;
+    const my = (window as any).__ip_lastMouseY;
+    if (typeof mx === "number" && typeof my === "number") updateStageCursorFromClientPoint(mx, my);
+    // Also refresh handle cursor styles for the currently selected node.
+    if (selected.size === 1) {
+      const id = Array.from(selected)[0];
+      const el = engine.getNodeElement(id);
+      const model = engine.getModel();
+      const n: any = model?.nodes.find((nn) => nn.id === id);
+      if (n?.type === "timer" || n?.type === "sound") applySelection();
+      else if (el) ensureHandles(el);
+    }
+  };
+
+  // Hover cursor based on hit-test (so we don't depend on DOM overlap ordering).
+  stage.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (getAppMode() !== "edit") return;
+      if (dragMode !== "none") return;
+      if (tool !== "select") return;
+      updateStageCursorFromClientPoint(ev.clientX, ev.clientY);
+    },
+    { passive: true }
+  );
 
   const applySelection = () => {
     const model = engine.getModel();
     if (!model) return;
     const canShowTransformUi = getAppMode() === "edit";
+    // Default: hide composite selection unless a composite root needs it.
+    hideCompositeSelBox();
+    stopCompositeSelectionBoxRaf();
     for (const n of model.nodes) {
       const el = engine.getNodeElement(n.id);
       if (!el) continue;
+      // Reset any per-node inline outline overrides (we'll re-apply selectively below).
+      el.style.outline = "";
+      el.style.outlineOffset = "";
       const isSel = canShowTransformUi && selected.has(n.id);
       el.classList.toggle("is-selected", isSel);
       if (!canShowTransformUi) {
@@ -3033,9 +4988,37 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         continue;
       }
       if (isSel && selected.size === 1) {
-        // While editing a composite (timer), never show handles for the composite itself.
-        if (compositeEditTimerId && n.id === compositeEditTimerId) el.querySelector(".handles")?.remove();
-        else ensureHandles(el);
+        // While editing a composite, timer/sound should edit sub-elements only (no root handles).
+        if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && n.id === compositeEditTimerId)
+          el.querySelector(".handles")?.remove();
+        else {
+          // Composite roots: draw selection using the effective bbox so buttons/labels are included.
+          if (n.type === "timer" || n.type === "sound") {
+            const eff = effectiveNodeRectClient(el, n);
+            if (eff && eff.width > 2 && eff.height > 2) {
+              const box = ensureCompositeSelBoxEl();
+              box.style.display = "block";
+              box.style.left = `${eff.left}px`;
+              box.style.top = `${eff.top}px`;
+              box.style.width = `${eff.width}px`;
+              box.style.height = `${eff.height}px`;
+              // Match node rotation (this drives both the box and its handles).
+              const rotDeg = Number((n as any)?.transform?.rotationDeg ?? 0) || 0;
+              box.style.transform = `rotate(${rotDeg}deg)`;
+              box.dataset.anchor = String((n as any)?.transform?.anchor ?? "centerCenter");
+              // IMPORTANT: this composite selection box is the ONLY visible selection box for timer/sound.
+              // Hide the default node outline and remove its handles (we render handles on the composite box).
+              el.style.outline = "none";
+              el.querySelector(".handles")?.remove();
+              ensureHandles(box);
+              // Keep it synced during pan/zoom/viewport resize.
+              startCompositeSelectionBoxRaf();
+            }
+            // (No node handles for timer/sound; handled by composite selection box.)
+          } else {
+            ensureHandles(el);
+          }
+        }
       }
       if (!isSel || selected.size !== 1) el.querySelector(".handles")?.remove();
     }
@@ -3044,6 +5027,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const clearSelection = () => {
     selected.clear();
     applySelection();
+    // Also clear any leftover composite sub-element selection chrome.
+    // (These can be selected via group edit mode and are not part of the root `selected` set.)
+    for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".comp-sub.is-selected, .timer-sub.is-selected"))) {
+      el.classList.remove("is-selected");
+      el.querySelector(".handles")?.remove();
+    }
   };
 
   const selectOne = (id: string) => {
@@ -3370,6 +5359,19 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           statS.addEventListener("change", () => (state.stat = statS.value));
           statF.append(statS);
           body.append(grid, statF);
+          return;
+        }
+
+        if (state.type === "arrow" || (state as any).type === "line") {
+          const grid = document.createElement("div");
+          grid.style.display = "grid";
+          grid.style.gridTemplateColumns = "repeat(2, 1fr)";
+          grid.style.gap = "12px";
+          grid.append(
+            mkText("color", "color", "white"),
+            mkNum("width", "width", { step: "0.5", min: "1" })
+          );
+          body.append(grid);
           return;
         }
 
@@ -3721,14 +5723,290 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
 
     if (ev.ctrlKey && ev.key.toLowerCase() === "c") {
-      (window as any).__ip_clipboard = getSelectedNodes().map((n) => JSON.parse(JSON.stringify(n)));
+      // Copy: include selected nodes + any descendants (so groups paste as a whole).
+      const model = engine.getModel();
+      const nodes = model?.nodes ?? [];
+      const byId = new Map(nodes.map((n: any) => [String(n.id), n]));
+      const selectedIds = new Set(Array.from(selected));
+      const allIds = new Set<string>(selectedIds);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const n of nodes as any[]) {
+          const pid = String(n.parentId ?? "").trim();
+          if (pid && allIds.has(pid) && !allIds.has(String(n.id))) {
+            allIds.add(String(n.id));
+            changed = true;
+          }
+        }
+      }
+      const copied = Array.from(allIds)
+        .map((id) => byId.get(id))
+        .filter(Boolean)
+        .map((n: any) => JSON.parse(JSON.stringify(n)));
+      // Compute a bounding box of root nodes (nodes whose parent isn't also copied).
+      const roots = copied.filter((n: any) => !String(n.parentId ?? "").trim() || !allIds.has(String(n.parentId ?? "").trim()));
+      let bbox = null as null | { space: "world" | "screen"; cx: number; cy: number };
+      try {
+        if (roots.length) {
+          const space = (roots[0]?.space ?? "world") === "screen" ? "screen" : "world";
+          if (space === "world") {
+            let minX = Infinity,
+              minY = Infinity,
+              maxX = -Infinity,
+              maxY = -Infinity;
+            for (const n of roots) {
+              const cs = rectCornersWorld(n.transform ?? {});
+              for (const p of cs) {
+                minX = Math.min(minX, p.x);
+                minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x);
+                maxY = Math.max(maxY, p.y);
+              }
+            }
+            if (isFinite(minX) && isFinite(minY) && isFinite(maxX) && isFinite(maxY)) bbox = { space, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+          } else {
+            // Screen-space: treat x/y as normalized and approximate bbox by anchor points.
+            let minX = Infinity,
+              minY = Infinity,
+              maxX = -Infinity,
+              maxY = -Infinity;
+            for (const n of roots) {
+              const t = n.transform ?? {};
+              const x = Number(t.x ?? 0);
+              const y = Number(t.y ?? 0);
+              const w = Number(t.w ?? 0.2);
+              const h = Number(t.h ?? 0.1);
+              const tl = anchorToTopLeftWorld({ x, y, w, h, anchor: String(t.anchor ?? "topLeft") } as any);
+              minX = Math.min(minX, tl.x);
+              minY = Math.min(minY, tl.y);
+              maxX = Math.max(maxX, tl.x + w);
+              maxY = Math.max(maxY, tl.y + h);
+            }
+            if (isFinite(minX) && isFinite(minY) && isFinite(maxX) && isFinite(maxY)) bbox = { space, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+          }
+        }
+      } catch {}
+      (window as any).__ip_clipboard = { nodes: copied, bbox };
       ev.preventDefault();
       return;
     }
 
     if (ev.ctrlKey && ev.key.toLowerCase() === "x") {
-      (window as any).__ip_clipboard = getSelectedNodes().map((n) => JSON.parse(JSON.stringify(n)));
+      // Cut: copy first (same semantics as Ctrl+C), then delete selection.
+      const model = engine.getModel();
+      const nodes = model?.nodes ?? [];
+      const byId = new Map(nodes.map((n: any) => [String(n.id), n]));
+      const selectedIds = new Set(Array.from(selected));
+      const allIds = new Set<string>(selectedIds);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const n of nodes as any[]) {
+          const pid = String(n.parentId ?? "").trim();
+          if (pid && allIds.has(pid) && !allIds.has(String(n.id))) {
+            allIds.add(String(n.id));
+            changed = true;
+          }
+        }
+      }
+      const copied = Array.from(allIds)
+        .map((id) => byId.get(id))
+        .filter(Boolean)
+        .map((n: any) => JSON.parse(JSON.stringify(n)));
+      const roots = copied.filter((n: any) => !String(n.parentId ?? "").trim() || !allIds.has(String(n.parentId ?? "").trim()));
+      let bbox = null as null | { space: "world" | "screen"; cx: number; cy: number };
+      try {
+        if (roots.length) {
+          const space = (roots[0]?.space ?? "world") === "screen" ? "screen" : "world";
+          if (space === "world") {
+            let minX = Infinity,
+              minY = Infinity,
+              maxX = -Infinity,
+              maxY = -Infinity;
+            for (const n of roots) {
+              const cs = rectCornersWorld(n.transform ?? {});
+              for (const p of cs) {
+                minX = Math.min(minX, p.x);
+                minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x);
+                maxY = Math.max(maxY, p.y);
+              }
+            }
+            if (isFinite(minX) && isFinite(minY) && isFinite(maxX) && isFinite(maxY)) bbox = { space, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+          } else {
+            let minX = Infinity,
+              minY = Infinity,
+              maxX = -Infinity,
+              maxY = -Infinity;
+            for (const n of roots) {
+              const t = n.transform ?? {};
+              const x = Number(t.x ?? 0);
+              const y = Number(t.y ?? 0);
+              const w = Number(t.w ?? 0.2);
+              const h = Number(t.h ?? 0.1);
+              const tl = anchorToTopLeftWorld({ x, y, w, h, anchor: String(t.anchor ?? "topLeft") } as any);
+              minX = Math.min(minX, tl.x);
+              minY = Math.min(minY, tl.y);
+              maxX = Math.max(maxX, tl.x + w);
+              maxY = Math.max(maxY, tl.y + h);
+            }
+            if (isFinite(minX) && isFinite(minY) && isFinite(maxX) && isFinite(maxY)) bbox = { space, cx: (minX + maxX) / 2, cy: (minY + maxY) / 2 };
+          }
+        }
+      } catch {}
+      (window as any).__ip_clipboard = { nodes: copied, bbox };
       await deleteSelection();
+      ev.preventDefault();
+      return;
+    }
+
+    if (ev.ctrlKey && ev.key.toLowerCase() === "v") {
+      const clip = (window as any).__ip_clipboard;
+      const items: any[] = Array.isArray(clip) ? clip : Array.isArray(clip?.nodes) ? clip.nodes : [];
+      if (items.length === 0) return;
+      const model = engine.getModel();
+      if (!model) return;
+      const before = cloneModel(model);
+
+      const cam = engine.getCamera();
+      const scr = engine.getScreen();
+      const stageRect = stage.getBoundingClientRect();
+      const mx = typeof (window as any).__ip_lastMouseX === "number" ? (window as any).__ip_lastMouseX : stageRect.left + stageRect.width / 2;
+      const my = typeof (window as any).__ip_lastMouseY === "number" ? (window as any).__ip_lastMouseY : stageRect.top + stageRect.height / 2;
+      const screenPos = { x: mx - stageRect.left, y: my - stageRect.top };
+      const targetWorld = screenEditMode ? null : screenToWorld(screenPos, cam as any, scr as any);
+      const targetScreenFrac =
+        scr.w > 0 && scr.h > 0 ? { x: screenPos.x / scr.w, y: screenPos.y / scr.h } : { x: 0.5, y: 0.5 };
+
+      const oldIds = new Set(items.map((n) => String(n.id)));
+      const idMap = new Map<string, string>();
+      const newNodes: any[] = [];
+
+      const prefixFor = (n: any) => {
+        const t = String(n?.type ?? "node");
+        // keep ids readable and stable
+        return t;
+      };
+
+      // Create new ids first
+      for (const n of items) {
+        const oldId = String(n.id);
+        idMap.set(oldId, nextId(prefixFor(n)));
+      }
+
+      // Determine roots for positioning (don't move children independently)
+      const rootOldIds = items
+        .filter((n) => {
+          const pid = String(n.parentId ?? "").trim();
+          return !pid || !oldIds.has(pid);
+        })
+        .map((n) => String(n.id));
+
+      // Compute bbox center from clipboard metadata (fallback to current root nodes)
+      const bbox = clip?.bbox ?? null;
+      const space = (bbox?.space ?? items[0]?.space ?? "world") === "screen" ? "screen" : "world";
+      let baseCx = bbox?.cx ?? 0;
+      let baseCy = bbox?.cy ?? 0;
+      if (!bbox) {
+        try {
+          if (space === "world") {
+            let minX = Infinity,
+              minY = Infinity,
+              maxX = -Infinity,
+              maxY = -Infinity;
+            for (const oldId of rootOldIds) {
+              const n = items.find((x) => String(x.id) === oldId);
+              if (!n) continue;
+              const cs = rectCornersWorld(n.transform ?? {});
+              for (const p of cs) {
+                minX = Math.min(minX, p.x);
+                minY = Math.min(minY, p.y);
+                maxX = Math.max(maxX, p.x);
+                maxY = Math.max(maxY, p.y);
+              }
+            }
+            if (isFinite(minX) && isFinite(minY) && isFinite(maxX) && isFinite(maxY)) {
+              baseCx = (minX + maxX) / 2;
+              baseCy = (minY + maxY) / 2;
+            }
+          } else {
+            baseCx = targetScreenFrac.x;
+            baseCy = targetScreenFrac.y;
+          }
+        } catch {}
+      }
+
+      // Compute delta to place near cursor; if we can't resolve cursor (or mismatch space), use a small offset.
+      let dxw = 0;
+      let dyw = 0;
+      let dxs = 0;
+      let dys = 0;
+      if (space === "world" && targetWorld) {
+        dxw = targetWorld.x - baseCx;
+        dyw = targetWorld.y - baseCy;
+      } else if (space === "screen") {
+        dxs = targetScreenFrac.x - baseCx;
+        dys = targetScreenFrac.y - baseCy;
+      } else {
+        // fallback offset (world)
+        dxw = 40;
+        dyw = 40;
+      }
+
+      for (const n0 of items) {
+        const n = JSON.parse(JSON.stringify(n0));
+        const oldId = String(n.id);
+        const newId = idMap.get(oldId) ?? nextId(prefixFor(n));
+        n.id = newId;
+
+        // Remap parentId if the parent is also pasted.
+        const pid = String(n.parentId ?? "").trim();
+        if (pid && idMap.has(pid)) n.parentId = idMap.get(pid);
+        else delete n.parentId;
+
+        // If this is a composite-root node, make sure compositeDir follows the new id.
+        if (n.type === "timer" || n.type === "sound") n.compositeDir = newId;
+
+        // Offset only roots (children keep their parent-relative transforms).
+        if (rootOldIds.includes(oldId)) {
+          const t = n.transform ?? {};
+          if ((n.space ?? "world") === "screen") {
+            n.transform = { ...t, x: Number(t.x ?? 0) + dxs, y: Number(t.y ?? 0) + dys };
+          } else {
+            n.transform = { ...t, x: Number(t.x ?? 0) + dxw, y: Number(t.y ?? 0) + dyw };
+          }
+        }
+
+        newNodes.push(n);
+      }
+
+      // Add to model
+      for (const n of newNodes) model.nodes.push(n);
+
+      // Add to views
+      const activeView = model.views.find((v) => v.id === getActiveViewId()) ?? model.views[0];
+      for (const n of newNodes) {
+        const id = String(n.id);
+        const isScreen = (n.space ?? "world") === "screen";
+        if (isScreen) {
+          for (const v of model.views) if (!v.show.includes(id)) v.show.push(id);
+        } else {
+          if (activeView && !activeView.show.includes(id)) activeView.show.push(id);
+        }
+      }
+
+      engine.setModel(cloneModel(model));
+      await hydrateQrImages(engine, model);
+      hydrateTextMath(engine, model);
+      selected.clear();
+      // Select pasted roots (more ergonomic than selecting every child).
+      for (const oldId of rootOldIds) {
+        const nid = idMap.get(oldId);
+        if (nid) selected.add(nid);
+      }
+      applySelection();
+      await commit(before);
       ev.preventDefault();
       return;
     }
@@ -3750,13 +6028,22 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   let compositeHiddenEls: HTMLElement[] = [];
   let compositeSelectedSubId: string | null = null;
   let compositeSelectedSubEl: HTMLElement | null = null;
-  let compositeDragMode: "none" | "move" | "resize" | "rotate" = "none";
+  let compositeDragMode: "none" | "move" | "resize" | "rotate" | "arrow" = "none";
   let compositeActiveHandle: string | null = null;
   let compositeStart = { x: 0, y: 0 };
   let compositeStartGeom: any = null;
   let compositeGrabOff = { x: 0, y: 0 };
   let compositeStartAngleRad = 0;
   let compositeStartRotationDeg = 0;
+  let compositeArrowDrag:
+    | null
+    | {
+        arrowId: string;
+        end: "p1" | "p2";
+        // Start point in client space (for hover thresholding)
+        startClientX: number;
+        startClientY: number;
+      } = null;
   let compositeDrag:
     | null
     | {
@@ -3768,6 +6055,40 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         box: DOMRect;
       } = null;
 
+  const compositeOuterRectClient = (rootEl: HTMLElement, layer: HTMLElement) => {
+    // Union bbox for the composite root + all its internal sub-elements (labels, buttons, plot, arrow hits).
+    // This is used to:
+    // - decide whether a double-click is "background" (screen edit) vs "inside a node"
+    // - gate group-edit interactions so you can't click inside the group but outside its bbox
+    const rr = rootEl.getBoundingClientRect();
+    let l = rr.left,
+      t = rr.top,
+      r = rr.right,
+      b = rr.bottom;
+    for (const sub of Array.from(layer.querySelectorAll<HTMLElement>(".comp-sub"))) {
+      const sr = sub.getBoundingClientRect();
+      // Skip absurd rects (e.g. detached/hidden)
+      if (!(sr.width > 0.5 && sr.height > 0.5)) continue;
+      l = Math.min(l, sr.left);
+      t = Math.min(t, sr.top);
+      r = Math.max(r, sr.right);
+      b = Math.max(b, sr.bottom);
+      // Include actual button rects (background/padding/border are on the button itself).
+      for (const btn of Array.from(sub.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
+        const br = btn.getBoundingClientRect();
+        if (!(br.width > 0.5 && br.height > 0.5)) continue;
+        l = Math.min(l, br.left);
+        t = Math.min(t, br.top);
+        r = Math.max(r, br.right);
+        b = Math.max(b, br.bottom);
+      }
+    }
+    return { left: l, top: t, right: r, bottom: b };
+  };
+
+  const isInRect = (rc: { left: number; top: number; right: number; bottom: number }, x: number, y: number) =>
+    x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom;
+
   // Screen edit mode (edit only): isolate and edit screen-space nodes.
   exitScreenEdit = () => {
     if (!screenEditMode) return;
@@ -3777,6 +6098,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
     screenDimmedEls = [];
     screenEditMode = false;
+    delete (window as any).__ip_screenEditing;
     const wrap = document.querySelector<HTMLElement>(".mode-toggle");
     const modeNow = (wrap?.dataset.mode ?? "edit").toLowerCase();
     const btn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
@@ -3792,6 +6114,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     exitScreenEdit();
     clearSelection();
     screenEditMode = true;
+    (window as any).__ip_screenEditing = true;
     const model = engine.getModel();
     const clampScreenTransform = (t: any) => {
       const w = Number(t.w ?? 0.2);
@@ -3828,6 +6151,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   const enterTimerCompositeEdit = (timerId: string) => {
+    const dbg = ipDebugEnabled("ip_debug_dblclick");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][dblclick] enterTimerCompositeEdit()", { timerId });
+    }
     // Avoid conflicting isolate modes.
     exitScreenEdit();
     compositeEditKind = "timer";
@@ -3854,14 +6182,27 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
     const layer = ensureTimerCompositeLayer(engine, timerId);
     if (layer) layer.style.pointerEvents = "auto";
+    // Mark composite editing so CSS can optionally gray out non-editable parts.
+    el.dataset.compositeEditing = "1";
     // Seed editable geoms for this composite folder.
     compositeGeomsByPath[timerId] = (layer as any)?.__textGeoms ?? {};
     for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".comp-sub") ?? [])) {
-      sub.style.pointerEvents = "auto";
-      sub.style.cursor = "grab";
+      // Lock the plot/data reference region: it's the coordinate system basis for everything else.
+      if (sub.dataset.kind === "plot-region") {
+        sub.style.pointerEvents = "none";
+        sub.style.cursor = "default";
+        // Keep the reference region visible and "grayed" while editing.
+        sub.style.background = "rgba(255,255,255,0.06)";
+        sub.style.outline = "1px dashed rgba(255,255,255,0.25)";
+        sub.style.outlineOffset = "0px";
+        sub.style.opacity = "0.45";
+      } else {
+        sub.style.pointerEvents = "auto";
+        sub.style.cursor = "grab";
+      }
       // Keep clean while editing (no frames).
       sub.style.border = "none";
-      sub.style.background = "transparent";
+      if (sub.dataset.kind !== "plot-region") sub.style.background = "transparent";
       sub.style.borderRadius = "0";
       sub.style.padding = "0";
     }
@@ -3874,6 +6215,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   const enterChoicesCompositeEdit = (pollId: string) => {
+    const dbg = ipDebugEnabled("ip_debug_dblclick");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][dblclick] enterChoicesCompositeEdit()", { pollId });
+    }
     // Avoid conflicting isolate modes.
     exitScreenEdit();
     compositeEditKind = "choices";
@@ -3902,6 +6248,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     const layer = el.querySelector<HTMLElement>(".choices-sub-layer");
     if (layer) layer.style.pointerEvents = "auto";
+    // Mark composite editing so CSS can gray out non-editable parts (buttons + pie).
+    el.dataset.compositeEditing = "1";
     // Seed editable geoms for nested folders from the model.
     const m = engine.getModel();
     const node = m?.nodes.find((n: any) => n.id === pollId);
@@ -3917,16 +6265,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       sub.style.padding = "0";
     }
 
-    // Make bullets the "main" editable element by default.
-    const bulletsEl = el.querySelector<HTMLElement>(".choices-bullets.comp-sub");
-    if (bulletsEl) {
-      for (const e3 of Array.from(el.querySelectorAll<HTMLElement>(".comp-sub"))) e3.classList.remove("is-selected");
-      bulletsEl.classList.add("is-selected");
-      ensureHandles(bulletsEl);
-      compositeEditPath = String(bulletsEl.dataset.compPath || pollId);
-      compositeSelectedSubId = bulletsEl.dataset.subId ?? "bullets";
-      compositeSelectedSubEl = bulletsEl;
-    }
+    // Do not auto-select the root node here.
+    // In group edit, the primary workflow is selecting/moving bullets and wheel independently.
+    // (Root selection is still possible by clicking the node outside sub-elements.)
 
     const modeBtn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
     if (modeBtn) modeBtn.textContent = "Exit group edit";
@@ -3935,6 +6276,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   const enterSoundCompositeEdit = (soundId: string) => {
+    const dbg = ipDebugEnabled("ip_debug_dblclick");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][dblclick] enterSoundCompositeEdit()", { soundId });
+    }
     // Avoid conflicting isolate modes.
     exitScreenEdit();
     compositeEditKind = "sound";
@@ -3976,11 +6322,19 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const exitTimerCompositeEdit = () => {
     if (!compositeEditTimerId) return;
     const el = engine.getNodeElement(compositeEditTimerId);
+    // Hard guarantee: strip any leftover sub-element selection chrome when exiting group edit.
+    if (el) {
+      for (const sub of Array.from(el.querySelectorAll<HTMLElement>(".comp-sub.is-selected, .timer-sub.is-selected"))) {
+        sub.classList.remove("is-selected");
+        sub.querySelector(".handles")?.remove();
+      }
+    }
     if (compositeEditKind === "timer") {
       const ov = el?.querySelector<HTMLElement>(".timer-overlay");
       if (ov) ov.style.display = "block";
       const layer = el?.querySelector<HTMLElement>(".timer-sub-layer");
       if (layer) layer.style.pointerEvents = "none";
+      if (el) el.dataset.compositeEditing = "0";
     } else if (compositeEditKind === "sound") {
       const ov = el?.querySelector<HTMLElement>(".sound-overlay");
       if (ov) ov.style.display = "block";
@@ -3991,6 +6345,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
       // Keep interactive so dblclick on bullets enters group edit (no "screen edit" by accident).
       if (layer) layer.style.pointerEvents = "auto";
+      if (el) el.dataset.compositeEditing = "0";
     }
     for (const e2 of compositeHiddenEls) e2.classList.remove("ip-dim-node");
     compositeHiddenEls = [];
@@ -4092,8 +6447,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const newText = ta.value.replaceAll("\r\n", "\n");
       subEl.dataset.template = newText;
 
-      // Update the stored elements.txt (single-line text syntax).
-      const src = String((layer as any).__elementsText ?? "");
+      // Update the stored elements.pr (single-line text syntax).
+      const src = String((layer as any).__elementsPr ?? "");
       const lines = src.split(/\r?\n/);
       const out: string[] = [];
       const re = new RegExp(`^\\s*text\\[name=${subId.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\]\\s*:\\s*(.*)$`);
@@ -4107,14 +6462,14 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         }
       }
       const nextText = out.join("\n");
-      (layer as any).__elementsText = nextText;
+      (layer as any).__elementsPr = nextText;
 
-      // Persist elementsText (and current geoms) to backend.
+      // Persist elements.pr (and current geoms) to backend.
       const geoms: any = (layer as any).__textGeoms ?? {};
       void fetch(`${BACKEND}/api/composite/save`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ compositePath: timerId, geoms, elementsText: nextText })
+        body: JSON.stringify({ compositePath: timerId, geoms, elementsPr: nextText })
       });
       close();
     });
@@ -4232,15 +6587,137 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   stage.addEventListener("dblclick", async (ev) => {
+    const dbg = ipDebugEnabled("ip_debug_dblclick");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][dblclick] fired", {
+        appMode: getAppMode(),
+        client: { x: ev.clientX, y: ev.clientY },
+        button: (ev as any).button,
+        detail: (ev as any).detail,
+        targetTag: (ev.target as any)?.tagName,
+        targetClass: (ev.target as any)?.className,
+        compositeEditTimerId,
+        compositeEditKind,
+        screenEditMode,
+        selected: Array.from(selected)
+      });
+    }
     // Hard block: Live mode must be resistant to any editing gestures.
     if (getAppMode() !== "edit") return;
     const target = ev.target as HTMLElement;
+    // Use dataset selector (more reliable than `.node` which can be missing on inner elements).
+    // NOTE: for composite-heavy nodes (timer/sound), sub-elements may not be within a `.node` DOM subtree.
+    // So we ALSO fall back to a geometry hit-test across all node bounding boxes.
+    const hitNodeEl = target.closest<HTMLElement>("[data-node-id], .node");
+    const model = engine.getModel();
+    // Composite roots: always prioritize entering group edit when dblclicking inside their effective bbox,
+    // even if the underlying DOM hit-test doesn't resolve cleanly (e.g. clicking through overlay chrome/canvas).
+    if (!compositeEditTimerId && model) {
+      const x = ev.clientX;
+      const y = ev.clientY;
+      let best: { id: string; kind: "timer" | "sound" | "choices"; area: number } | null = null;
+      for (const n of model.nodes as any[]) {
+        const kind = String(n?.type ?? "");
+        if (kind !== "timer" && kind !== "sound" && kind !== "choices") continue;
+        const el = engine.getNodeElement(String(n.id));
+        if (!el) continue;
+        const rotDeg = Number(n?.transform?.rotationDeg ?? 0) || 0;
+        const eff = kind === "choices" ? null : effectiveNodeRectClient(el, n);
+        const r = eff ?? (el.getBoundingClientRect() as any);
+        const rc: any = { left: r.left, top: r.top, right: r.right ?? r.left + r.width, bottom: r.bottom ?? r.top + r.height, width: r.width, height: r.height };
+        const hit = isPointInRotatedRectClient(rc, rotDeg, x, y);
+        if (dbg) {
+          // eslint-disable-next-line no-console
+          console.log("[ip][dblclick] candidate", {
+            id: String(n.id),
+            type: kind,
+            rotDeg,
+            hit,
+            rect: { left: rc.left, top: rc.top, width: rc.width, height: rc.height }
+          });
+        }
+        if (!hit) continue;
+        const area = Math.max(1, rc.width * rc.height);
+        if (!best || area < best.area) best = { id: String(n.id), kind: kind as any, area };
+      }
+      if (best) {
+        if (dbg) {
+          // eslint-disable-next-line no-console
+          console.log("[ip][dblclick] entering composite edit", best);
+        }
+        if (best.kind === "timer") enterTimerCompositeEdit(best.id);
+        else if (best.kind === "sound") enterSoundCompositeEdit(best.id);
+        else enterChoicesCompositeEdit(best.id);
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+      if (dbg) {
+        // eslint-disable-next-line no-console
+        console.log("[ip][dblclick] no composite root hit");
+      }
+    }
+
+    // If a composite root (timer/sound/choices) is selected, double-clicking within its OUTER selection
+    // box should always enter group edit (even if the click target is the overlay selection chrome).
+    if (!compositeEditTimerId && model && selected.size === 1) {
+      const selId = Array.from(selected)[0];
+      const selNode: any = model.nodes.find((n: any) => String(n.id) === String(selId));
+      const selEl = selNode ? engine.getNodeElement(String(selNode.id)) : null;
+      if (selNode && selEl && (selNode.type === "timer" || selNode.type === "sound")) {
+        const eff = effectiveNodeRectClient(selEl, selNode);
+        const rotDeg = Number(selNode?.transform?.rotationDeg ?? 0) || 0;
+        if (eff && isPointInRotatedRectClient(eff as any, rotDeg, ev.clientX, ev.clientY)) {
+          if (selNode.type === "timer") enterTimerCompositeEdit(String(selNode.id));
+          else enterSoundCompositeEdit(String(selNode.id));
+          (ev as any).stopImmediatePropagation?.();
+          ev.preventDefault();
+          return;
+        }
+      }
+      if (selNode && selEl && selNode.type === "choices") {
+        const r = selEl.getBoundingClientRect();
+        const rotDeg = Number(selNode?.transform?.rotationDeg ?? 0) || 0;
+        const rc: any = { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        if (isPointInRotatedRectClient(rc, rotDeg, ev.clientX, ev.clientY)) {
+          enterChoicesCompositeEdit(String(selNode.id));
+          (ev as any).stopImmediatePropagation?.();
+          ev.preventDefault();
+          return;
+        }
+      }
+    }
+    const hitNodeIdByRect = (() => {
+      if (!model) return null;
+      // Prefer the deepest DOM element if it has a node id.
+      const domId = (hitNodeEl as any)?.dataset?.nodeId ?? (hitNodeEl as any)?.dataset?.nodeId;
+      if (domId) return String(domId);
+      const x = ev.clientX;
+      const y = ev.clientY;
+      let best: { id: string; area: number } | null = null;
+      for (const n of model.nodes as any[]) {
+        const el = engine.getNodeElement(String(n.id));
+        if (!el) continue;
+        const rotDeg = Number(n?.transform?.rotationDeg ?? 0) || 0;
+        // Use rotated hit-testing so this works for rotated nodes AND composites.
+        const eff = effectiveNodeRectClient(el, n);
+        const r = eff ?? (el.getBoundingClientRect() as any);
+        const rc: any = { left: r.left, top: r.top, right: r.right ?? r.left + r.width, bottom: r.bottom ?? r.top + r.height, width: r.width, height: r.height };
+        if (!isPointInRotatedRectClient(rc, rotDeg, x, y)) continue;
+        const area = Math.max(1, rc.width * rc.height);
+        if (!best || area < best.area) best = { id: String(n.id), area };
+      }
+      return best?.id ?? null;
+    })();
+    const hitAnyBBox = !!hitNodeIdByRect;
 
     // Background double-click behavior:
     // - If in group edit: exit group edit.
     // - Else if in screen edit: exit screen edit.
     // - Else: enter screen edit.
-    if (!target.closest(".node") && !target.closest(".modal") && !target.closest(".ctx-menu") && !target.closest(".edit-toolbox")) {
+    // IMPORTANT: only treat as "background" if the click is OUTSIDE ALL node bounding boxes.
+    if (!hitAnyBBox && !target.closest(".modal") && !target.closest(".ctx-menu") && !target.closest(".edit-toolbox")) {
       if ((window as any).__ip_exitCompositeEdit) {
         (window as any).__ip_exitCompositeEdit?.();
         ev.preventDefault();
@@ -4286,13 +6763,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         return;
       }
     }
-    const nodeEl = target.closest<HTMLElement>(".node");
-    const id = nodeEl?.dataset.nodeId;
-    if (!id) {
-      return;
-    }
-    const model = engine.getModel();
-    const node = model?.nodes.find((n) => n.id === id) as any;
+    const id = hitNodeIdByRect;
+    if (!id || !model) return;
+    const node = model.nodes.find((n: any) => String(n.id) === String(id)) as any;
 
     // Block editing screen elements when not in screen edit mode
     if (!screenEditMode && node && node.space === "screen") {
@@ -4328,8 +6801,41 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId) return;
     const t = ev.target as HTMLElement;
-    const sub = t.closest<HTMLElement>(".comp-sub");
+    const rootEl = engine.getNodeElement(compositeEditTimerId);
+    if (!rootEl) return;
+    const layer =
+      compositeEditKind === "timer"
+        ? rootEl.querySelector<HTMLElement>(".timer-sub-layer")
+        : compositeEditKind === "sound"
+          ? rootEl.querySelector<HTMLElement>(".sound-sub-layer")
+          : rootEl.querySelector<HTMLElement>(".choices-sub-layer");
+    if (!layer) return;
+    // Enforce composite bounding box: you should not be able to interact with the group outside its bbox.
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId) {
+      const m = engine.getModel();
+      const node: any = m?.nodes.find((n: any) => String(n.id) === String(compositeEditTimerId));
+      const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+      const eff = node ? effectiveNodeRectClient(rootEl, node) : null;
+      const rc = eff ?? (compositeOuterRectClient(rootEl, layer) as any);
+      const inside = rc ? isPointInRotatedRectClient(rc as any, rotDeg, ev.clientX, ev.clientY) : false;
+      if (!inside) {
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+    }
+    // When grabbing resize/rotate handles, NEVER re-pick: handles can sit outside the sub rect,
+    // and re-picking makes unrelated elements (e.g. wheel) appear "connected".
+    const handleHit = t.closest<HTMLElement>(".handle, .handles, .anchor-dot");
+    const directSub = t.closest<HTMLElement>(".comp-sub");
+    const sub = handleHit && directSub ? directSub : _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY);
     if (!sub) return;
+    // Lock plot/data region (reference system) in group edit: not selectable/movable.
+    if (sub.dataset.kind === "plot-region") {
+      (ev as any).stopImmediatePropagation?.();
+      ev.preventDefault();
+      return;
+    }
     // If the user is grabbing the root node handles, let the normal editor handle it.
     if (t.closest(".node > .handles")) return;
     // When selecting a sub-element, clear root selection so the transform UI follows the sub-element.
@@ -4342,6 +6848,47 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     compositeSelectedSubEl = sub;
     for (const e of Array.from(timerEl.querySelectorAll<HTMLElement>(".comp-sub"))) e.classList.remove("is-selected");
     sub.classList.add("is-selected");
+
+    // Composite axis arrows (timer/sound): drag endpoints in plot coords (no bbox handles).
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && sub.dataset.kind === "plot-arrow") {
+      const specs: any[] = (layer as any).__arrowSpecs ?? [];
+      if (!Array.isArray(specs) || specs.length === 0) return;
+      const requestedArrowId = String(sub.dataset.arrowId ?? "");
+      const { ox, oy, xLen, yLen } = _plotRectCss(timerEl);
+      const toClient = (u: number, vUp: number) => ({ x: ox + u * xLen, y: oy - vUp * yLen });
+      const px = ev.clientX;
+      const py = ev.clientY;
+      let best: { id: string; end: "p1" | "p2"; d2: number } | null = null;
+      for (const a of specs) {
+        const id = String(a?.id ?? "");
+        if (!id) continue;
+        if (requestedArrowId && id !== requestedArrowId) continue;
+        const p1 = toClient(Number(a.x0 ?? 0), Number(a.y0 ?? 0));
+        const p2 = toClient(Number(a.x1 ?? 1), Number(a.y1 ?? 0));
+        const d1 = (p1.x - px) ** 2 + (p1.y - py) ** 2;
+        const d2 = (p2.x - px) ** 2 + (p2.y - py) ** 2;
+        const pick = d1 <= d2 ? { id, end: "p1" as const, d2: d1 } : { id, end: "p2" as const, d2 };
+        if (!best || pick.d2 < best.d2) best = pick;
+      }
+      const THRESH_PX = 32;
+      if (!best || best.d2 > THRESH_PX * THRESH_PX) {
+        // Not near endpoints: don't start a drag (avoid confusing "selection box" behavior).
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+      compositeEditPath = compositeEditTimerId;
+      compositeStartGeom = { x: 0, y: 0, w: 1, h: 1, rotationDeg: 0, anchor: "topLeft", align: "left" };
+      compositeStart = { x: ev.clientX, y: ev.clientY };
+      compositeDragMode = "arrow";
+      compositeArrowDrag = { arrowId: best.id, end: best.end, startClientX: ev.clientX, startClientY: ev.clientY };
+      setBodyCursor("crosshair");
+      (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+      (ev as any).stopImmediatePropagation?.();
+      ev.preventDefault();
+      return;
+    }
+
     ensureHandles(sub);
 
     // Parent-relative coordinates:
@@ -4406,6 +6953,24 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       anchor: String(g0.anchor ?? sub.dataset.anchor ?? "centerCenter"),
       align: String(g0.align ?? (sub.style.textAlign || "center"))
     };
+    // Hard guarantee: the choices wheel group must ALWAYS render as a true circle.
+    // That means the wheel box must be pixel-square, which requires wFrac != hFrac when the parent box isn't square.
+    if (compositeEditKind === "choices" && subId === "wheel") {
+      const aspect = box.width / Math.max(1e-9, box.height);
+      const wPx = compositeStartGeom.w * box.width;
+      const hPx = compositeStartGeom.h * box.height;
+      const sPx = Math.max(8, Math.min(wPx, hPx));
+      const wFrac = sPx / box.width;
+      const hFrac = sPx / box.height;
+      compositeStartGeom.w = wFrac;
+      compositeStartGeom.h = hFrac;
+      sub.style.width = `${wFrac * 100}%`;
+      sub.style.height = `${hFrac * 100}%`;
+      // Keep anchor point stable; store the corrected square-in-pixels fractions.
+      if (subId) geoms[subId] = { ...(geoms[subId] ?? {}), w: wFrac, h: hFrac };
+      // (aspect is only used for reasoning; wFrac/hFrac already encode it)
+      void aspect;
+    }
     // Preserve cursor-to-anchor offset to avoid the “jump” on drag start.
     const px = (ev.clientX - box.left) / box.width;
     const py = (ev.clientY - box.top) / box.height;
@@ -4452,6 +7017,63 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const dx = (ev.clientX - compositeStart.x) / box.width;
     const dy = (ev.clientY - compositeStart.y) / box.height;
 
+    if (compositeDragMode === "arrow" && compositeArrowDrag) {
+      const cad = compositeArrowDrag;
+      if (!(compositeEditKind === "timer" || compositeEditKind === "sound")) return;
+      const layer =
+        compositeEditKind === "timer"
+          ? timerEl.querySelector<HTMLElement>(".timer-sub-layer")
+          : timerEl.querySelector<HTMLElement>(".sound-sub-layer");
+      if (!layer) return;
+      const specs: any[] = (layer as any).__arrowSpecs ?? [];
+      if (!Array.isArray(specs) || specs.length === 0) return;
+      const spec = specs.find((a: any) => String(a?.id ?? "") === cad.arrowId);
+      if (!spec) return;
+
+      const { ox, oy, xLen, yLen } = _plotRectCss(timerEl);
+      const u = (ev.clientX - ox) / Math.max(1e-9, xLen);
+      const vUp = (oy - ev.clientY) / Math.max(1e-9, yLen);
+      const uu = Math.max(-1, Math.min(2, u));
+      const vv = Math.max(-1, Math.min(2, vUp));
+      if (cad.end === "p1") {
+        spec.x0 = uu;
+        spec.y0 = vv;
+      } else {
+        spec.x1 = uu;
+        spec.y1 = vv;
+      }
+
+      const fmt = (n: number) => {
+        if (!Number.isFinite(n)) return "0";
+        const t = Math.round(n * 1e6) / 1e6;
+        return String(t);
+      };
+      const id = String(spec.id ?? "");
+      const color = String(spec.color ?? "white");
+      const width = Number.isFinite(Number(spec.width)) ? Number(spec.width) : 0.006;
+      const nextLine = `arrow[name=${id},from=(${fmt(spec.x0)},${fmt(spec.y0)}),to=(${fmt(spec.x1)},${fmt(spec.y1)}),color=${color},width=${fmt(width)}]`;
+
+      const src = String((layer as any).__elementsPr ?? "");
+      const lines = src.split(/\\r?\\n/);
+      const out: string[] = [];
+      const re = new RegExp(`^\\\\s*arrow\\\\[name=${id.replace(/[.*+?^${}()|[\\\\]\\\\\\\\]/g, "\\\\$&")},.*\\\\]\\\\s*$`);
+      let replaced = false;
+      for (const ln of lines) {
+        if (!replaced && re.test(ln.trim())) {
+          out.push(nextLine);
+          replaced = true;
+        } else {
+          out.push(ln);
+        }
+      }
+      if (!replaced) out.push(nextLine);
+      (layer as any).__elementsPr = out.join("\\n");
+
+      if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
+      else renderSoundCompositeArrows(timerEl, layer);
+      return;
+    }
+
     if (compositeDragMode === "move") {
       const px = (ev.clientX - box.left) / box.width;
       const py = (ev.clientY - box.top) / box.height;
@@ -4490,8 +7112,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const min = 0.01;
       const hnd = compositeActiveHandle;
       const isCorner = hnd === "nw" || hnd === "ne" || hnd === "sw" || hnd === "se";
-      const forceUniform =
-        compositeEditKind === "choices" && (sid === "wheel" || sid === "pie"); // keep wheel aspect
+      const forceUniform = compositeEditKind === "choices" && (sid === "wheel" || sid === "pie"); // keep wheel aspect
+      const forceWheelCircle = compositeEditKind === "choices" && sid === "wheel";
 
       // Convert anchor-point rect -> top-left rect for resizing math
       const tl = anchorToTopLeftWorld({ ...rect, anchor: compositeStartGeom.anchor } as any);
@@ -4534,6 +7156,20 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
       tlr.w = Math.max(min, tlr.w);
       tlr.h = Math.max(min, tlr.h);
+      if (forceWheelCircle) {
+        // Pixel-square enforcement:
+        // wFrac*boxW == hFrac*boxH  =>  wFrac == hFrac*(boxH/boxW)
+        const sPx = Math.max(8, Math.max(tlr.w * box.width, tlr.h * box.height));
+        const wNew = sPx / box.width;
+        const hNew = sPx / box.height;
+        // Anchor opposite edges relative to the original top-left rect (tl).
+        const w0 = rect.w;
+        const h0 = rect.h;
+        if (hnd.includes("w")) tlr.x = tl.x + (w0 - wNew);
+        if (hnd.includes("n")) tlr.y = tl.y + (h0 - hNew);
+        tlr.w = wNew;
+        tlr.h = hNew;
+      }
 
       // Back to anchor point
       const ap = topLeftToAnchorWorld(tlr, compositeStartGeom.anchor);
@@ -4545,8 +7181,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       sub.style.height = `${rect.h * 100}%`;
       if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), x: rect.x, y: rect.y, w: rect.w, h: rect.h };
 
-      // Choices composite: scale bullets content with its own sub-element size (so resizing bullets scales fonts).
-      if (compositeEditKind === "choices" && sid === "bullets") {
+      // Choices composite: scale bullets content ONLY for corner scaling (pure scale).
+      // Edge resizing should not change text layout; it should only change the box.
+      if (compositeEditKind === "choices" && sid === "bullets" && isCorner) {
         const baseW = Number(sub.dataset.baseW ?? String(compositeStartGeom.w ?? rect.w));
         const baseH = Number(sub.dataset.baseH ?? String(compositeStartGeom.h ?? rect.h));
         // Seed base sizes once (so scaling works both up and down).
@@ -4554,7 +7191,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         if (!Number.isFinite(Number(sub.dataset.baseH))) sub.dataset.baseH = String(baseH);
         const sx = rect.w / Math.max(1e-9, baseW);
         const sy = rect.h / Math.max(1e-9, baseH);
-        const localScale = Math.max(0.1, Math.min(sx, sy));
+        // Use uniform scale factor (corner scaling is uniform when isCorner is true).
+        // This keeps wrapping behavior stable: width/height/font scale together.
+        const localScale = Math.max(0.1, Math.max(sx, sy));
         sub.style.setProperty("--local-scale", String(localScale));
       }
       return;
@@ -4571,16 +7210,27 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     // Persist composite geometries from the in-memory model (no DOM-rect measuring -> no jitter / size drift).
     const geoms: any = compositeGeomsByPath[compositeEditPath] ?? {};
+    const payload: any = { compositePath: compositeEditPath, geoms };
+    // Timer/sound composites also persist elements.pr (so axis arrow edits are saved).
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && compositeEditPath === compositeEditTimerId) {
+      const layer =
+        compositeEditKind === "timer"
+          ? engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".timer-sub-layer")
+          : engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".sound-sub-layer");
+      const elementsPr = String((layer as any)?.__elementsPr ?? "");
+      if (elementsPr.trim()) payload.elementsPr = elementsPr;
+    }
     void fetch(`${BACKEND}/api/composite/save`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       // Save into the folder that owns the dragged element (supports nested folders).
-      body: JSON.stringify({ compositePath: compositeEditPath, geoms })
+      body: JSON.stringify(payload)
     });
 
     compositeDragMode = "none";
     compositeActiveHandle = null;
     compositeStartGeom = null;
+    compositeArrowDrag = null;
     setBodyCursor("");
   });
 
@@ -4593,8 +7243,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (getAppMode() !== "edit") return;
     const target = ev.target as HTMLElement;
     const anchorEl = target.closest<HTMLElement>(".anchor-dot");
-    const handleEl = target.closest<HTMLElement>(".handle");
     const nodeEl = target.closest<HTMLElement>(".node");
+    const compSubEl = target.closest<HTMLElement>(".comp-sub");
 
     if (nodeEl?.dataset.nodeId) {
       const id = resolveSelectableId(nodeEl.dataset.nodeId);
@@ -4609,6 +7259,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         ev.preventDefault();
         return;
       }
+
+    // Composite sub-elements (including axis arrows) are handled by the composite-sub pointerdown handler above.
 
     // In composite edit mode:
     // - Timer/Sound: never select/rotate the composite root itself (edit sub-elements only).
@@ -4669,19 +7321,42 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
       start = { x: ev.clientX, y: ev.clientY };
 
-      if (handleEl?.dataset.handle && selected.size === 1) {
-        activeHandle = handleEl.dataset.handle;
-        dragMode = activeHandle === "rot" || activeHandle.startsWith("rot-") ? "rotate" : "resize";
-        setBodyCursor(cursorForHandle(activeHandle));
-        if (dragMode === "rotate") {
-          const r = nodeEl.getBoundingClientRect();
-          const cx = r.left + r.width / 2;
-          const cy = r.top + r.height / 2;
-          startAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
-          startRotationDeg = node?.transform.rotationDeg ?? 0;
+      // Special-case arrow/line: edit as a segment with 2 endpoints + midpoint (no bbox resize/rotate).
+      if (selected.size === 1 && (node as any)?.type && ((node as any).type === "arrow" || (node as any).type === "line")) {
+        // Hit regions:
+        // - endpoint balls: radius 20px
+        // - translate band: within 20px of segment, excluding endpoint balls
+        // - closest wins
+        const hnd = hitTestSegmentHandle(nodeEl, ev.clientX, ev.clientY);
+        if (hnd) {
+          activeHandle = hnd;
+          dragMode = "line";
+          setBodyCursor("grabbing");
+          (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+          ev.preventDefault();
+          return;
+        }
+        // Not close enough to the segment; fall back to normal move behavior.
+      } else if (selected.size === 1 && nodeEl) {
+        const hnd = hitTestTransformHandle(nodeEl, node, ev.clientX, ev.clientY);
+        if (hnd) {
+          activeHandle = hnd;
+          dragMode = activeHandle === "rot" || activeHandle.startsWith("rot-") ? "rotate" : "resize";
+          setBodyCursor(cursorForHandleWithRotation(activeHandle, Number((node as any)?.transform?.rotationDeg ?? 0)));
+          if (dragMode === "rotate") {
+            const r = nodeEl.getBoundingClientRect();
+            const cx = r.left + r.width / 2;
+            const cy = r.top + r.height / 2;
+            startAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+            startRotationDeg = (node as any)?.transform?.rotationDeg ?? 0;
+          }
+          (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+          ev.preventDefault();
+          return;
         }
       } else {
         dragMode = "move";
+        setBodyCursor("grabbing");
       }
 
       (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
@@ -4698,6 +7373,98 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const dy = ev.clientY - start.y;
     const cam = engine.getCamera();
     const scr = engine.getScreen();
+
+    if (dragMode === "line" && selected.size === 1) {
+      const onlyId = Array.from(selected)[0];
+      const startNode: any = startNodesById[onlyId];
+      if (!startNode) return;
+      const sp = startNode.space ?? "world";
+      const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
+      const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
+
+      const t0 = startNode.transform ?? {};
+      const from0 = startNode.from ?? { x: 0, y: 0.5 };
+      const to0 = startNode.to ?? { x: 1, y: 0.5 };
+      const tl0 = anchorToTopLeftWorld({ x: Number(t0.x ?? 0), y: Number(t0.y ?? 0), w: Number(t0.w ?? 1), h: Number(t0.h ?? 1), anchor: t0.anchor ?? "topLeft" } as any);
+      const w0 = Math.max(1e-9, Number(t0.w ?? 1));
+      const h0 = Math.max(1e-9, Number(t0.h ?? 1));
+      let p1 = { x: tl0.x + Number(from0.x ?? 0) * w0, y: tl0.y + Number(from0.y ?? 0) * h0 };
+      let p2 = { x: tl0.x + Number(to0.x ?? 1) * w0, y: tl0.y + Number(to0.y ?? 0) * h0 };
+
+      const hnd = activeHandle ?? "mid";
+      if (hnd === "p1") {
+        p1 = { x: p1.x + ddx, y: p1.y + ddy };
+      } else if (hnd === "p2") {
+        p2 = { x: p2.x + ddx, y: p2.y + ddy };
+      } else {
+        // mid: translate both
+        p1 = { x: p1.x + ddx, y: p1.y + ddy };
+        p2 = { x: p2.x + ddx, y: p2.y + ddy };
+      }
+
+      // Snap (Shift) for world-space only.
+      if (ev.shiftKey && sp === "world") {
+        const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
+        const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
+        const snap = (v: number) => Math.round(v / snapSpacing) * snapSpacing;
+        const snapPt = (p: { x: number; y: number }) => ({ x: snap(p.x), y: snap(p.y) });
+        const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          return dx * dx + dy * dy;
+        };
+
+        if (hnd === "p1") {
+          // Endpoint drag: snap ONLY the moved endpoint.
+          p1 = snapPt(p1);
+        } else if (hnd === "p2") {
+          // Endpoint drag: snap ONLY the moved endpoint.
+          p2 = snapPt(p2);
+        } else {
+          // Mid translate: preserve length+angle by applying a SINGLE translation snap offset.
+          // We snap whichever endpoint is closer to a grid intersection, then apply that delta to both.
+          const s1 = snapPt(p1);
+          const s2 = snapPt(p2);
+          const d1 = dist2(p1, s1);
+          const d2 = dist2(p2, s2);
+          const dx = (d1 <= d2 ? s1.x - p1.x : s2.x - p2.x);
+          const dy = (d1 <= d2 ? s1.y - p1.y : s2.y - p2.y);
+          p1 = { x: p1.x + dx, y: p1.y + dy };
+          p2 = { x: p2.x + dx, y: p2.y + dy };
+        }
+      }
+
+      // Refit an axis-aligned bbox around the two points (keeps endpoints within [0..1]).
+      let minX = Math.min(p1.x, p2.x);
+      let minY = Math.min(p1.y, p2.y);
+      let maxX = Math.max(p1.x, p2.x);
+      let maxY = Math.max(p1.y, p2.y);
+      const minSize = sp === "world" ? 10 : 0.005;
+      if (maxX - minX < minSize) {
+        const cx = (minX + maxX) / 2;
+        minX = cx - minSize / 2;
+        maxX = cx + minSize / 2;
+      }
+      if (maxY - minY < minSize) {
+        const cy = (minY + maxY) / 2;
+        minY = cy - minSize / 2;
+        maxY = cy + minSize / 2;
+      }
+      const w1 = maxX - minX;
+      const h1 = maxY - minY;
+      const fx = (p1.x - minX) / w1;
+      const fy = (p1.y - minY) / h1;
+      const tx = (p2.x - minX) / w1;
+      const ty = (p2.y - minY) / h1;
+
+      engine.updateNode(onlyId, {
+        transform: { x: minX, y: minY, w: w1, h: h1, anchor: "topLeft", rotationDeg: 0 } as any,
+        from: { x: fx, y: fy },
+        to: { x: tx, y: ty }
+      } as any);
+      applySelection();
+      return;
+    }
 
     if (dragMode === "move") {
       for (const id of selected) {
@@ -4732,7 +7499,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     if (dragMode === "rotate") {
       const el = engine.getNodeElement(onlyId);
-      const r = el?.getBoundingClientRect();
+      const curModel = engine.getModel();
+      const curNode: any = curModel?.nodes.find((n) => n.id === onlyId);
+      const eff = el && (curNode?.type === "timer" || curNode?.type === "sound") ? effectiveNodeRectClient(el, curNode) : null;
+      const r = (eff as any) ?? el?.getBoundingClientRect();
       if (!r) return;
       const cx = r.left + r.width / 2;
       const cy = r.top + r.height / 2;
@@ -4741,6 +7511,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       let rot = startRotationDeg + d;
       if (ev.shiftKey) rot = Math.round(rot / 15) * 15;
       engine.updateNode(onlyId, { transform: { rotationDeg: rot } as any } as any);
+      // Keep cursor angle in sync while snapping (otherwise it can look “stuck” until the next hover event).
+      if (activeHandle) setBodyCursor(cursorForHandleWithRotation(activeHandle, rot));
+      // Refresh selection chrome for composites without recreating node-level handles (which causes "double anchors").
+      if (curNode?.type === "timer" || curNode?.type === "sound") applySelection();
+      else if (el) ensureHandles(el);
       return;
     }
 
@@ -4750,8 +7525,6 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
       const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
       const min = sp === "world" ? 5 : 0.01;
-      const isCorner =
-        activeHandle === "nw" || activeHandle === "ne" || activeHandle === "sw" || activeHandle === "se";
 
       const curModel = engine.getModel();
       const curNode: any = curModel?.nodes.find((n) => n.id === onlyId);
@@ -4769,20 +7542,61 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
             : Number((startNode as any).fontPx ?? (t0.h ?? 40) * 0.6)
           : null;
 
-      if (isCorner) {
+      // Corner scaling:
+      // - Text: scale on BOTH bottom corners (sw/se)
+      // - Bullets: scale ONLY on bottom-right (se) to behave like a "text region" where edge resizes
+      //            change wrapping/rows, and one corner scales the whole thing.
+      const isScaleCorner =
+        activeHandle === "sw" || activeHandle === "se"
+          ? curNode?.type === "bullets"
+            ? activeHandle === "se"
+            : true
+          : false;
+
+      const snapSpacingWorld =
+        ev.shiftKey && sp === "world"
+          ? (() => {
+              const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
+              return t >= 0.5 ? spacing1 : spacing0;
+            })()
+          : null;
+      const snapWorld = (v: number) => {
+        const s = snapSpacingWorld;
+        if (!(s && s > 0)) return v;
+        return Math.round(v / s) * s;
+      };
+
+      if (isScaleCorner) {
         const sx = activeHandle.includes("w") ? -ddx : ddx;
         const sy = activeHandle.includes("n") ? -ddy : ddy;
         const w1 = Math.max(min, t0.w + sx);
         const h1 = Math.max(min, t0.h + sy);
-        const s = Math.max(w1 / Math.max(1e-9, t0.w), h1 / Math.max(1e-9, t0.h));
-        rect.w = Math.max(min, t0.w * s);
-        rect.h = Math.max(min, t0.h * s);
+        const sRaw = Math.max(w1 / Math.max(1e-9, t0.w), h1 / Math.max(1e-9, t0.h));
+
+        // Corner scaling changes box size (including bullets).
+        rect.w = Math.max(min, t0.w * sRaw);
+        rect.h = Math.max(min, t0.h * sRaw);
+
+        // Shift: snap uniform scale so the resulting box width/height lands on grid units.
+        // Rule: snap when either dimension is close to a whole number of grid units; pick the closer snap.
+        if (snapSpacingWorld) {
+          const snappedW = Math.max(min, snapWorld(rect.w));
+          const snappedH = Math.max(min, snapWorld(rect.h));
+          const sFromW = snappedW / Math.max(1e-9, t0.w);
+          const sFromH = snappedH / Math.max(1e-9, t0.h);
+          const sUse = Math.abs(sFromW - sRaw) <= Math.abs(sFromH - sRaw) ? sFromW : sFromH;
+          rect.w = Math.max(min, t0.w * sUse);
+          rect.h = Math.max(min, t0.h * sUse);
+        }
+
+        // Corner scaling changes box size (including bullets).
         if (activeHandle.includes("w")) rect.x = tl0.x + (t0.w - rect.w);
         if (activeHandle.includes("n")) rect.y = tl0.y + (t0.h - rect.h);
 
         // Corner scaling should scale text-like font size along with the box.
         if (isTextLike) {
-          engine.updateNode(onlyId, { fontPx: Math.max(1, (startFontPx ?? 28) * s) } as any);
+          const sUsed = rect.w / Math.max(1e-9, t0.w);
+          engine.updateNode(onlyId, { fontPx: Math.max(1, (startFontPx ?? 28) * sUsed) } as any);
         }
       } else {
         // Edge handles: free resize
@@ -4795,6 +7609,34 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         if (activeHandle.includes("n")) {
           rect.y = tl0.y + ddy;
           rect.h = Math.max(min, t0.h - ddy);
+        }
+
+        // Shift: snap ONLY the moved edge to grid lines (world-space only).
+        if (snapSpacingWorld) {
+          // Snap x edges
+          if (activeHandle.includes("e") && !activeHandle.includes("w")) {
+            const right = rect.x + rect.w;
+            const rightSn = snapWorld(right);
+            rect.w = Math.max(min, rightSn - rect.x);
+          }
+          if (activeHandle.includes("w")) {
+            const rightFixed = tl0.x + t0.w;
+            const leftSn = snapWorld(rect.x);
+            rect.x = leftSn;
+            rect.w = Math.max(min, rightFixed - rect.x);
+          }
+          // Snap y edges
+          if (activeHandle.includes("s") && !activeHandle.includes("n")) {
+            const bottom = rect.y + rect.h;
+            const bottomSn = snapWorld(bottom);
+            rect.h = Math.max(min, bottomSn - rect.y);
+          }
+          if (activeHandle.includes("n")) {
+            const bottomFixed = tl0.y + t0.h;
+            const topSn = snapWorld(rect.y);
+            rect.y = topSn;
+            rect.h = Math.max(min, bottomFixed - rect.y);
+          }
         }
 
         // Edge resizing should NOT scale text font; initialize fontPx if missing so it stays stable.
@@ -4812,13 +7654,21 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
   });
 
-  stage.addEventListener("pointerup", async () => {
+  // Finish drag reliably even if pointerup happens outside the stage.
+  window.addEventListener("pointerup", () => {
+    void finishDrag();
+  });
+  window.addEventListener("pointercancel", () => {
+    // Cancel should not commit.
+    pendingCompositeDrag = null;
     dragMode = "none";
     activeHandle = null;
     setBodyCursor("");
     startNodesById = null;
-    await commit(startSnapshot);
     startSnapshot = null;
+    const mx = (window as any).__ip_lastMouseX;
+    const my = (window as any).__ip_lastMouseY;
+    if (typeof mx === "number" && typeof my === "number") updateStageCursorFromClientPoint(mx, my);
   });
 }
 
@@ -4845,18 +7695,15 @@ async function main() {
   const DESIGN_W = (model as any).defaults?.designWidth ?? 1920;
   const baseViewCam = (viewsInOrder[0] as any)?.camera ?? { cx: 0, cy: 0, zoom: 1 };
   const toActualCamera = (c: { cx: number; cy: number; zoom: number }) => {
-    // Treat model camera.zoom as a "zoom factor" relative to fitting the design viewport height.
+    // Treat model camera.zoom as a "zoom factor" relative to fitting the design viewport.
+    // Fit BOTH width+height so authored defaults stay inside the view for any window size.
     const scr = engine.getScreen();
-    const fit = scr.h / DESIGN_H;
-    // Backend view layout uses DESIGN_W/DESIGN_H to place views one "design viewport" apart.
-    // But when we fit height, the visible world width depends on the current aspect ratio.
-    // Scale X offsets so adjacent views stay one viewport apart for any window size.
-    const aspect = scr.w / Math.max(1, scr.h);
-    const visibleWAtZoom1 = DESIGN_H * aspect;
-    const xScale = visibleWAtZoom1 / Math.max(1, DESIGN_W);
+    const fit = Math.min(scr.h / DESIGN_H, scr.w / DESIGN_W);
     return {
-      cx: baseViewCam.cx + (c.cx - baseViewCam.cx) * xScale,
-      cy: baseViewCam.cy + (c.cy - baseViewCam.cy),
+      // IMPORTANT: keep cx/cy in the same world space as nodes. Scaling camera centers without
+      // scaling node positions causes view content to drift offscreen.
+      cx: c.cx,
+      cy: c.cy,
       zoom: c.zoom * fit,
     };
   };

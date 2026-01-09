@@ -7,11 +7,11 @@ text[name=x_label]: Time (s)
 text[name=y_label]: Procentage (%)
 
 # Default controls (non-editable chrome; uses KaTeX + {{...}} bindings):
-buttons[name=timer1_buttons,orientation=h,labels=[{{runPauseResume}}, Reset],actions=[timer-startstop, timer-reset]]
+buttons[name=t_timer_buttons, orientation=h, labels=[{{runPauseResume}}, Reset], actions=[timer-startstop, timer-reset]]
 
 # Stats label (auto-updated via {{...}} binding, editable/positionable):
 text[name=stats]: \mu={{mean}}s    \sigma={{sigma}}s    count={{count}}
 
 # Default arrows (editable in composite mode):
-arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]
-arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]
+arrow[name=x_axis, from=(0,0), to=(1.05,0), color=white, width=0.006]
+arrow[name=y_axis, from=(0,0), to=(0,1.05), color=white, width=0.006]

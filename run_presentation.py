@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -10,6 +12,30 @@ import webbrowser
 from pathlib import Path
 from shutil import which
 
+_STOP_REQUESTED = False
+
+
+def _request_stop() -> None:
+    global _STOP_REQUESTED
+    _STOP_REQUESTED = True
+
+
+def _install_signal_handlers() -> None:
+    """
+    Best-effort: ensure "stop" signals lead to a clean shutdown.
+
+    Notes:
+    - Ctrl+C -> SIGINT (raises KeyboardInterrupt normally)
+    - Ctrl+Z on many *nix shells -> SIGTSTP (suspends by default, keeping the port bound)
+      We override SIGTSTP to request shutdown instead, so the server doesn't linger.
+    - On Windows PowerShell, Ctrl+Z is NOT a stop signal for processes; users should use Ctrl+C.
+    """
+    try:
+        if hasattr(signal, "SIGTSTP"):
+            signal.signal(signal.SIGTSTP, lambda *_: _request_stop())  # type: ignore[arg-type]
+    except Exception:
+        # Non-fatal; continue without extra signal handling.
+        pass
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent
@@ -167,10 +193,61 @@ def _ensure_node_deps(root: Path) -> None:
         raise SystemExit(res.returncode)
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run interactive presentation (dev mode).")
+    p.add_argument(
+        "-p",
+        "--presentation",
+        default=os.environ.get("IP_PRESENTATION_ID") or "default",
+        help="Presentation id (folder under ./presentations/). Also configurable via IP_PRESENTATION_ID.",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=int(os.environ.get("IP_PORT") or "8000"),
+        help="Local backend port (default: 8000). Useful if another server is already running.",
+    )
+    p.add_argument(
+        "--no-reload",
+        action="store_true",
+        help="Disable uvicorn --reload (more stable on some Windows/OneDrive setups).",
+    )
+    return p.parse_args()
+
+
+def _port_in_use(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
 def main() -> int:
+    _install_signal_handlers()
     root = _repo_root()
+    args = _parse_args()
+    pres_id = str(args.presentation or "default").strip() or "default"
+    port = int(args.port or 8000)
+    reload = not bool(getattr(args, "no_reload", False))
+    os.environ["IP_PRESENTATION_ID"] = pres_id
+    os.environ["IP_PORT"] = str(port)
+    pres_dir = root / "presentations" / pres_id
+    if not pres_dir.exists():
+        print(f"[run_presentation] Presentation folder not found: {pres_dir}")
+        print("[run_presentation] Create it under ./presentations/<id>/ or pick an existing one.")
+        return 1
+    if _port_in_use(port):
+        print(f"[run_presentation] Port {port} is already in use.")
+        print("[run_presentation] Stop the existing server, or run on a different port:")
+        alt = port + 1 if port != 8001 else 8002
+        print(f"[run_presentation]   poetry run python run_presentation.py --presentation {pres_id} --port {alt}")
+        return 1
 
     print("[run_presentation] Starting presentation (dev mode)")
+    print(f"[run_presentation] Presentation id: {pres_id}")
+    print(f"[run_presentation] Port: {port}")
+    print(f"[run_presentation] Reload: {reload}")
     _ensure_node_deps(root)
 
     procs: list[subprocess.Popen] = []
@@ -188,7 +265,7 @@ def main() -> int:
             # Start a localhost.run tunnel so the QR code points to a real public URL.
             try:
                 print("[run_presentation] Starting tunnel (localhost.run via ssh)...")
-                tunnel_proc, public_base_url = _start_localhostrun_tunnel(8000)
+                tunnel_proc, public_base_url = _start_localhostrun_tunnel(port)
                 procs.append(tunnel_proc)
                 if public_base_url:
                     print(f"[run_presentation] Tunnel URL: {public_base_url}")
@@ -202,7 +279,7 @@ def main() -> int:
             except Exception as e:
                 print(f"[run_presentation] Tunnel disabled (could not start ssh tunnel): {e}")
 
-        # Generate / update join QR png into presentations/default/media/join_qr.png
+        # Generate / update join QR png into presentations/<id>/media/join_qr.png
         try:
             import qrcode  # type: ignore
             from PIL import Image  # type: ignore
@@ -214,7 +291,7 @@ def main() -> int:
                 return 1
             join_url = join_origin.rstrip("/") + "/join"
 
-            media_dir = root / "presentations" / "default" / "media"
+            media_dir = root / "presentations" / pres_id / "media"
             media_dir.mkdir(parents=True, exist_ok=True)
             out_path = media_dir / "join_qr.png"
 
@@ -246,11 +323,15 @@ def main() -> int:
             "-m",
             "uvicorn",
             "apps.backend.app.main:app",
-            "--reload",
             "--port",
-            "8000",
+            str(port),
         ]
+        if reload:
+            backend_cmd.append("--reload")
         env_overrides: dict[str, str] = {}
+        # Explicitly pass presentation id to the backend process (important for --reload spawns).
+        env_overrides["IP_PRESENTATION_ID"] = pres_id
+        env_overrides["IP_PORT"] = str(port)
         if public_base_url:
             env_overrides["PUBLIC_BASE_URL"] = public_base_url
         backend_proc = _run_with_env(backend_cmd, cwd=root, env_overrides=env_overrides)
@@ -258,21 +339,23 @@ def main() -> int:
 
         time.sleep(0.5)
         print("")
-        print("[run_presentation] Presentation: http://localhost:8000")
-        print("[run_presentation] Backend API:  http://localhost:8000/api/presentation")
+        print(f"[run_presentation] Presentation: http://localhost:{port}")
+        print(f"[run_presentation] Backend API:  http://localhost:{port}/api/presentation")
         if public_base_url:
             print(f"[run_presentation] Audience join: {public_base_url.rstrip('/')}/join")
         print("")
-        print("[run_presentation] Press Ctrl+C to stop.")
+        print("[run_presentation] Press Ctrl+C to stop. (Ctrl+Z may suspend on some shells and keep the port in use.)")
 
         # Open browser to first view (best-effort; does not guarantee fullscreen).
         try:
-            webbrowser.open("http://localhost:8000", new=1)
+            webbrowser.open(f"http://localhost:{port}", new=1)
         except Exception:
             pass
 
         # Wait until any process exits
         while True:
+            if _STOP_REQUESTED:
+                raise KeyboardInterrupt
             for p in procs:
                 code = p.poll()
                 if code is not None:

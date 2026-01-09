@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import PRESENTATION_DIR
+
 
 @dataclass(frozen=True)
 class Presentation:
@@ -38,7 +40,7 @@ def _load_defaults(pres_dir: Path) -> dict[str, Any]:
         return {"designWidth": 1920, "designHeight": 1080, "viewTransitionMs": 4000, "pixelateSteps": 20}
 
 
-def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None:
+def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str, *, debug: bool = False) -> None:
     """
     If the user deletes the timer folder, we regenerate a default composite.
     (This is groundwork; runtime expansion/editing comes next.)
@@ -64,15 +66,57 @@ def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None
     timer_dir.mkdir(parents=True, exist_ok=True)
 
     # Regenerate defaults if folder (or any required file) is missing.
-    # Back-compat:
-    # - legacy timer composite uses elements.txt (edited via UI today)
-    # - we also generate elements.pr for easier authoring in the repo
-    elements_txt_path = timer_dir / "elements.txt"
     elements_pr_path = timer_dir / "elements.pr"
     geometries_path = timer_dir / "geometries.csv"
     animations_path = timer_dir / "animations.csv"
-    if (elements_txt_path.exists() or elements_pr_path.exists()) and geometries_path.exists() and animations_path.exists():
+    if elements_pr_path.exists() and geometries_path.exists() and animations_path.exists():
+        # Forward-migrate legacy geometry schema only.
+        #
+        # Important:
+        # - Newer composites (edited via the UI) use a different geometries.csv schema
+        #   (includes a `parent` column) and a `view` like "composite".
+        # - Those files should be treated as authoritative user edits; do NOT auto-tweak them.
+        try:
+            gtxt = geometries_path.read_text(encoding="utf-8")
+            header = (gtxt.splitlines()[0] if gtxt else "").strip()
+            if "parent" in header:
+                return
+            if "\ny_label," in gtxt:
+                lines = gtxt.splitlines(keepends=True)
+                out: list[str] = []
+                for ln in lines:
+                    if ln.startswith("y_label,"):
+                        parts = ln.rstrip("\n").split(",")
+                        # Schema: id,view,x,y,w,h,rotationDeg,anchor,align
+                        # Ensure at least 9 fields.
+                        while len(parts) < 9:
+                            parts.append("")
+                        # Only migrate legacy "timer" view rows.
+                        if (parts[1] or "").strip() not in ("timer", ""):
+                            out.append(ln)
+                            continue
+                        try:
+                            yv = float(parts[3] or "0")
+                        except Exception:
+                            yv = 0.0
+                        # Legacy fix: if y is very low, move it to center.
+                        # (This only applies to the old auto-generated defaults.)
+                        if yv < 0.2:
+                            parts[3] = "0.50"
+                            # Use centerCenter anchor to avoid rotation+anchor skew.
+                            parts[7] = "centerCenter"
+                            ln = ",".join(parts) + "\n"
+                    out.append(ln)
+                geometries_path.write_text("".join(out), encoding="utf-8")
+        except Exception:
+            pass
         return
+
+    btn_labels = ["{{runPauseResume}}", "Reset"]
+    btn_actions = ["timer-startstop", "timer-reset"]
+    if debug:
+        btn_labels.append("Test")
+        btn_actions.append("timer-test")
 
     default_elements = (
         "# timer composite elements (draft)\n"
@@ -83,6 +127,9 @@ def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None
         "text[name=x_label]: Time (s)\n"
         "text[name=y_label]: Procentage (%)\n"
         "\n"
+        "# Default controls (non-editable chrome; uses KaTeX + {{...}} bindings):\n"
+        f"buttons[name={composite_dir}_buttons,orientation=h,labels=[{', '.join(btn_labels)}],actions=[{', '.join(btn_actions)}]]\n"
+        "\n"
         "# Stats label (auto-updated via {{...}} binding, editable/positionable):\n"
         # Use KaTeX commands (\mu/\sigma) instead of unicode glyphs. Placeholders use {{...}}.
         "text[name=stats]: \\mu={{mean}}s    \\sigma={{sigma}}s    count={{count}}\n"
@@ -92,21 +139,20 @@ def _ensure_timer_composite_defaults(pres_dir: Path, composite_dir: str) -> None
         # NOTE: The renderer treats these as "data-rect coords" mapped to the plot region.
         # Origin is bottom-left of the data rect.
         "arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]\n"
-        "arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]\n",
+        "arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]\n"
     )
-    if not elements_txt_path.exists():
-        elements_txt_path.write_text(default_elements, encoding="utf-8")
     if not elements_pr_path.exists():
         elements_pr_path.write_text(default_elements, encoding="utf-8")
     geometries_path.write_text(
-        "id,view,x,y,w,h,rotationDeg,anchor,align\n"
-        # Labels are allowed outside 0..1 (composite supports it). Keep them small.
-        "x_label,timer,0.50,1.06,0.50,0.08,0,topCenter,center\n"
-        # Match the current timer1 layout used in the presentation.
-        "y_label,timer,-0.15627517456611062,0.05482153612994739,0.40,0.08,-90,centerRight,center\n"
-        "stats,timer,0.5028738858079436,0.055646919385237144,0.70,0.08,0,topCenter,center\n"
-        "x_axis,timer,0,0,1,1,0,topLeft,\n"
-        "y_axis,timer,0,0,1,1,0,topLeft,\n",
+        # Match the current (UI-edited) timer1 geometries.csv schema + placement.
+        # Note: timer uses a "composite" view and includes a `parent` column.
+        "id,view,x,y,w,h,rotationDeg,anchor,align,parent\n"
+        "x_label,composite,0.5070540905458654,1.0336728154499004,0.5,0.08,0,topCenter,center,\n"
+        "y_label,composite,-0.17038335565784135,0.11719580843509136,0.4,0.08,-90,centerCenter,center,\n"
+        f"{composite_dir}_buttons,composite,0.50,-0.02,0.80,0.10,0,topCenter,center,\n"
+        "stats,composite,0.5028738858079436,0.055646919385237144,0.7,0.08,0,topCenter,center,\n"
+        "x_axis,composite,0,0,1,1,0,topLeft,,\n"
+        "y_axis,composite,0,0,1,1,0,topLeft,,\n",
         encoding="utf-8",
     )
     animations_path.write_text(
@@ -128,19 +174,25 @@ def _ensure_sound_composite_defaults(pres_dir: Path, composite_dir: str) -> None
     sound_dir = groups_dir / composite_dir
     sound_dir.mkdir(parents=True, exist_ok=True)
 
-    elements_txt_path = sound_dir / "elements.txt"
     elements_pr_path = sound_dir / "elements.pr"
     geometries_path = sound_dir / "geometries.csv"
     animations_path = sound_dir / "animations.csv"
     # If everything exists, still do a tiny forward-migration:
-    # ensure the newer "peak" label exists in elements + geometries.
-    if (elements_txt_path.exists() or elements_pr_path.exists()) and geometries_path.exists() and animations_path.exists():
+    # - ensure the newer "peak" label exists in elements + geometries
+    # - nudge y_label slightly upward (newer default)
+    if elements_pr_path.exists() and geometries_path.exists() and animations_path.exists():
         try:
-            p = elements_pr_path if elements_pr_path.exists() else elements_txt_path
-            txt = p.read_text(encoding="utf-8")
+            txt = elements_pr_path.read_text(encoding="utf-8") if elements_pr_path.exists() else ""
+            # Ensure buttons[...] line exists (buttons are defined by elements.pr, not hard-coded).
+            if "buttons[" not in txt:
+                txt = (
+                    txt.rstrip()
+                    + "\n"
+                    + f"buttons[name={composite_dir}_buttons,orientation=h,labels=[{{{{runPauseResume}}}}, Reset, {{{{modeToggle}}}}],actions=[sound-toggle, sound-reset, sound-mode-toggle]]\n"
+                )
             if "text[name=peak]" not in txt:
                 txt = txt.rstrip() + "\ntext[name=peak]: \\mathrm{peak}={{peakHz}}\\,\\mathrm{Hz}\n"
-                p.write_text(txt + ("\n" if not txt.endswith("\n") else ""), encoding="utf-8")
+                elements_pr_path.write_text(txt + ("\n" if not txt.endswith("\n") else ""), encoding="utf-8")
         except Exception:
             pass
         try:
@@ -164,6 +216,45 @@ def _ensure_sound_composite_defaults(pres_dir: Path, composite_dir: str) -> None
                     geometries_path.write_text(gtxt.rstrip() + "\n" + line, encoding="utf-8")
         except Exception:
             pass
+        # Canonicalize y_label + peak positions (always) so sound/timer cannot drift.
+        try:
+            gtxt = geometries_path.read_text(encoding="utf-8")
+            if "\ny_label,sound," in gtxt:
+                parts = gtxt.splitlines(keepends=True)
+                out_lines: list[str] = []
+                for ln in parts:
+                    if ln.startswith("y_label,sound,"):
+                        cols = ln.rstrip("\n").split(",")
+                        while len(cols) < 9:
+                            cols.append("")
+                        cols[2] = "-0.17038335565784135"
+                        cols[3] = "0.11719580843509136"
+                        cols[7] = "centerCenter"
+                        cols[8] = "center"
+                        ln = ",".join(cols) + "\n"
+                    out_lines.append(ln)
+                geometries_path.write_text("".join(out_lines), encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            gtxt = geometries_path.read_text(encoding="utf-8")
+            if "\npeak,sound," in gtxt:
+                parts = gtxt.splitlines(keepends=True)
+                out_lines: list[str] = []
+                for ln in parts:
+                    if ln.startswith("peak,sound,"):
+                        cols = ln.rstrip("\n").split(",")
+                        while len(cols) < 9:
+                            cols.append("")
+                        cols[2] = "0.5028738858079436"
+                        cols[3] = "0.055646919385237144"
+                        cols[7] = "topCenter"
+                        cols[8] = "center"
+                        ln = ",".join(cols) + "\n"
+                    out_lines.append(ln)
+                geometries_path.write_text("".join(out_lines), encoding="utf-8")
+        except Exception:
+            pass
         return
 
     default_elements = (
@@ -173,6 +264,9 @@ def _ensure_sound_composite_defaults(pres_dir: Path, composite_dir: str) -> None
         "# Axis labels (auto-updated via {{...}} binding, editable/positionable):\n"
         "text[name=x_label]: {{xLabel}}\n"
         "text[name=y_label]: {{yLabel}}\n"
+        "\n"
+        "# Default controls (non-editable chrome):\n"
+        f"buttons[name={composite_dir}_buttons,orientation=h,labels=[{{{{runPauseResume}}}}, Reset, {{{{modeToggle}}}}],actions=[sound-toggle, sound-reset, sound-mode-toggle]]\n"
         # Spectrum-only label (hidden in pressure mode by the frontend):
         "text[name=peak]: \\mathrm{peak}={{peakHz}}\\,\\mathrm{Hz}\n"
         "\n"
@@ -180,15 +274,16 @@ def _ensure_sound_composite_defaults(pres_dir: Path, composite_dir: str) -> None
         "arrow[name=x_axis,from=(0,0),to=(1.05,0),color=white,width=0.006]\n"
         "arrow[name=y_axis,from=(0,0),to=(0,1.05),color=white,width=0.006]\n"
     )
-    if not elements_txt_path.exists():
-        elements_txt_path.write_text(default_elements, encoding="utf-8")
     if not elements_pr_path.exists():
         elements_pr_path.write_text(default_elements, encoding="utf-8")
     geometries_path.write_text(
         "id,view,x,y,w,h,rotationDeg,anchor,align\n"
         "x_label,sound,0.50,1.06,0.60,0.08,0,topCenter,center\n"
-        "y_label,sound,-0.14,0.50,0.45,0.08,-90,centerRight,center\n"
-        "peak,sound,0.98,0.04,0.55,0.08,0,topRight,right\n"
+        # Canonical (match timer y_label placement):
+        "y_label,sound,-0.17038335565784135,0.11719580843509136,0.45,0.08,-90,centerCenter,center\n"
+        f"{composite_dir}_buttons,sound,0.50,-0.02,0.86,0.10,0,topCenter,center\n"
+        # Canonical (match timer stats placement):
+        "peak,sound,0.5028738858079436,0.055646919385237144,0.55,0.08,0,topCenter,center\n"
         "x_axis,sound,0,0,1,1,0,topLeft,\n"
         "y_axis,sound,0,0,1,1,0,topLeft,\n",
         encoding="utf-8",
@@ -199,7 +294,16 @@ def _ensure_sound_composite_defaults(pres_dir: Path, composite_dir: str) -> None
     )
 
 
-def _ensure_choices_composite_defaults(pres_dir: Path, composite_dir: str) -> None:
+def _ensure_choices_composite_defaults(
+    pres_dir: Path,
+    composite_dir: str,
+    *,
+    bullet_style: str,
+    options: list[dict[str, str]],
+    other_label: str,
+    include_limit: float,
+    text_inside_limit: float,
+) -> None:
     """
     Create a default composite folder for choices nodes.
     This lets the presenter edit internal layout (bullets/wheel) without opening the modal.
@@ -217,37 +321,63 @@ def _ensure_choices_composite_defaults(pres_dir: Path, composite_dir: str) -> No
 
     # Root composite elements.pr is auto-generated by the choices composite.
     # It documents the sub-elements and ensures the required entries exist without manual authoring.
+    #
+    # IMPORTANT: bullets content is explicit rows (no template), generated from the poll options.
+    bullet_lines = [str((o.get("label") or o.get("id") or "")).strip() for o in (options or [])]
+    bullet_lines = [b for b in bullet_lines if b]
+    bullets_block = "bullets[name=bullets,type=%s]:" % (bullet_style or "A")
+    bullets_block = bullets_block + ("\n" + "\n".join(bullet_lines) if bullet_lines else "")
+
+    # Keep buttons as authored chrome (templated labels/actions).
+    default_buttons = "buttons[name=buttons,orientation=h,labels=[{{runPauseResume}}, Reset],actions=[choices-startstop, choices-reset]]"
+
+    # Wheel is a group; we expose key rendering params here to keep choices self-describing.
+    wheel_line = (
+        "wheel[name=wheel"
+        f",type={bullet_style or 'A'}"
+        f",otherLabel={other_label}"
+        f",minLevel={include_limit:g}"
+        f",textInsideLimit={text_inside_limit:g}"
+        "]"
+    )
+
     canonical_root = (
         "# choices composite elements.pr (v1)\n"
         "# Sub-elements (editable via group edit + geometries.csv):\n"
         "# - bullets: an element (NOT a group) that renders question + options\n"
         "# - wheel: a group whose internals live in wheel/elements.pr + wheel/geometries.csv\n"
+        "# - buttons: chrome controls (movable as a unit). Use timer/sound syntax:\n"
+        "#   buttons[name=buttons,orientation=h|v,labels=[...],actions=[...]]\n"
         "#\n"
-        "# Buttons are UI controls attached to the choices node, not editable elements.\n"
-        "bullets[name=bullets]\n"
-        "wheel[name=wheel]\n"
+        f"{bullets_block}\n"
+        f"{default_buttons}\n"
+        f"{wheel_line}\n"
     )
     try:
-        if not elements_path.exists():
-            elements_path.write_text(canonical_root, encoding="utf-8")
-        else:
+        # Preserve an existing custom buttons[...] line if present; otherwise use default.
+        buttons_line = default_buttons
+        if elements_path.exists():
             txt = elements_path.read_text(encoding="utf-8")
-            need_bullets = re.search(r"^\s*bullets\s*\[", txt, flags=re.MULTILINE) is None
-            need_wheel = re.search(r"^\s*wheel\s*\[", txt, flags=re.MULTILINE) is None
-            if need_bullets or need_wheel:
-                patch_lines: list[str] = []
-                if need_bullets:
-                    patch_lines.append("bullets[name=bullets]")
-                if need_wheel:
-                    patch_lines.append("wheel[name=wheel]")
-                elements_path.write_text((txt.rstrip() + "\n\n" + "\n".join(patch_lines)).rstrip() + "\n", encoding="utf-8")
+            for ln0 in txt.splitlines():
+                ln = ln0.strip()
+                if not ln or ln.startswith("#"):
+                    continue
+                if ln.startswith("buttons["):
+                    buttons_line = ln
+                    break
+        # Always rewrite canonical root (bullets rows are generated; wheel params kept in sync).
+        elements_path.write_text(
+            canonical_root.replace(default_buttons, buttons_line),
+            encoding="utf-8",
+        )
     except Exception:
         # Non-fatal: UI can still function without this file.
         pass
 
     # Folder nesting governs hierarchy:
     # groups/<pollId>/geometries.csv defines top-level children (bullets + wheel).
-    # Buttons are NOT an editable element; they follow the main choices node and are not stored here.
+    # Buttons are chrome (not templated), but they ARE a composite sub-element and should be positioned
+    # consistently with other composites (timer/sound).
     # groups/<pollId>/wheel/* defines wheel-only internal elements.
     wheel_dir = comp_dir / "wheel"
     wheel_dir.mkdir(parents=True, exist_ok=True)
@@ -257,12 +387,23 @@ def _ensure_choices_composite_defaults(pres_dir: Path, composite_dir: str) -> No
             "id,view,x,y,w,h,rotationDeg,anchor,align,parent\n"
             # Default layout: bullets on left, wheel on right (wheel itself is square).
             "bullets,composite,0.00,0.00,0.62,1.00,0,topLeft,left,\n"
-            "wheel,composite,1.00,0.50,0.38,0.38,0,centerRight,center,\n",
+            # Default buttons: same sizing feel as other composites.
+            "buttons,composite,0.50,-0.02,0.86,0.10,0,topCenter,center,\n"
+            # Wheel box should be centered on the circle (anchor=centerCenter).
+            # Place it slightly higher by default to match the bullets layout.
+            "wheel,composite,0.81,0.46,0.38,0.38,0,centerCenter,center,\n",
             encoding="utf-8",
         )
 
 
-def _ensure_wheel_composite_defaults(pres_dir: Path, poll_id: str, options: list[dict[str, str]], *, other_label: str) -> None:
+def _ensure_wheel_composite_defaults(
+    pres_dir: Path,
+    poll_id: str,
+    options: list[dict[str, str]],
+    *,
+    bullet_style: str,
+    other_label: str,
+) -> None:
     """
     Ensure the wheel composite (choices results) exists and is "healed" to contain:
     - wheel/geometries.csv: pie + label offsets for each option id + "other"
@@ -275,34 +416,35 @@ def _ensure_wheel_composite_defaults(pres_dir: Path, poll_id: str, options: list
 
     # --- elements.pr (templates) ---
     el_path = base / "elements.pr"
-    try:
-        existing = el_path.read_text(encoding="utf-8") if el_path.exists() else ""
-    except Exception:
-        existing = ""
+    def _bullet_for(idx: int, style: str) -> str:
+        s = (style or "A").strip()
+        if not s:
+            s = "A"
+        # Numeric bullets: 1,2,3,...
+        if s[0].isdigit():
+            return str(idx + 1)
+        # Alphabetic bullets: A,B,C,... (or a,b,c,...)
+        base = ord("a") if s[0].islower() else ord("A")
+        # Clamp to A..Z (good enough for typical polls).
+        return chr(base + (idx % 26))
 
-    lines = existing.splitlines() if existing else []
-    have: set[str] = set()
-    for ln in lines:
-        m = re.match(r"^\s*text\[name=(?P<id>[a-zA-Z_]\w*)\]\s*:", ln.strip())
-        if m:
-            have.add(m.group("id"))
-
-    out_lines = list(lines) if lines else [
-        "# wheel elements.pr (v1)",
-        "# text[name=<optionId>]: <template>",
-        "# Use {{label}} {{percent}} {{votes}} {{totalVotes}}",
+    # Canonical wheel templates are derived from the *parent* choices composite:
+    # - bullets[...] defines the region names (shown in the bullet list)
+    # - wheel uses only the bullet marker (A/1/...) + percent (keeps the wheel uncluttered)
+    out_lines: list[str] = [
+        "# wheel elements.pr (v2)",
+        "# Generated from ../elements.pr (top-down).",
+        "# Each option is rendered as its bullet marker (A/1/...) + percent.",
+        "# You can still override positioning via wheel/geometries.csv (per text[name=<id>]).",
+        "# Available bindings: {{label}} {{percent}} {{votes}} {{totalVotes}}",
     ]
-    # Add missing per-option templates (do not overwrite existing).
-    for opt in options:
+    for idx, opt in enumerate(options or []):
         oid = str(opt.get("id") or "").strip()
-        lab = str(opt.get("label") or "").strip()
-        if not oid or oid in have:
+        if not oid:
             continue
-        out_lines.append(f"text[name={oid}]: {lab} ({{{{percent}}}}%)")
-        have.add(oid)
-    if "other" not in have:
-        out_lines.append(f"text[name=other]: {other_label} ({{{{percent}}}}%)")
-
+        mark = _bullet_for(idx, bullet_style or "A")
+        out_lines.append(f"text[name={oid}]: {mark} ({{{{percent}}}}%)")
+    out_lines.append(f"text[name=other]: {other_label} ({{{{percent}}}}%)")
     try:
         el_path.write_text("\n".join(out_lines).rstrip() + "\n", encoding="utf-8")
     except Exception:
@@ -890,6 +1032,45 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 screen_nodes.add(name)
             continue
 
+        if kw == "line":
+            # Simple line node (rendered by the frontend as SVG, no arrowhead).
+            # Syntax: line[name=...,from=(0,0),to=(1,0),color=white,width=2]
+            def parse_vec(raw_v: str | None, default: tuple[float, float]) -> tuple[float, float]:
+                s = str(raw_v or "").strip()
+                m2 = re.match(r"^\(\s*([\-0-9.]+)\s*,\s*([\-0-9.]+)\s*\)\s*$", s)
+                if not m2:
+                    return default
+                try:
+                    return (float(m2.group(1)), float(m2.group(2)))
+                except ValueError:
+                    return default
+
+            fx, fy = parse_vec(params.get("from"), (0.0, 0.5))
+            tx, ty = parse_vec(params.get("to"), (1.0, 0.5))
+            col = str(params.get("color") or params.get("stroke") or "white").strip() or "white"
+            w_raw = str(params.get("width") or params.get("strokeWidth") or "").strip()
+            width = None
+            if w_raw:
+                try:
+                    width = float(w_raw)
+                except ValueError:
+                    width = None
+            nodes_by_id[name] = {
+                "id": name,
+                "type": "line",
+                "space": "screen" if screen_mode else "world",
+                "from": {"x": fx, "y": fy},
+                "to": {"x": tx, "y": ty},
+                "color": col,
+                "width": width,
+            }
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
+            continue
+
         if kw == "sound":
             # Server-side audio spectrum/time-series viewer.
             # Syntax: sound[name=...,mode=spectrum|pressure,color=white]
@@ -925,10 +1106,9 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             try:
                 pres_dir = path.parent
                 comp_dir = pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name)
-                tpl_path = (comp_dir / "elements.pr") if (comp_dir / "elements.pr").exists() else (comp_dir / "elements.txt")
-                if tpl_path.exists():
-                    tpl = tpl_path.read_text(encoding="utf-8")
-                    nodes_by_id[name]["elementsText"] = tpl
+                elements_pr = comp_dir / "elements.pr"
+                if elements_pr.exists():
+                    nodes_by_id[name]["elementsText"] = elements_pr.read_text(encoding="utf-8")
             except Exception:
                 pass
             try:
@@ -966,10 +1146,6 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
         if kw == "timer":
             # Interactive timer / histogram node (rendered by the frontend; data via backend APIs).
             # Ensure the composite defaults exist only if a timer is actually used in the presentation.
-            try:
-                _ensure_timer_composite_defaults(path.parent, name)
-            except Exception:
-                pass
             show_time = (params.get("showTime") or "0").strip()
             grid_raw = str(params.get("grid") or "").strip().lower()
             bar_color = (params.get("barColor") or "orange").strip()
@@ -979,6 +1155,8 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             min_s_raw = (params.get("min") or "").strip()
             max_s_raw = (params.get("max") or "").strip()
             bin_s_raw = (params.get("binSize") or "").strip()
+            debug_raw = str(params.get("debug") or "").strip().lower()
+            debug = debug_raw in {"1", "true", "yes", "on"}
 
             def fnum(v: str, default: float | None) -> float | None:
                 if not v:
@@ -999,12 +1177,17 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 if bins <= 0 or abs(bins - round(bins)) > 1e-6:
                     raise ValueError(f"timer[{name}] has incompatible min/max/binSize (span={span}, bin={bin_s})")
 
+            try:
+                _ensure_timer_composite_defaults(path.parent, name, debug=debug)
+            except Exception:
+                pass
             nodes_by_id[name] = {
                 "id": name,
                 "type": "timer",
                 "space": "world",
                 "showTime": show_time == "1" or show_time.lower() in {"true", "yes", "on"},
                 "grid": grid_raw in {"1", "true", "yes", "on"},
+                "debug": bool(debug),
                 "barColor": bar_color,
                 "lineColor": line_color,
                 "lineWidth": line_w,
@@ -1021,10 +1204,9 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             try:
                 pres_dir = path.parent
                 timer_dir = pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name)
-                # Prefer elements.pr when present (repo-friendly); fall back to legacy elements.txt.
-                tpl_path = (timer_dir / "elements.pr") if (timer_dir / "elements.pr").exists() else (timer_dir / "elements.txt")
-                if tpl_path.exists():
-                    tpl = tpl_path.read_text(encoding="utf-8")
+                elements_pr = timer_dir / "elements.pr"
+                if elements_pr.exists():
+                    tpl = elements_pr.read_text(encoding="utf-8")
                     # Provide both raw params and normalized fields.
                     args_for_tpl: dict[str, Any] = dict(nodes_by_id[name]["args"])
                     args_for_tpl.update(
@@ -1076,10 +1258,6 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
 
         if kw == "choices":
             # Ensure the choices composite defaults exist only if a choices node is actually used.
-            try:
-                _ensure_choices_composite_defaults(path.parent, name)
-            except Exception:
-                pass
             content_lines: list[str] = []
             if has_colon:
                 while i < len(lines):
@@ -1097,13 +1275,33 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             chart_raw = (params.get("type") or params.get("chart") or "pieChart").strip()
             chart = "pie" if "pie" in chart_raw.lower() else "pie"
             bullet_style = (params.get("bullets") or "A").strip() or "A"
+            debug_raw = str(params.get("debug") or "").strip().lower()
+            debug = debug_raw in {"1", "true", "yes", "on"}
             include_limit = _try_float(params.get("includeLimit") or params.get("minPct") or params.get("min") or "3") or 3.0
             text_inside_limit = _try_float(params.get("textInsideLimit") or params.get("minInsidePct") or params.get("minInside") or "6") or 6.0
             other_label = (params.get("otherLabel") or "Other").strip() or "Other"
             options = parse_choice_options(params.get("choices"))
+            try:
+                _ensure_choices_composite_defaults(
+                    path.parent,
+                    name,
+                    bullet_style=bullet_style,
+                    options=options,
+                    other_label=other_label,
+                    include_limit=include_limit,
+                    text_inside_limit=text_inside_limit,
+                )
+            except Exception:
+                pass
             # Ensure wheel composite exists and includes per-option templates + label offsets.
             try:
-                _ensure_wheel_composite_defaults(path.parent, name, options, other_label=other_label)
+                _ensure_wheel_composite_defaults(
+                    path.parent,
+                    name,
+                    options,
+                    bullet_style=bullet_style,
+                    other_label=other_label,
+                )
             except Exception:
                 pass
             nodes_by_id[name] = {
@@ -1113,6 +1311,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "question": question,
                 "chart": chart,
                 "bullets": bullet_style,
+                "debug": bool(debug),
                 "options": options,
                 "includeLimit": include_limit,
                 "textInsideLimit": text_inside_limit,
@@ -1153,6 +1352,14 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                     "": load_geoms(base / "geometries.csv"),
                     "wheel": load_geoms(base / "wheel" / "geometries.csv"),
                 }
+                # Load root elements.pr so the client can render chrome (buttons) consistently
+                # with timer/sound (labels/actions are authored here).
+                try:
+                    root_el = (base / "elements.pr")
+                    if root_el.exists():
+                        nodes_by_id[name]["elementsText"] = root_el.read_text(encoding="utf-8")
+                except Exception:
+                    pass
                 # Load wheel elements.pr for client-side overlay text/arrow rendering.
                 try:
                     elp = (base / "wheel" / "elements.pr")
@@ -1407,7 +1614,9 @@ def _parse_animations_csv(path: Path) -> tuple[dict[str, dict[str, Any]], list[d
 
 def load_presentation(presentation_dir: Path | None = None) -> Presentation:
     root = _repo_root()
-    pres_dir = presentation_dir or (root / "presentations" / "default")
+    # Default to the active presentation folder (controlled by IP_PRESENTATION_ID).
+    # Many call sites rely on the default behavior (e.g. /api/presentation).
+    pres_dir = presentation_dir or PRESENTATION_DIR
     defaults = _load_defaults(pres_dir)
     pres_path = pres_dir / "presentation.pr"
     if not pres_path.exists():
@@ -1465,6 +1674,10 @@ def load_presentation(presentation_dir: Path | None = None) -> Presentation:
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 420.0, "h": 80.0, "anchor": "topLeft"}
             elif node["type"] == "sound":
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 800.0, "h": 360.0, "anchor": "topLeft"}
+            elif node["type"] == "choices":
+                # Choices contains two horizontal sub-elements (bullets + wheel) and needs a wide box
+                # to avoid overflow/click-through in the editor.
+                node["transform"] = {"x": 0.0, "y": 0.0, "w": 1100.0, "h": 620.0, "anchor": "centerCenter"}
             else:
                 node["transform"] = {"x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0, "anchor": "topLeft"}
 

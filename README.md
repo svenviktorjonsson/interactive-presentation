@@ -186,14 +186,15 @@ Composite nodes store their internal layout in folders:
 ```text
 presentations/default/groups/
   timer1/
-    elements.txt
+    elements.pr
     geometries.csv
     animations.csv
 
   fav_subjects/
-    bullets/
-      geometries.csv
+    elements.pr
+    geometries.csv
     wheel/
+      elements.pr
       geometries.csv
 ```
 

@@ -2,7 +2,9 @@ import type { PresentationModel } from "@interactive/content";
 import { BACKEND } from "../config";
 
 export async function fetchModel(): Promise<PresentationModel> {
-  const res = await fetch(`${BACKEND}/api/presentation`);
+  const ctrl = new AbortController();
+  const t = window.setTimeout(() => ctrl.abort(), 10000);
+  const res = await fetch(`${BACKEND}/api/presentation`, { signal: ctrl.signal }).finally(() => window.clearTimeout(t));
   if (!res.ok) throw new Error(`Backend error: ${res.status}`);
   return (await res.json()) as PresentationModel;
 }

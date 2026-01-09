@@ -9,6 +9,46 @@ from ..config import PRESENTATION_DIR
 
 router = APIRouter()
 
+def _format_pr_list_commas(text: str) -> str:
+    # Keep behavior aligned with /api/composite/save: `[a,b]` -> `[a, b]`.
+    s = str(text or "")
+    out: list[str] = []
+    in_quotes = False
+    brace = 0
+    paren = 0
+    bracket = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == '"':
+            in_quotes = not in_quotes
+            out.append(ch)
+            i += 1
+            continue
+        if not in_quotes:
+            if ch == "{":
+                brace += 1
+            elif ch == "}":
+                brace = max(0, brace - 1)
+            elif ch == "(":
+                paren += 1
+            elif ch == ")":
+                paren = max(0, paren - 1)
+            elif ch == "[":
+                bracket += 1
+            elif ch == "]":
+                bracket = max(0, bracket - 1)
+        if ch == "," and bracket > 0 and not in_quotes and brace == 0 and paren == 0:
+            out.append(ch)
+            j = i + 1
+            if j < len(s) and s[j] not in (" ", "\t", "\r", "\n", "]"):
+                out.append(" ")
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
 
 @router.post("/api/timer/composite/save")
 def timer_composite_save(payload: dict = Body(...)):
@@ -34,8 +74,9 @@ def timer_composite_save(payload: dict = Body(...)):
     timer_dir = PRESENTATION_DIR / "groups" / composite_dir
     timer_dir.mkdir(parents=True, exist_ok=True)
     out_path = timer_dir / "geometries.csv"
+    # Legacy endpoint: treat elementsText as `.pr` content and persist to elements.pr.
     if isinstance(elements_text, str):
-        (timer_dir / "elements.txt").write_text(elements_text, encoding="utf-8")
+        (timer_dir / "elements.pr").write_text(_format_pr_list_commas(elements_text), encoding="utf-8")
 
     fieldnames = ["id", "view", "x", "y", "w", "h", "rotationDeg", "anchor", "align"]
     with out_path.open("w", encoding="utf-8", newline="") as f:

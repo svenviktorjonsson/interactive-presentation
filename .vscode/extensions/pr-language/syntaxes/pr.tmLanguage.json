@@ -125,7 +125,7 @@
     },
     "element-generic": {
       "name": "meta.element.generic.pr",
-      "match": "^(text|image|button|input|video|audio|shape|group|table)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "match": "^(text|image|button|buttons|input|video|audio|shape|group|table)(\\[)([^\\]]*)(\\])(:)?(.*)$",
       "captures": {
         "1": { "name": "entity.name.function.element.pr" },
         "2": { "name": "punctuation.definition.attributes.begin.pr" },
@@ -228,6 +228,22 @@
 
     "attributes-common": {
       "patterns": [
+        {
+          "comment": "generic attribute with tuple value (captures commas so numbers highlight correctly)",
+          "match": "([a-zA-Z_][a-zA-Z0-9_]*)(=)(\\([^\\)]*\\))",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": {
+              "patterns": [
+                { "name": "punctuation.definition.group.begin.pr", "match": "\\(" },
+                { "name": "punctuation.definition.group.end.pr", "match": "\\)" },
+                { "name": "punctuation.separator.comma.pr", "match": "," },
+                { "name": "constant.numeric.pr", "match": "-?(?:\\d+\\.?\\d*|\\.\\d+)" }
+              ]
+            }
+          }
+        },
         {
           "comment": "color attributes - valid colors",
           "match": "(bgColor|barColor|lineColor|fgColor|color|fillColor|strokeColor)(=)(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey|transparent)(?=[,\\]]|$)",

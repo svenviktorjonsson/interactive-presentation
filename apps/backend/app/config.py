@@ -8,7 +8,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 WEB_DIST = REPO_ROOT / "apps" / "web" / "dist"
 ASSETS_DIR = WEB_DIST / "assets"
 
-PRESENTATION_DIR = REPO_ROOT / "presentations" / "default"
+PRESENTATION_ID = (os.environ.get("IP_PRESENTATION_ID") or "default").strip() or "default"
+PRESENTATION_DIR = REPO_ROOT / "presentations" / PRESENTATION_ID
 MEDIA_DIR = PRESENTATION_DIR / "media"
 
 

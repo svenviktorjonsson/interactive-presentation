@@ -38,6 +38,8 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
+  /* Always behind DOM nodes (e.g. images/QR). */
+  z-index: 0;
 }
 
 .overlay {
@@ -45,6 +47,8 @@ body {
   inset: 0;
   /* Must be interactive so nodes (and resize/rotate handles) can receive clicks. */
   pointer-events: auto;
+  /* Always above canvas-rendered layers. */
+  z-index: 1;
 }
 
 .node {
@@ -54,6 +58,51 @@ body {
   /* Ensure non-math text matches KaTeX \mathrm{...} */
   font-family: KaTeX_Main, Times New Roman, serif;
   font-weight: 400;
+}
+
+/* Shared control bar/button styling (used by timer/sound/choices) */
+.ip-controlbar {
+  gap: calc(10px * var(--control-scale, 1));
+  padding: 0 calc(10px * var(--control-scale, 1));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.ip-controlbtn {
+  padding: calc(12px * var(--control-scale, 1)) calc(14px * var(--control-scale, 1));
+  border-radius: calc(10px * var(--control-scale, 1));
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.92);
+  font-weight: 800;
+  cursor: pointer;
+  font-size: calc(16px * var(--control-scale, 1));
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Do not stretch: keep buttons only as wide as their content. */
+  flex: 0 0 auto;
+  min-width: 0;
+  white-space: nowrap;
+}
+.ip-controlbtn:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+.ip-controlbtn:active {
+  background: rgba(110, 168, 255, 0.18);
+  border-color: rgba(110,168,255,0.28);
+}
+.ip-controlbtn.primary {
+  background: rgba(110, 168, 255, 0.22);
+  border-color: rgba(110,168,255,0.28);
+}
+
+.ip-button-content {
+  /* Match text rendering behavior and keep KaTeX aligned */
+  font-family: KaTeX_Main, Times New Roman, serif;
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 /* KaTeX defaults to ~1.21em; for mixed text+math we want math to match surrounding text size */
@@ -68,6 +117,28 @@ body {
 .node.is-selected {
   outline: 2px solid rgba(110, 168, 255, 0.9);
   outline-offset: 0px;
+}
+
+/* Arrow/line are edited via control points, not a bounding box. */
+.node-arrow.is-selected,
+.node-line.is-selected {
+  outline: none;
+}
+
+/* Endpoint/midpoint control points for arrow/line */
+.handles.handles-line .handle.point {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid rgba(110,168,255,0.9);
+  background: rgba(15,17,24,0.35);
+  pointer-events: auto;
+}
+.handles.handles-line .handle.point.mid {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+  opacity: 0.9;
 }
 
 /* Live mode must stay clean: never show editor transform/selection chrome. */
@@ -136,6 +207,7 @@ html[data-ip-mode="live"] .handles {
   gap: 0;
   box-sizing: border-box;
   --ui-scale: 1;
+  --control-scale: var(--ui-scale, 1);
 }
 
 /* Smooth zoom scaling (avoid "jumping" when --ui-scale changes). */
@@ -173,24 +245,18 @@ html[data-ip-mode="live"] .handles {
   box-sizing: border-box;
 }
 
-/* Smooth, stable zoom scaling for bullets: scale via transform instead of re-rasterizing font sizes. */
+/* Choices bullets: font should scale with zoom (like text), without changing line wrapping. */
 .node-choices .choices-bullets-inner {
   position: absolute;
   inset: 0;
-  transform-origin: top left;
-  /* --ui-scale: zoom + (optional) fontPx scaling from the editor */
-  /* --local-scale: derived from the bullets sub-element size in composite edit */
-  transform: scale(calc(var(--ui-scale, 1) * var(--local-scale, 1)));
-  /* IMPORTANT: do not change the layout width/height when scaling.
-     We want pure visual scaling (no reflow / no line-wrap changes). */
-  /* Leave room for the in-node headerbar (buttons). This is in the unscaled coordinate system,
-     and will scale together with the bullets content. */
-  padding: 18px;
-  padding-top: 72px;
+  /* Zoom scaling: done via inherited font-size (affects layout + wrapping). */
+  font-size: calc(18px * var(--ui-scale, 1) * var(--choices-font-scale, 1) * var(--local-scale, 1));
+  /* Bullets should fill the box; buttons are a separate movable group. */
+  padding: calc(18px * var(--ui-scale, 1) * var(--local-scale, 1));
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
-  gap: 12px;
+  gap: calc(12px * var(--ui-scale, 1) * var(--local-scale, 1));
   /* Let selection handles on the parent stay clickable/visible. */
   pointer-events: none;
 }
@@ -221,13 +287,13 @@ html[data-ip-mode="live"] .handles {
 
 .node-choices .choices-question {
   font-weight: 800;
-  font-size: 28px;
+  font-size: 1.27em; /* ~28/22 */
   line-height: 1.25;
 }
 
 .node-choices .choices-status {
-  font-size: 13px;
-  padding: 4px 10px;
+  font-size: 0.6em; /* ~13/22 */
+  padding: 0.25em 0.75em;
   border-radius: 999px;
   border: 1px solid rgba(255, 255, 255, 0.14);
   background: rgba(255, 255, 255, 0.06);
@@ -273,20 +339,20 @@ html[data-ip-mode="live"] .handles {
   align-items: center;
   gap: 10px;
   font-weight: 700;
-  font-size: 24px;
+  font-size: 1.09em; /* ~24/22 */
 }
 
 .node-choices .choices-swatch {
-  width: 14px;
-  height: 14px;
+  width: 0.64em; /* ~14/22 */
+  height: 0.64em;
   border-radius: 999px;
-  border: 2px solid rgba(255, 255, 255, 0.25);
+  border: 0.09em solid rgba(255, 255, 255, 0.25); /* ~2/22 */
   display: inline-block;
 }
 
 .node-choices .choices-meta {
   color: var(--muted);
-  font-size: 18px;
+  font-size: 0.82em; /* ~18/22 */
   white-space: nowrap;
 }
 
@@ -311,7 +377,7 @@ html[data-ip-mode="live"] .handles {
 
 .node-choices .choices-total {
   color: var(--muted);
-  font-size: 14px;
+  font-size: 0.64em; /* ~14/22 */
 }
 
 .node-choices .choices-controls {
@@ -322,36 +388,11 @@ html[data-ip-mode="live"] .handles {
 
 .node-choices .choices-headerbar {
   position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  padding: 0 calc(10px * var(--ui-scale, 1));
-  display: flex;
-  gap: calc(10px * var(--ui-scale, 1));
-  align-items: center;
-  pointer-events: auto;
+  inset: 0;
   z-index: 5;
 }
 
-.node-choices .choices-btn {
-  padding: calc(12px * var(--ui-scale, 1)) calc(14px * var(--ui-scale, 1));
-  border-radius: calc(10px * var(--ui-scale, 1));
-  border: 1px solid rgba(255,255,255,0.16);
-  background: transparent;
-  color: rgba(255, 255, 255, 0.92);
-  font-weight: 800;
-  cursor: pointer;
-  font-size: calc(16px * var(--ui-scale, 1));
-}
-
-.node-choices .choices-btn:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.node-choices .choices-btn:active {
-  background: rgba(110, 168, 255, 0.18);
-  border-color: rgba(110,168,255,0.28);
-}
+/* Choices buttons use shared `.ip-controlbtn` (same sizing as timer/sound). */
 
 .node-bullets {
   padding: 0;
@@ -390,6 +431,7 @@ html[data-ip-mode="live"] .handles {
 
 .node-timer {
   --timer-scale: 1;
+  --control-scale: var(--timer-scale, 1);
 }
 
 .node-timer .timer-frame {
@@ -399,30 +441,16 @@ html[data-ip-mode="live"] .handles {
 
 .node-timer .timer-header {
   top: calc(-44px * var(--timer-scale, 1));
-  gap: calc(10px * var(--timer-scale, 1));
-  padding: 0 calc(10px * var(--timer-scale, 1));
   pointer-events: auto;
 }
 
 /* timer-status removed (buttons already convey state) */
 
-.node-timer .timer-btn {
-  padding: calc(12px * var(--timer-scale, 1)) calc(14px * var(--timer-scale, 1));
-  border-radius: calc(10px * var(--timer-scale, 1));
-  border: none;
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.92);
-  font-weight: 800;
-  cursor: pointer;
-  font-size: calc(16px * var(--timer-scale, 1));
-}
-
-.node-timer .timer-btn.primary {
-  background: rgba(110, 168, 255, 0.22);
-}
+/* timer buttons now use shared .ip-controlbtn */
 
 .node-sound {
   --sound-scale: 1;
+  --control-scale: var(--sound-scale, 1);
 }
 
 .node-sound .sound-frame {
@@ -432,36 +460,29 @@ html[data-ip-mode="live"] .handles {
 
 .node-sound .sound-header {
   top: calc(-44px * var(--sound-scale, 1));
-  gap: calc(10px * var(--sound-scale, 1));
-  padding: 0 calc(10px * var(--sound-scale, 1));
   pointer-events: auto;
 }
 
-.node-sound .sound-btn {
-  padding: calc(12px * var(--sound-scale, 1)) calc(14px * var(--sound-scale, 1));
-  border-radius: calc(10px * var(--sound-scale, 1));
-  border: 1px solid rgba(255,255,255,0.16);
-  background: transparent;
-  color: rgba(255, 255, 255, 0.92);
-  font-weight: 800;
-  cursor: pointer;
-  font-size: calc(16px * var(--sound-scale, 1));
-}
+/* sound buttons now use shared .ip-controlbtn */
 
-.node-sound .sound-btn:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
-
-.node-sound .sound-btn:active {
-  background: rgba(110, 168, 255, 0.18);
-  border-color: rgba(110,168,255,0.28);
-}
-
-/* In Edit mode, header buttons should not steal clicks (editing should be easy). */
-html[data-ip-mode="edit"] .node-timer .timer-header,
-html[data-ip-mode="edit"] .node-choices .choices-headerbar,
-html[data-ip-mode="edit"] .node-sound .sound-header {
+/* In Edit mode, control buttons should not steal clicks (editing should be easy),
+   but the *button group container* should still be draggable/selectable. */
+html[data-ip-mode="edit"] .node-timer .timer-header .ip-controlbtn,
+html[data-ip-mode="edit"] .node-choices .choices-headerbar .ip-controlbtn,
+html[data-ip-mode="edit"] .node-sound .sound-header .ip-controlbtn {
   pointer-events: none;
+}
+
+/* Same rule for composite-defined button groups (timer/sound/choices). */
+html[data-ip-mode="edit"] .timer-sub-buttons .ip-controlbtn,
+html[data-ip-mode="edit"] .sound-sub-buttons .ip-controlbtn,
+html[data-ip-mode="edit"] .choices-buttons .ip-controlbtn {
+  pointer-events: none;
+}
+html[data-ip-mode="edit"] .node-choices[data-composite-editing="1"] canvas.choices-chart-canvas {
+  opacity: 0.35;
+  filter: grayscale(0.35);
+  pointer-events: none !important;
 }
 
 .ip-hide-node {
@@ -488,7 +509,9 @@ html[data-ip-mode="edit"] .node-sound .sound-header {
 .handles {
   position: absolute;
   inset: 0;
-  pointer-events: auto;
+  /* IMPORTANT: don't block interaction with composite internals (timer/sound/choices sub-elements).
+     Only the individual `.handle` / `.anchor-dot` hitboxes should be interactive. */
+  pointer-events: none;
   z-index: 50;
 }
 

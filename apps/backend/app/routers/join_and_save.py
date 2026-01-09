@@ -119,17 +119,20 @@ def save_presentation(payload: dict = Body(...)):
     if not isinstance(nodes, list):
         return Response(status_code=400, content="Invalid nodes", media_type="text/plain")
 
-    # Keep existing debug prints (can remove later if desired).
-    for n in nodes:
-        if isinstance(n, dict) and n.get("type") == "choices":
-            print(f"[DEBUG] Choices node: {n.get('id')}")
-            print(f"[DEBUG]   options type: {type(n.get('options'))}")
-            opts = n.get("options")
-            print(f"[DEBUG]   options value: {opts}")
-            if isinstance(opts, list):
-                print(f"[DEBUG]   options count: {len(opts)}")
-                for i, opt in enumerate(opts):
-                    print(f"[DEBUG]     opt[{i}] type={type(opt)}: {opt}")
+    # Optional diagnostics (dev only): enable by setting IP_DEBUG_CHOICES=1
+    import os
+
+    if os.environ.get("IP_DEBUG_CHOICES", "").strip() == "1":
+        for n in nodes:
+            if isinstance(n, dict) and n.get("type") == "choices":
+                print(f"[DEBUG] Choices node: {n.get('id')}")
+                print(f"[DEBUG]   options type: {type(n.get('options'))}")
+                opts = n.get("options")
+                print(f"[DEBUG]   options value: {opts}")
+                if isinstance(opts, list):
+                    print(f"[DEBUG]   options count: {len(opts)}")
+                    for i, opt in enumerate(opts):
+                        print(f"[DEBUG]     opt[{i}] type={type(opt)}: {opt}")
 
     write_presentation_txt(pres_dir / "presentation.pr", payload)
     write_geometries_csv(pres_dir / "geometries.csv", payload)

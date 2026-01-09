@@ -39,6 +39,8 @@ def sound_stop():
 
 @router.post("/api/sound/reset")
 def sound_reset():
+    # Reset should also put the system in the "Run" state (fresh start).
+    CAPTURE.pause()
     CAPTURE.reset()
     return {"ok": True}
 

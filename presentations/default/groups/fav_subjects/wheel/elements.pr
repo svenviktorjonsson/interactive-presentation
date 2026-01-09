@@ -1,9 +1,11 @@
-# wheel elements.pr (v1)
-# text[name=<optionId>]: <template>
-# Use {{label}} {{percent}} {{votes}} {{totalVotes}}
-text[name=Biologi]: Biologi ({{percent}}%)
-text[name=Kemi]: Kemi ({{percent}}%)
-text[name=Fysik]: Fysik ({{percent}}%)
-text[name=Matematik]: Matematik ({{percent}}%)
-text[name=vrigt]: Övrigt ({{percent}}%)
+# wheel elements.pr (v2)
+# Generated from ../elements.pr (top-down).
+# Each option is rendered as its bullet marker (A/1/...) + percent.
+# You can still override positioning via wheel/geometries.csv (per text[name=<id>]).
+# Available bindings: {{label}} {{percent}} {{votes}} {{totalVotes}}
+text[name=Biologi]: A ({{percent}}%)
+text[name=Kemi]: B ({{percent}}%)
+text[name=Fysik]: C ({{percent}}%)
+text[name=Matematik]: D ({{percent}}%)
+text[name=vrigt]: E ({{percent}}%)
 text[name=other]: Other ({{percent}}%)

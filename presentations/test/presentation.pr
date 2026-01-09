@@ -1,0 +1,15 @@
+# presentation.txt v1 (canonical)
+
+view[name=home]:
+text[name=t_text]:
+Core element test
+
+bullets[name=t_bullets,type=A]:
+This is a bullets node.
+Scaling should scale text, not shrink wrapping width.
+
+arrow[name=t_arrow,from=(0,0.5),to=(1,1),color=white,width=4]
+line[name=t_line,from=(0,0.5),to=(1,1),color=white,width=4]
+timer[name=t_timer,barColor=orange,binSize=1,grid=off,lineColor=green,lineWidth=2,max=40,min=20,showTime=0,stat=gaussian]
+text[name=text2]:
+New text
