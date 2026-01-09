@@ -485,6 +485,13 @@ html[data-ip-mode="edit"] .node-choices[data-composite-editing="1"] canvas.choic
   pointer-events: none !important;
 }
 
+/* Composite edit: the plot canvases must NOT steal pointer events from editable sub-elements.
+   Dragging on the plot region should behave like background (pan), not block selection. */
+html[data-ip-mode="edit"] .node-timer[data-composite-editing="1"] canvas.timer-canvas,
+html[data-ip-mode="edit"] .node-sound[data-composite-editing="1"] canvas.sound-canvas {
+  pointer-events: none !important;
+}
+
 .ip-hide-node {
   display: none !important;
 }
@@ -495,6 +502,12 @@ html[data-ip-mode="edit"] .node-choices[data-composite-editing="1"] canvas.choic
   filter: grayscale(0.5);
 }
 
+/* Composite level editing: dim any elements outside the active reference box */
+.ip-composite-dim {
+  opacity: 0.18 !important;
+  filter: grayscale(0.65);
+}
+
 .timer-sub.is-selected {
   outline: 2px solid rgba(110, 168, 255, 0.9);
   outline-offset: 0px;
@@ -503,6 +516,15 @@ html[data-ip-mode="edit"] .node-choices[data-composite-editing="1"] canvas.choic
 /* Composite sub-elements (choices/timer internal) */
 .comp-sub.is-selected {
   outline: 2px solid rgba(110, 168, 255, 0.9);
+  outline-offset: 0px;
+}
+
+/* Composite edit discoverability:
+   show faint bounding boxes for editable composite sub-elements even before selection,
+   so authors can find/click labels/arrows/buttons (elements.pr children). */
+html[data-ip-mode="edit"] .node-timer[data-composite-editing="1"] .comp-sub:not(.is-selected):not([data-kind="plot-region"]),
+html[data-ip-mode="edit"] .node-sound[data-composite-editing="1"] .comp-sub:not(.is-selected):not([data-kind="plot-region"]) {
+  outline: 1px dashed rgba(255, 255, 255, 0.22);
   outline-offset: 0px;
 }
 

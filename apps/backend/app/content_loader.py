@@ -1113,17 +1113,20 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 pass
             try:
                 pres_dir = path.parent
-                g_path = (pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name) / "geometries.csv")
-                if g_path.exists():
-                    geoms: dict[str, Any] = {}
-                    with g_path.open("r", encoding="utf-8", newline="") as f:
+                base = (pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name))
+
+                def load_geoms(csv_path: Path) -> dict[str, Any]:
+                    out: dict[str, Any] = {}
+                    if not csv_path.exists():
+                        return out
+                    with csv_path.open("r", encoding="utf-8", newline="") as f:
                         reader = csv.DictReader(f)
                         for row in reader:
                             sid = (row.get("id") or "").strip()
                             if not sid or sid.startswith("#"):
                                 continue
                             try:
-                                geoms[sid] = {
+                                out[sid] = {
                                     "x": float((row.get("x") or "0").strip() or 0),
                                     "y": float((row.get("y") or "0").strip() or 0),
                                     "w": float((row.get("w") or "0.2").strip() or 0.2),
@@ -1131,10 +1134,18 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                                     "rotationDeg": float((row.get("rotationDeg") or "0").strip() or 0),
                                     "anchor": (row.get("anchor") or "topLeft").strip() or "topLeft",
                                     "align": (row.get("align") or "").strip(),
+                                    "parent": (row.get("parent") or "").strip(),
                                 }
                             except Exception:
                                 continue
-                    nodes_by_id[name]["compositeGeometries"] = geoms
+                    return out
+
+                root_geoms = load_geoms(base / "geometries.csv")
+                nodes_by_id[name]["compositeGeometriesByPath"] = {
+                    "": root_geoms,
+                    "plot": load_geoms(base / "plot" / "geometries.csv"),
+                }
+                nodes_by_id[name]["compositeGeometries"] = root_geoms
             except Exception:
                 pass
             if current_view:
@@ -1228,17 +1239,20 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             # Load composite-local geometries for editable sub-elements.
             try:
                 pres_dir = path.parent
-                g_path = (pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name) / "geometries.csv")
-                if g_path.exists():
-                    geoms: dict[str, Any] = {}
-                    with g_path.open("r", encoding="utf-8", newline="") as f:
+                base = (pres_dir / "groups" / str(nodes_by_id[name].get("compositeDir") or name))
+
+                def load_geoms(csv_path: Path) -> dict[str, Any]:
+                    out: dict[str, Any] = {}
+                    if not csv_path.exists():
+                        return out
+                    with csv_path.open("r", encoding="utf-8", newline="") as f:
                         reader = csv.DictReader(f)
                         for row in reader:
                             sid = (row.get("id") or "").strip()
                             if not sid or sid.startswith("#"):
                                 continue
                             try:
-                                geoms[sid] = {
+                                out[sid] = {
                                     "x": float((row.get("x") or "0").strip() or 0),
                                     "y": float((row.get("y") or "0").strip() or 0),
                                     "w": float((row.get("w") or "0.2").strip() or 0.2),
@@ -1246,10 +1260,20 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                                     "rotationDeg": float((row.get("rotationDeg") or "0").strip() or 0),
                                     "anchor": (row.get("anchor") or "topLeft").strip() or "topLeft",
                                     "align": (row.get("align") or "").strip(),
+                                    "parent": (row.get("parent") or "").strip(),
                                 }
                             except Exception:
                                 continue
-                    nodes_by_id[name]["compositeGeometries"] = geoms
+                    return out
+
+                # Timer composites now support nested geometry folders (like choices wheel).
+                # Keep backward compatibility: still expose `compositeGeometries` as the root path.
+                root_geoms = load_geoms(base / "geometries.csv")
+                nodes_by_id[name]["compositeGeometriesByPath"] = {
+                    "": root_geoms,
+                    "plot": load_geoms(base / "plot" / "geometries.csv"),
+                }
+                nodes_by_id[name]["compositeGeometries"] = root_geoms
             except Exception:
                 pass
 

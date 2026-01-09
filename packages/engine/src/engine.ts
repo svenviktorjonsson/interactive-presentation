@@ -168,10 +168,17 @@ export class Engine {
   private onPointerDown(ev: PointerEvent) {
     if (ev.button !== 0) return;
     if (!this.panZoomEnabled) return;
+    // While in composite/group edit mode, the app layer owns pointer routing (select/drag/pan).
+    // Letting the engine also start a camera pan here causes "drag looks like pan" conflicts.
+    if ((window as any).__ip_compositeEditing) return;
     // If the user is manipulating a node/handle, do not start panning.
     const t = ev.target as Element | null;
     if (
       t?.closest(".node") ||
+      // Composite/group edit sub-elements live outside the `.node` subtree in some cases
+      // and must behave like normal draggable elements (i.e. do not start background pan).
+      t?.closest(".comp-sub") ||
+      t?.closest(".ip-composite-selection") ||
       t?.closest(".handle") ||
       t?.closest(".modal") ||
       t?.closest(".fs-prompt") ||

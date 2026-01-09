@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import csv
+import logging
 from typing import Any
 
 from fastapi.responses import Response
 
 from ..config import PRESENTATION_DIR
+
+logger = logging.getLogger("ip.composite_service")
 
 
 def _format_pr_list_commas(text: str) -> str:
@@ -71,15 +74,19 @@ def save_composite(payload: dict[str, Any]) -> dict | Response:
     elements_text = payload.get("elementsText")
     elements_pr = payload.get("elementsPr")
     if not composite_path:
+        logger.warning("save_composite: 400 Missing compositePath (keys=%s)", sorted(payload.keys()))
         return Response(status_code=400, content="Missing compositePath", media_type="text/plain")
 
     parts = [p for p in composite_path.replace("\\", "/").split("/") if p.strip()]
     if not parts:
+        logger.warning("save_composite: 400 Invalid compositePath (raw=%r)", composite_path)
         return Response(status_code=400, content="Invalid compositePath", media_type="text/plain")
     for part in parts:
         if not part.replace("_", "").replace("-", "").isalnum():
+            logger.warning("save_composite: 400 Invalid compositePath segment (raw=%r part=%r)", composite_path, part)
             return Response(status_code=400, content="Invalid compositePath segment", media_type="text/plain")
     if not isinstance(geoms, dict):
+        logger.warning("save_composite: 400 Missing geoms (compositePath=%r geomsType=%s)", composite_path, type(geoms).__name__)
         return Response(status_code=400, content="Missing geoms", media_type="text/plain")
 
     comp_dir = PRESENTATION_DIR / "groups"

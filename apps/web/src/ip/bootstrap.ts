@@ -93,30 +93,72 @@ function _plotFracsForEl(el: HTMLElement) {
   return PLOT_FRACS;
 }
 
-function _pickSmallestCompositeSub(root: HTMLElement, clientX: number, clientY: number) {
+function _pickSmallestCompositeSub(
+  root: HTMLElement,
+  clientX: number,
+  clientY: number,
+  opts?: { activeCompPath?: string | null; excludeEl?: HTMLElement | null }
+) {
   // Search across the whole composite root, not just a specific layer:
   // - allows selecting nested comp-subs (e.g. wheel labels)
   // - allows selecting fully covered elements (smallest bbox wins)
   const subs = Array.from(root.querySelectorAll<HTMLElement>(".comp-sub"));
-  let best: { el: HTMLElement; area: number; z: number; order: number } | null = null;
+  // IMPORTANT: plot-arrow hitboxes are helper overlays; they must NEVER steal selection
+  // from normal editable elements (text/buttons). If nothing else is under the cursor,
+  // then we can fall back to arrows.
+  let bestNormal: { el: HTMLElement; area: number; z: number; order: number } | null = null;
+  let bestArrow: { el: HTMLElement; area: number; z: number; order: number } | null = null;
   for (let i = 0; i < subs.length; i++) {
     const el = subs[i];
-    // Ignore hidden/disabled nodes.
-    if (el.offsetParent === null) continue;
+    if (opts?.excludeEl && el === opts.excludeEl) continue;
+    const activePath = String(opts?.activeCompPath ?? "");
+    if (activePath) {
+      const p = String(el.dataset.compPath ?? "");
+      // In a nested composite level, ONLY allow selecting elements whose compPath matches that level.
+      if (p !== activePath) continue;
+    }
+    // Hard-disable plot region overlays: they are internal helpers and should never be selectable.
+    // (Older DOM could be missing dataset.kind, so also match by class/subId.)
+    const subId = String(el.dataset.subId ?? "");
+    const kind = String(el.dataset.kind ?? "");
+    if (
+      kind === "plot-region" ||
+      subId === "plot" ||
+      el.classList.contains("timer-sub-plot") ||
+      el.classList.contains("sound-sub-plot")
+    ) {
+      continue;
+    }
+    // Ignore hidden nodes.
+    // NOTE: `offsetParent` is unreliable for some positioned elements; prefer computed styles + bbox.
+    const cs = window.getComputedStyle(el);
+    if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity || "1") <= 0) continue;
     const r = el.getBoundingClientRect();
     if (!(clientX >= r.left && clientX <= r.right && clientY >= r.top && clientY <= r.bottom)) continue;
+    if (!(r.width > 0.5 && r.height > 0.5)) continue;
     const area = Math.max(1e-6, r.width * r.height);
     const zRaw = window.getComputedStyle(el).zIndex;
     const z = zRaw === "auto" ? 0 : Number(zRaw) || 0;
     const cand = { el, area, z, order: i };
-    if (!best) best = cand;
-    else if (cand.area < best.area - 1e-6) best = cand;
-    else if (Math.abs(cand.area - best.area) <= 1e-6) {
-      if (cand.z > best.z) best = cand;
-      else if (cand.z === best.z && cand.order > best.order) best = cand; // later in DOM = on top
+    const isArrow = kind === "plot-arrow";
+    const best = isArrow ? bestArrow : bestNormal;
+    if (!best) {
+      if (isArrow) bestArrow = cand;
+      else bestNormal = cand;
+    } else if (cand.area < best.area - 1e-6) {
+      if (isArrow) bestArrow = cand;
+      else bestNormal = cand;
+    } else if (Math.abs(cand.area - best.area) <= 1e-6) {
+      if (cand.z > best.z) {
+        if (isArrow) bestArrow = cand;
+        else bestNormal = cand;
+      } else if (cand.z === best.z && cand.order > best.order) {
+        if (isArrow) bestArrow = cand;
+        else bestNormal = cand; // later in DOM = on top
+      }
     }
   }
-  return best?.el ?? null;
+  return bestNormal?.el ?? bestArrow?.el ?? null;
 }
 
 function _plotRectCss(nodeEl: HTMLElement) {
@@ -1589,13 +1631,31 @@ function _parseList(raw: string | undefined): string[] {
 }
 
 function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
+  const dbg = ipDebugEnabled("ip_debug_composite");
   const m = engine.getModel();
   const node = m?.nodes.find((n) => n.id === timerId) as any;
   const el = engine.getNodeElement(timerId);
-  if (!node || !el) return null;
+  if (!node || !el) {
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.warn("[ip][composite] ensureTimerCompositeLayer: missing node/el", { timerId, hasNode: !!node, hasEl: !!el });
+    }
+    return null;
+  }
 
   const frame = el.querySelector<HTMLElement>(":scope .timer-frame");
-  if (!frame) return null;
+  if (!frame) {
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.warn("[ip][composite] ensureTimerCompositeLayer: missing .timer-frame", {
+        timerId,
+        nodeType: node?.type,
+        elClass: el.className,
+        childTags: Array.from(el.children).map((c) => (c as any)?.tagName)
+      });
+    }
+    return null;
+  }
 
   let layer = frame.querySelector<HTMLElement>(":scope .timer-sub-layer");
   if (!layer) {
@@ -1618,39 +1678,42 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     svg.style.pointerEvents = "none";
     layer.append(svg);
 
-    // Plot/ticks/ticklabels region: special non-editable component, movable as one in group edit.
-    const plot = document.createElement("div");
-    plot.className = "timer-sub timer-sub-plot comp-sub";
-    plot.dataset.subId = "plot";
-    plot.dataset.compPath = timerId;
-    plot.dataset.kind = "plot-region";
-    plot.style.position = "absolute";
-    plot.style.pointerEvents = "none";
-    plot.style.zIndex = "10";
-    plot.style.background = "rgba(255,255,255,0.03)";
-    layer.append(plot);
+    // Plot group: a real nested composite level.
+    // - root level can move/resize it (it's just another element)
+    // - double-click enters `${timerId}/plot` where only plot internals are selectable
+    const plotGroup = document.createElement("div");
+    plotGroup.className = "timer-sub comp-sub comp-group timer-sub-plotgroup";
+    plotGroup.dataset.subId = "plot";
+    plotGroup.dataset.compPath = timerId;
+    plotGroup.dataset.groupPath = `${timerId}/plot`;
+    plotGroup.style.position = "absolute";
+    plotGroup.style.pointerEvents = "none";
+    plotGroup.style.zIndex = "10";
+    plotGroup.style.background = "transparent";
+    layer.append(plotGroup);
+    (layer as any).__plotGroup = plotGroup;
 
     // Hit layers for axis arrows (editable in group edit mode) - one per arrow id.
     // These map 1:1 to arrow[...] specs (not special graphics).
     const mkArrowHit = (arrowId: string) => {
-      const layerEl = layer!;
+      const container = ((layer as any).__plotGroup as HTMLElement | null) ?? layer!;
       const h = document.createElement("div");
       h.className = "timer-sub timer-sub-arrow-hit comp-sub";
       h.dataset.subId = arrowId;
-      h.dataset.compPath = timerId;
+      h.dataset.compPath = `${timerId}/plot`;
       h.dataset.kind = "plot-arrow";
       h.dataset.arrowId = arrowId;
       h.style.position = "absolute";
       // Sized by renderTimerCompositeArrows() (tight bbox).
       h.style.pointerEvents = "none";
       h.style.zIndex = "20";
-      layerEl.append(h);
+      container.append(h);
       return h;
     };
     mkArrowHit("x_axis");
     mkArrowHit("y_axis");
 
-    const geoms: Record<string, any> = node.compositeGeometries ?? {};
+    const geoms: Record<string, any> = (node.compositeGeometriesByPath?.[""] ?? node.compositeGeometries ?? {}) as any;
     // Default plot region = the canonical plot rect used by the renderer.
     geoms["plot"] = geoms["plot"] ?? {
       x: PLOT_FRACS.leftF,
@@ -1662,6 +1725,10 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
       align: "left",
     };
     const text = String(node.elementsText ?? "");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][composite] timer elementsText", { timerId, chars: text.length, head: text.slice(0, 180) });
+    }
     const lines = text.split(/\r?\n/);
     const arrowSpecs: Array<{
       id: string;
@@ -1841,38 +1908,43 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     (layer as any).__elementsPr = text;
   }
 
+  // Ensure plot group exists for older layers.
+  let plotGroup = (layer as any).__plotGroup as HTMLElement | null;
+  if (!plotGroup) {
+    plotGroup = layer.querySelector<HTMLElement>(":scope > .timer-sub-plotgroup");
+    if (!plotGroup) {
+      plotGroup = document.createElement("div");
+      plotGroup.className = "timer-sub comp-sub comp-group timer-sub-plotgroup";
+      plotGroup.dataset.subId = "plot";
+      plotGroup.dataset.compPath = timerId;
+      plotGroup.dataset.groupPath = `${timerId}/plot`;
+      plotGroup.style.position = "absolute";
+      plotGroup.style.pointerEvents = "none";
+      plotGroup.style.zIndex = "10";
+      plotGroup.style.background = "transparent";
+      layer.append(plotGroup);
+    }
+    (layer as any).__plotGroup = plotGroup;
+  }
+
   // Ensure per-axis hit layers exist even if the layer was created before we added them.
   const ensureHit = (arrowId: string) => {
-    if (layer.querySelector<HTMLElement>(`:scope > .timer-sub-arrow-hit[data-arrow-id="${arrowId}"]`)) return;
+    const container = ((layer as any).__plotGroup as HTMLElement | null) ?? layer;
+    if (container.querySelector<HTMLElement>(`:scope > .timer-sub-arrow-hit[data-arrow-id="${arrowId}"]`)) return;
     const h = document.createElement("div");
     h.className = "timer-sub timer-sub-arrow-hit comp-sub";
     h.dataset.subId = arrowId;
-    h.dataset.compPath = timerId;
+    h.dataset.compPath = `${timerId}/plot`;
     h.dataset.kind = "plot-arrow";
     h.dataset.arrowId = arrowId;
     h.style.position = "absolute";
     // Sized by renderTimerCompositeArrows() (tight bbox).
     h.style.pointerEvents = "none";
     h.style.zIndex = "20";
-    layer.append(h);
+    container.append(h);
   };
   ensureHit("x_axis");
   ensureHit("y_axis");
-
-  // Ensure plot region sub-element exists for older layers.
-  let plotEl = layer.querySelector<HTMLElement>(":scope > .timer-sub-plot[data-sub-id=\"plot\"]");
-  if (!plotEl) {
-    plotEl = document.createElement("div");
-    plotEl.className = "timer-sub timer-sub-plot comp-sub";
-    plotEl.dataset.subId = "plot";
-    plotEl.dataset.compPath = timerId;
-    plotEl.dataset.kind = "plot-region";
-    plotEl.style.position = "absolute";
-    plotEl.style.pointerEvents = "none";
-    plotEl.style.zIndex = "10";
-    plotEl.style.background = "rgba(255,255,255,0.03)";
-    layer.append(plotEl);
-  }
 
   // Sync plot region geom -> DOM box + dataset fracs so canvas/ticks follow it.
   const geoms: Record<string, any> = (layer as any).__textGeoms ?? (node.compositeGeometries ?? {});
@@ -1894,11 +1966,14 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
   el.dataset.plotRightF = String(rightF);
   el.dataset.plotTopF = String(topF);
   el.dataset.plotBottomF = String(bottomF);
-  if (plotEl) {
-    plotEl.style.left = `${leftF * 100}%`;
-    plotEl.style.top = `${topF * 100}%`;
-    plotEl.style.width = `${Number(pg.w) * 100}%`;
-    plotEl.style.height = `${Number(pg.h) * 100}%`;
+  if (plotGroup) {
+    plotGroup.style.left = `${leftF * 100}%`;
+    plotGroup.style.top = `${topF * 100}%`;
+    plotGroup.style.width = `${Number(pg.w) * 100}%`;
+    plotGroup.style.height = `${Number(pg.h) * 100}%`;
+    // Anchor is always topLeft for the plot reference box (simplifies nested coords).
+    plotGroup.dataset.anchor = "topLeft";
+    plotGroup.style.transform = "translate(0%, 0%)";
   }
 
   return layer;
@@ -1907,6 +1982,8 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
 function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
   const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
   const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .timer-sub-text"));
+  const isGroupEditing = timerEl.dataset.compositeEditing === "1";
+  const appMode = getAppMode();
   // Prefer engine-provided pixel size to avoid reflow jitter; fall back to DOM rect.
   const hPx = Number(timerEl.dataset.timerHpx ?? "0");
   const wPx = Number(timerEl.dataset.timerWpx ?? "0");
@@ -1946,6 +2023,12 @@ function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, dat
       const contentEl = t.querySelector<HTMLElement>(":scope .timer-sub-content");
       if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
     }
+
+    // Composite texts should only be interactive in group edit mode (Edit mode).
+    // In Live mode they are display-only; in normal Edit mode they should not steal clicks from selecting the timer node.
+    const interactive = appMode === "edit" && isGroupEditing;
+    t.style.pointerEvents = interactive ? "auto" : "none";
+    t.style.cursor = interactive ? "grab" : "default";
   }
 }
 
@@ -1959,6 +2042,7 @@ function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLElement, d
       ? { width: wPx, height: hPx }
       : timerEl.getBoundingClientRect();
   const isGroupEditing = timerEl.dataset.compositeEditing === "1";
+  const appMode = getAppMode();
   for (const boxEl of els) {
     const sid = boxEl.dataset.subId ?? "";
     const g = geoms[sid] ?? {};
@@ -1966,8 +2050,13 @@ function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLElement, d
     const fontPx = Math.max(12, timerBox.height * h * 0.55);
     const scale = Math.max(0.6, Math.min(3, fontPx / 16));
     boxEl.style.setProperty("--control-scale", String(scale));
-    boxEl.style.opacity = isGroupEditing ? "0.35" : "1";
-    boxEl.style.pointerEvents = isGroupEditing ? "none" : "auto";
+    // Interaction rules:
+    // - Live: the real buttons must be clickable
+    // - Edit (not group edit): do NOT steal clicks from selecting the timer node
+    // - Edit + group edit: allow selecting/moving the button group as a composite sub-element
+    const canSelectGroup = appMode === "edit" && isGroupEditing;
+    boxEl.style.opacity = canSelectGroup ? "1" : "1";
+    boxEl.style.pointerEvents = appMode === "live" ? "auto" : canSelectGroup ? "auto" : "none";
 
     for (const btn of Array.from(boxEl.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
       const tpl = btn.dataset.template ?? "";
@@ -2081,17 +2170,21 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
     const y2 = mapY(Number(a.y1 ?? 1));
 
     // Keep a per-arrow hitbox in sync with the rendered arrow (smallest bbox wins in selection).
-    const hit = layer.querySelector<HTMLElement>(`:scope > .timer-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`);
+    const plotGroup = (layer as any).__plotGroup as HTMLElement | null;
+    const hit = (plotGroup ?? layer).querySelector<HTMLElement>(
+      `:scope > .timer-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`
+    );
     if (hit) {
       const padPx = 24;
       const minX = Math.min(x1, x2) - padPx;
       const maxX = Math.max(x1, x2) + padPx;
       const minY = Math.min(y1, y2) - padPx;
       const maxY = Math.max(y1, y2) + padPx;
-      hit.style.left = `${(minX / w) * 100}%`;
-      hit.style.top = `${(minY / h) * 100}%`;
-      hit.style.width = `${((maxX - minX) / w) * 100}%`;
-      hit.style.height = `${((maxY - minY) / h) * 100}%`;
+      // Hitboxes live inside the plotGroup (nested level), so position them relative to plot rect.
+      hit.style.left = `${((minX - ox) / Math.max(1e-9, xLen)) * 100}%`;
+      hit.style.top = `${((minY - (oy - yLen)) / Math.max(1e-9, yLen)) * 100}%`;
+      hit.style.width = `${((maxX - minX) / Math.max(1e-9, xLen)) * 100}%`;
+      hit.style.height = `${((maxY - minY) / Math.max(1e-9, yLen)) * 100}%`;
     }
 
     const markerId = `arrowhead-${timerId}-${a.id}`;
@@ -2412,40 +2505,41 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
     svg.style.pointerEvents = "none";
     layer.append(svg);
 
-    // Plot/ticks/ticklabels region: special non-editable component, movable as one in group edit.
-    const plot = document.createElement("div");
-    plot.className = "sound-sub sound-sub-plot comp-sub";
-    plot.dataset.subId = "plot";
-    plot.dataset.compPath = soundId;
-    plot.dataset.kind = "plot-region";
-    plot.style.position = "absolute";
-    plot.style.pointerEvents = "none";
-    plot.style.zIndex = "10";
-    plot.style.background = "rgba(255,255,255,0.03)";
-    layer.append(plot);
+    // Plot group: nested composite level (soundId/plot).
+    const plotGroup = document.createElement("div");
+    plotGroup.className = "sound-sub comp-sub comp-group sound-sub-plotgroup";
+    plotGroup.dataset.subId = "plot";
+    plotGroup.dataset.compPath = soundId;
+    plotGroup.dataset.groupPath = `${soundId}/plot`;
+    plotGroup.style.position = "absolute";
+    plotGroup.style.pointerEvents = "none";
+    plotGroup.style.zIndex = "10";
+    plotGroup.style.background = "transparent";
+    layer.append(plotGroup);
+    (layer as any).__plotGroup = plotGroup;
 
     // Hit layers for axis arrows (editable in group edit mode) - one per arrow id.
     // These are *not* special graphics; they map 1:1 to arrow[...] specs.
     // Positioned over the plot rect only, so selection outlines aren't huge.
     const mkArrowHit = (arrowId: string) => {
-      const layerEl = layer!;
+      const container = ((layer as any).__plotGroup as HTMLElement | null) ?? layer!;
       const h = document.createElement("div");
       h.className = "sound-sub sound-sub-arrow-hit comp-sub";
       h.dataset.subId = arrowId;
-      h.dataset.compPath = soundId;
+      h.dataset.compPath = `${soundId}/plot`;
       h.dataset.kind = "plot-arrow";
       h.dataset.arrowId = arrowId;
       h.style.position = "absolute";
       // Sized by renderSoundCompositeArrows() (tight bbox).
       h.style.pointerEvents = "none";
       h.style.zIndex = "20";
-      layerEl.append(h);
+      container.append(h);
       return h;
     };
     mkArrowHit("x_axis");
     mkArrowHit("y_axis");
 
-    const geoms: Record<string, any> = node.compositeGeometries ?? {};
+    const geoms: Record<string, any> = (node.compositeGeometriesByPath?.[""] ?? node.compositeGeometries ?? {}) as any;
     // Enforce canonical positions for y_label + peak so sound matches timer.
     geoms["y_label"] = { ...(geoms["y_label"] ?? {}), ...CANON_COMPOSITE_Y_LABEL };
     geoms["peak"] = { ...(geoms["peak"] ?? {}), ...CANON_COMPOSITE_STATS };
@@ -2606,35 +2700,40 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
 
   // Ensure per-axis hit layers exist even if the layer was created before we added them.
   const ensureHit = (arrowId: string) => {
-    if (layer.querySelector<HTMLElement>(`:scope > .sound-sub-arrow-hit[data-arrow-id="${arrowId}"]`)) return;
+    const container = ((layer as any).__plotGroup as HTMLElement | null) ?? layer;
+    if (container.querySelector<HTMLElement>(`:scope > .sound-sub-arrow-hit[data-arrow-id="${arrowId}"]`)) return;
     const h = document.createElement("div");
     h.className = "sound-sub sound-sub-arrow-hit comp-sub";
     h.dataset.subId = arrowId;
-    h.dataset.compPath = soundId;
+    h.dataset.compPath = `${soundId}/plot`;
     h.dataset.kind = "plot-arrow";
     h.dataset.arrowId = arrowId;
     h.style.position = "absolute";
     // Sized by renderSoundCompositeArrows() (tight bbox).
     h.style.pointerEvents = "none";
     h.style.zIndex = "20";
-    layer.append(h);
+    container.append(h);
   };
   ensureHit("x_axis");
   ensureHit("y_axis");
 
-  // Ensure plot region sub-element exists for older layers.
-  let plotEl = layer.querySelector<HTMLElement>(':scope > .sound-sub-plot[data-sub-id="plot"]');
-  if (!plotEl) {
-    plotEl = document.createElement("div");
-    plotEl.className = "sound-sub sound-sub-plot comp-sub";
-    plotEl.dataset.subId = "plot";
-    plotEl.dataset.compPath = soundId;
-    plotEl.dataset.kind = "plot-region";
-    plotEl.style.position = "absolute";
-    plotEl.style.pointerEvents = "none";
-    plotEl.style.zIndex = "10";
-    plotEl.style.background = "rgba(255,255,255,0.03)";
-    layer.append(plotEl);
+  // Ensure plot group exists for older layers.
+  let plotGroup = (layer as any).__plotGroup as HTMLElement | null;
+  if (!plotGroup) {
+    plotGroup = layer.querySelector<HTMLElement>(":scope > .sound-sub-plotgroup");
+    if (!plotGroup) {
+      plotGroup = document.createElement("div");
+      plotGroup.className = "sound-sub comp-sub comp-group sound-sub-plotgroup";
+      plotGroup.dataset.subId = "plot";
+      plotGroup.dataset.compPath = soundId;
+      plotGroup.dataset.groupPath = `${soundId}/plot`;
+      plotGroup.style.position = "absolute";
+      plotGroup.style.pointerEvents = "none";
+      plotGroup.style.zIndex = "10";
+      plotGroup.style.background = "transparent";
+      layer.append(plotGroup);
+    }
+    (layer as any).__plotGroup = plotGroup;
   }
 
   // Sync plot region geom -> DOM box + dataset fracs so canvas/ticks follow it.
@@ -2657,11 +2756,13 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
   el.dataset.plotRightF = String(rightF);
   el.dataset.plotTopF = String(topF);
   el.dataset.plotBottomF = String(bottomF);
-  if (plotEl) {
-    plotEl.style.left = `${leftF * 100}%`;
-    plotEl.style.top = `${topF * 100}%`;
-    plotEl.style.width = `${Number(pg.w) * 100}%`;
-    plotEl.style.height = `${Number(pg.h) * 100}%`;
+  if (plotGroup) {
+    plotGroup.style.left = `${leftF * 100}%`;
+    plotGroup.style.top = `${topF * 100}%`;
+    plotGroup.style.width = `${Number(pg.w) * 100}%`;
+    plotGroup.style.height = `${Number(pg.h) * 100}%`;
+    plotGroup.dataset.anchor = "topLeft";
+    plotGroup.style.transform = "translate(0%, 0%)";
   }
 
   return layer;
@@ -2717,6 +2818,7 @@ function renderSoundCompositeButtons(soundEl: HTMLElement, layer: HTMLElement, d
   const wPx = Number(soundEl.dataset.soundWpx ?? "0");
   const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
   const isGroupEditing = soundEl.dataset.compositeEditing === "1";
+  const appMode = getAppMode();
   for (const boxEl of els) {
     const sid = boxEl.dataset.subId ?? "";
     const g = geoms[sid] ?? {};
@@ -2724,9 +2826,13 @@ function renderSoundCompositeButtons(soundEl: HTMLElement, layer: HTMLElement, d
     const fontPx = Math.max(12, box.height * h * 0.55);
     const scale = Math.max(0.6, Math.min(3, fontPx / 16));
     boxEl.style.setProperty("--control-scale", String(scale));
-    // In group edit, treat buttons as non-editable chrome: visible but disabled.
-    boxEl.style.opacity = isGroupEditing ? "0.35" : "1";
-    boxEl.style.pointerEvents = isGroupEditing ? "none" : "auto";
+    // Interaction rules:
+    // - Live: buttons must be clickable
+    // - Edit (not group edit): do NOT steal clicks from selecting the sound node
+    // - Edit + group edit: allow selecting/moving the button group as a composite sub-element
+    const canSelectGroup = appMode === "edit" && isGroupEditing;
+    boxEl.style.opacity = "1";
+    boxEl.style.pointerEvents = appMode === "live" ? "auto" : canSelectGroup ? "auto" : "none";
     for (const btn of Array.from(boxEl.querySelectorAll<HTMLButtonElement>("button.ip-controlbtn"))) {
       const tpl = btn.dataset.template ?? "";
       const resolved = applyDataBindings(tpl, data);
@@ -2795,17 +2901,20 @@ function renderSoundCompositeArrows(soundEl: HTMLElement, layer: HTMLElement) {
     const x2 = mapX(Number(a.x1 ?? 1));
     const y2 = mapY(Number(a.y1 ?? 1));
 
-    const hit = layer.querySelector<HTMLElement>(`:scope > .sound-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`);
+    const plotGroup = (layer as any).__plotGroup as HTMLElement | null;
+    const hit = (plotGroup ?? layer).querySelector<HTMLElement>(
+      `:scope > .sound-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`
+    );
     if (hit) {
       const padPx = 24;
       const minX = Math.min(x1, x2) - padPx;
       const maxX = Math.max(x1, x2) + padPx;
       const minY = Math.min(y1, y2) - padPx;
       const maxY = Math.max(y1, y2) + padPx;
-      hit.style.left = `${(minX / w) * 100}%`;
-      hit.style.top = `${(minY / h) * 100}%`;
-      hit.style.width = `${((maxX - minX) / w) * 100}%`;
-      hit.style.height = `${((maxY - minY) / h) * 100}%`;
+      hit.style.left = `${((minX - ox) / Math.max(1e-9, xLen)) * 100}%`;
+      hit.style.top = `${((minY - (oy - yLen)) / Math.max(1e-9, yLen)) * 100}%`;
+      hit.style.width = `${((maxX - minX) / Math.max(1e-9, xLen)) * 100}%`;
+      hit.style.height = `${((maxY - minY) / Math.max(1e-9, yLen)) * 100}%`;
     }
 
     const markerId = `arrowhead-${soundId}-${a.id}`;
@@ -3008,6 +3117,38 @@ function ipDebugEnabled(flag: string) {
   }
 }
 
+async function _debugCompositeSaveFetch(url: string, payload: any, ctx: Record<string, any>) {
+  const dbg = ipDebugEnabled("ip_debug_composite_save");
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      // Always log failures (otherwise 400s are impossible to debug from the UI).
+      // eslint-disable-next-line no-console
+      console.warn("[ip][composite][save] failed", { status: res.status, statusText: res.statusText, ctx, body: txt });
+      if (dbg) {
+        // eslint-disable-next-line no-console
+        console.warn("[ip][composite][save] payload", payload);
+      }
+    } else if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][composite][save] ok", { ctx, payload });
+    }
+  } catch (err) {
+    // Always log network errors too.
+    // eslint-disable-next-line no-console
+    console.warn("[ip][composite][save] error", { ctx, err });
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.warn("[ip][composite][save] payload", payload);
+    }
+  }
+}
+
 function ensureHandles(el: HTMLElement) {
   // Safety: never show transform UI in Live mode.
   if (getAppMode() !== "edit") {
@@ -3044,6 +3185,13 @@ function ensureHandles(el: HTMLElement) {
 
   // Rotate cursor directions with the node rotation (fixes e.g. rotated y-label edge cursors).
   const parseRotateDeg = (cssTransform: string | null | undefined) => {
+    // Prefer the modern rotate property when present (composite sub-elements use `style.rotate = "Xdeg"`).
+    const r0 = String((el as any)?.style?.rotate ?? "").trim();
+    const m0 = r0.match(/^\s*([\-0-9.]+)\s*deg\s*$/i);
+    if (m0) {
+      const v0 = Number(m0[1]);
+      if (Number.isFinite(v0)) return v0;
+    }
     const s = String(cssTransform ?? "");
     const m = s.match(/rotate\(\s*([\-0-9.]+)\s*deg\s*\)/i);
     if (!m) return 0;
@@ -4343,6 +4491,19 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       stage.style.cursor = "pointer";
       return;
     }
+    // Composite/group edit: hovering sub-elements should feel like normal draggable elements.
+    // (Handles already set their own cursors.)
+    if (compositeEditTimerId) {
+      const handleEl = elAt.closest<HTMLElement>(".handle");
+      if (!handleEl) {
+        const sub = elAt.closest<HTMLElement>(".comp-sub");
+        const kind = String(sub?.dataset.kind ?? "");
+        if (sub && kind !== "plot-region") {
+          stage.style.cursor = "grab";
+          return;
+        }
+      }
+    }
 
     const model = engine.getModel();
 
@@ -4455,6 +4616,17 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     // Composite sub-elements rendered in the overlay layer.
     for (const sub of Array.from(layer.querySelectorAll<HTMLElement>(".comp-sub"))) {
+    // Ignore plot helper region; it must not affect bbox/hit-testing.
+    const subId = String(sub.dataset.subId ?? "");
+    const kind = String(sub.dataset.kind ?? "");
+    if (
+      kind === "plot-region" ||
+      subId === "plot" ||
+      sub.classList.contains("timer-sub-plot") ||
+      sub.classList.contains("sound-sub-plot")
+    ) {
+      continue;
+    }
       const sr = sub.getBoundingClientRect();
       if (!(sr.width > 0.5 && sr.height > 0.5)) continue;
       rects.push(sr);
@@ -4728,6 +4900,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
       const anchorEl = (ev.target as HTMLElement).closest?.(".anchor-dot");
       if (anchorEl) return; // let anchor click logic handle it
+
+      // Critical: while editing timer/sound composites, do NOT let the normal node selection/drag handler run.
+      // Otherwise it can select/drag the composite root in capture phase and stop propagation,
+      // preventing sub-element selection (which looks like "clicking a label selects the full rect").
+      if (compositeEditTimerId && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
+        return;
+      }
 
       const model = engine.getModel();
       if (!model) return;
@@ -6024,6 +6203,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   let compositeEditTimerId: string | null = null; // composite root node id
   let compositeEditKind: "timer" | "choices" | "sound" = "timer";
   let compositeEditPath: string = "";
+  const compositePathStack: string[] = [];
   const compositeGeomsByPath: Record<string, any> = {};
   let compositeHiddenEls: HTMLElement[] = [];
   let compositeSelectedSubId: string | null = null;
@@ -6150,6 +6330,67 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     (window as any).__ip_exitScreenEdit = exitScreenEdit;
   };
 
+  const applyCompositeLevelDimming = () => {
+    if (!compositeEditTimerId) return;
+    const rootEl = engine.getNodeElement(compositeEditTimerId);
+    if (!rootEl) return;
+    const activeBox =
+      rootEl.querySelector<HTMLElement>(`[data-group-path="${compositeEditPath}"]`) ??
+      rootEl;
+    // Dim and disable pointer events for elements outside the active box.
+    // IMPORTANT: do NOT disable pointer events on the active box, or its descendants won't be interactive.
+    for (const sub of Array.from(rootEl.querySelectorAll<HTMLElement>(".comp-sub"))) {
+      const inActiveBox = activeBox.contains(sub);
+      sub.classList.toggle("ip-composite-dim", !inActiveBox);
+      // Ensure we restore pointer-events when moving back up levels.
+      sub.style.pointerEvents = inActiveBox ? "auto" : "none";
+    }
+    // Also dim non-comp-sub content outside the active box (e.g. underlying chart layers).
+    // Keep this light: just add a dataset marker for CSS hooks if needed.
+    rootEl.dataset.compositeLevel = compositeEditPath;
+  };
+
+  const enterCompositeLevel = (path: string) => {
+    if (!compositeEditTimerId) return;
+    const p = String(path || compositeEditTimerId);
+    if (!p) return;
+    // Normalize stack root.
+    if (compositePathStack.length === 0) compositePathStack.push(String(compositeEditTimerId));
+    if (compositePathStack[compositePathStack.length - 1] !== p) compositePathStack.push(p);
+    compositeEditPath = p;
+    compositeSelectedSubId = null;
+    compositeSelectedSubEl = null;
+    // Clear any selection chrome.
+    const rootEl = engine.getNodeElement(compositeEditTimerId);
+    if (rootEl) {
+      for (const e of Array.from(rootEl.querySelectorAll<HTMLElement>(".comp-sub"))) {
+        e.classList.remove("is-selected");
+        e.querySelector(":scope > .handles")?.remove();
+      }
+    }
+    applyCompositeLevelDimming();
+  };
+
+  const exitCompositeLevel = () => {
+    if (!compositeEditTimerId) return;
+    if (compositePathStack.length <= 1) {
+      (window as any).__ip_exitCompositeEdit?.();
+      return;
+    }
+    compositePathStack.pop();
+    compositeEditPath = compositePathStack[compositePathStack.length - 1] ?? String(compositeEditTimerId);
+    compositeSelectedSubId = null;
+    compositeSelectedSubEl = null;
+    const rootEl = engine.getNodeElement(compositeEditTimerId);
+    if (rootEl) {
+      for (const e of Array.from(rootEl.querySelectorAll<HTMLElement>(".comp-sub"))) {
+        e.classList.remove("is-selected");
+        e.querySelector(":scope > .handles")?.remove();
+      }
+    }
+    applyCompositeLevelDimming();
+  };
+
   const enterTimerCompositeEdit = (timerId: string) => {
     const dbg = ipDebugEnabled("ip_debug_dblclick");
     if (dbg) {
@@ -6185,17 +6426,22 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // Mark composite editing so CSS can optionally gray out non-editable parts.
     el.dataset.compositeEditing = "1";
     // Seed editable geoms for this composite folder.
+    // Root path == timerId; nested plot level == `${timerId}/plot`.
     compositeGeomsByPath[timerId] = (layer as any)?.__textGeoms ?? {};
+    const byPath: any = (engine.getModel()?.nodes.find((n: any) => String(n.id) === String(timerId)) as any)?.compositeGeometriesByPath ?? {};
+    compositeGeomsByPath[`${timerId}/plot`] = byPath["plot"] ?? {};
     for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".comp-sub") ?? [])) {
       // Lock the plot/data reference region: it's the coordinate system basis for everything else.
       if (sub.dataset.kind === "plot-region") {
         sub.style.pointerEvents = "none";
         sub.style.cursor = "default";
-        // Keep the reference region visible and "grayed" while editing.
-        sub.style.background = "rgba(255,255,255,0.06)";
-        sub.style.outline = "1px dashed rgba(255,255,255,0.25)";
+        // IMPORTANT:
+        // The plot region is an internal helper (not authored in elements.pr).
+        // Keep it invisible in composite edit to avoid confusing "ghost element" selection boxes.
+        sub.style.background = "transparent";
+        sub.style.outline = "none";
         sub.style.outlineOffset = "0px";
-        sub.style.opacity = "0.45";
+        sub.style.opacity = "1";
       } else {
         sub.style.pointerEvents = "auto";
         sub.style.cursor = "grab";
@@ -6212,6 +6458,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (modeBtn) modeBtn.textContent = "Exit group edit";
     (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
     (window as any).__ip_compositeEditing = true;
+    compositeEditPath = timerId;
+    compositePathStack.length = 0;
+    compositePathStack.push(timerId);
+    applyCompositeLevelDimming();
   };
 
   const enterChoicesCompositeEdit = (pollId: string) => {
@@ -6273,6 +6523,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (modeBtn) modeBtn.textContent = "Exit group edit";
     (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
     (window as any).__ip_compositeEditing = true;
+    compositeEditPath = pollId;
+    compositePathStack.length = 0;
+    compositePathStack.push(pollId);
+    applyCompositeLevelDimming();
   };
 
   const enterSoundCompositeEdit = (soundId: string) => {
@@ -6305,9 +6559,21 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const layer = ensureSoundCompositeLayer(engine, soundId);
     if (layer) layer.style.pointerEvents = "auto";
     compositeGeomsByPath[soundId] = (layer as any)?.__textGeoms ?? {};
+    const byPath: any = (engine.getModel()?.nodes.find((n: any) => String(n.id) === String(soundId)) as any)?.compositeGeometriesByPath ?? {};
+    compositeGeomsByPath[`${soundId}/plot`] = byPath["plot"] ?? {};
     for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".comp-sub") ?? [])) {
-      sub.style.pointerEvents = "auto";
-      sub.style.cursor = "grab";
+      if (sub.dataset.kind === "plot-region") {
+        sub.style.pointerEvents = "none";
+        sub.style.cursor = "default";
+        // Keep it invisible; plot is internal and not authored in elements.pr.
+        sub.style.background = "transparent";
+        sub.style.outline = "none";
+        sub.style.outlineOffset = "0px";
+        sub.style.opacity = "1";
+      } else {
+        sub.style.pointerEvents = "auto";
+        sub.style.cursor = "grab";
+      }
       sub.style.border = "none";
       sub.style.background = "transparent";
       sub.style.borderRadius = "0";
@@ -6317,6 +6583,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (modeBtn) modeBtn.textContent = "Exit group edit";
     (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
     (window as any).__ip_compositeEditing = true;
+    compositeEditPath = soundId;
+    compositePathStack.length = 0;
+    compositePathStack.push(soundId);
+    applyCompositeLevelDimming();
   };
 
   const exitTimerCompositeEdit = () => {
@@ -6350,6 +6620,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     for (const e2 of compositeHiddenEls) e2.classList.remove("ip-dim-node");
     compositeHiddenEls = [];
     compositeEditTimerId = null;
+    compositeEditPath = "";
+    compositePathStack.length = 0;
     compositeDrag = null;
     compositeDragMode = "none";
     compositeActiveHandle = null;
@@ -6466,11 +6738,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
       // Persist elements.pr (and current geoms) to backend.
       const geoms: any = (layer as any).__textGeoms ?? {};
-      void fetch(`${BACKEND}/api/composite/save`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ compositePath: timerId, geoms, elementsPr: nextText })
-      });
+      void _debugCompositeSaveFetch(
+        `${BACKEND}/api/composite/save`,
+        { compositePath: timerId, geoms, elementsPr: nextText },
+        { kind: "timer", where: "text-editor-save", compositePath: timerId }
+      );
       close();
     });
   };
@@ -6577,11 +6849,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
       // Persist elements.pr (and current geoms) to backend.
       const geoms: any = compositeGeomsByPath[`${pollId}/wheel`] ?? (layer as any).__wheelGeoms ?? {};
-      void fetch(`${BACKEND}/api/composite/save`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ compositePath: `${pollId}/wheel`, geoms, elementsPr: nextText })
-      });
+      void _debugCompositeSaveFetch(
+        `${BACKEND}/api/composite/save`,
+        { compositePath: `${pollId}/wheel`, geoms, elementsPr: nextText },
+        { kind: "choices", where: "wheel-text-editor-save", compositePath: `${pollId}/wheel` }
+      );
       close();
     });
   };
@@ -6719,7 +6991,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // IMPORTANT: only treat as "background" if the click is OUTSIDE ALL node bounding boxes.
     if (!hitAnyBBox && !target.closest(".modal") && !target.closest(".ctx-menu") && !target.closest(".edit-toolbox")) {
       if ((window as any).__ip_exitCompositeEdit) {
-        (window as any).__ip_exitCompositeEdit?.();
+        // Nested composite editing: background dblclick steps back one level.
+        // If we're already at the root level, this exits group edit.
+        exitCompositeLevel();
         ev.preventDefault();
         return;
       }
@@ -6747,6 +7021,14 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
     }
     if (compositeEditTimerId && compositeEditKind === "choices") {
+      // Nested levels: double-click a group container to enter its coordinate system.
+      const grp = target.closest<HTMLElement>(".comp-sub");
+      if (grp?.dataset.groupPath) {
+        enterCompositeLevel(String(grp.dataset.groupPath));
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
       // Double-clicking the bullets element should open the regular editor for the choices node.
       const bulletsEl = target.closest<HTMLElement>(".choices-bullets");
       if (bulletsEl) {
@@ -6758,6 +7040,15 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const sub = target.closest<HTMLElement>(".choices-wheel-text");
       if (sub) {
         openChoicesWheelTextEditor(compositeEditTimerId, sub);
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+    }
+    if (compositeEditTimerId && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
+      const grp = target.closest<HTMLElement>(".comp-sub");
+      if (grp?.dataset.groupPath) {
+        enterCompositeLevel(String(grp.dataset.groupPath));
         (ev as any).stopImmediatePropagation?.();
         ev.preventDefault();
         return;
@@ -6810,30 +7101,31 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           ? rootEl.querySelector<HTMLElement>(".sound-sub-layer")
           : rootEl.querySelector<HTMLElement>(".choices-sub-layer");
     if (!layer) return;
-    // Enforce composite bounding box: you should not be able to interact with the group outside its bbox.
-    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId) {
-      const m = engine.getModel();
-      const node: any = m?.nodes.find((n: any) => String(n.id) === String(compositeEditTimerId));
-      const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
-      const eff = node ? effectiveNodeRectClient(rootEl, node) : null;
-      const rc = eff ?? (compositeOuterRectClient(rootEl, layer) as any);
-      const inside = rc ? isPointInRotatedRectClient(rc as any, rotDeg, ev.clientX, ev.clientY) : false;
-      if (!inside) {
-        (ev as any).stopImmediatePropagation?.();
-        ev.preventDefault();
-        return;
-      }
-    }
+    // Do NOT enforce a separate composite bbox gate here.
+    // It causes valid sub-elements that extend outside the plot/data region to become non-interactive.
+    // Background/disabled interactions are handled explicitly elsewhere (compositePan + plot-region/plot-arrow rules).
     // When grabbing resize/rotate handles, NEVER re-pick: handles can sit outside the sub rect,
     // and re-picking makes unrelated elements (e.g. wheel) appear "connected".
     const handleHit = t.closest<HTMLElement>(".handle, .handles, .anchor-dot");
     const directSub = t.closest<HTMLElement>(".comp-sub");
-    const sub = handleHit && directSub ? directSub : _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY);
+    const sub =
+      handleHit && directSub
+        ? directSub
+        : _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY, { activeCompPath: compositeEditPath });
     if (!sub) return;
+    const dbg = ipDebugEnabled("ip_debug_composite_drag");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][composite][drag] pointerdown pick", {
+        activePath: compositeEditPath,
+        targetCls: String((t as any)?.className ?? ""),
+        picked: { subId: sub.dataset.subId, kind: sub.dataset.kind, compPath: sub.dataset.compPath, cls: sub.className },
+        client: { x: ev.clientX, y: ev.clientY },
+      });
+    }
     // Lock plot/data region (reference system) in group edit: not selectable/movable.
     if (sub.dataset.kind === "plot-region") {
-      (ev as any).stopImmediatePropagation?.();
-      ev.preventDefault();
+      // Treat non-editable/disabled sub-elements as background: allow panning.
       return;
     }
     // If the user is grabbing the root node handles, let the normal editor handle it.
@@ -6883,7 +7175,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       compositeDragMode = "arrow";
       compositeArrowDrag = { arrowId: best.id, end: best.end, startClientX: ev.clientX, startClientY: ev.clientY };
       setBodyCursor("crosshair");
-      (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+      stage.setPointerCapture?.(ev.pointerId);
       (ev as any).stopImmediatePropagation?.();
       ev.preventDefault();
       return;
@@ -6978,7 +7270,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     if (handleEl?.dataset.handle) {
       compositeActiveHandle = handleEl.dataset.handle;
-      compositeDragMode = compositeActiveHandle === "rot" ? "rotate" : "resize";
+      // Handle naming matches `ensureHandles()`:
+      // - rot / rot-tl / rot-tr => rotate
+      // - n/e/s/w/sw/se => resize
+      compositeDragMode = compositeActiveHandle === "rot" || compositeActiveHandle.startsWith("rot-") ? "rotate" : "resize";
       setBodyCursor(cursorForHandle(compositeActiveHandle));
       if (compositeDragMode === "rotate") {
         const cx = r.left + r.width / 2;
@@ -6990,7 +7285,17 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       compositeDragMode = "move";
       sub.style.cursor = "grabbing";
     }
-    (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][composite][drag] start", {
+        mode: compositeDragMode,
+        handle: compositeActiveHandle,
+        subId,
+        path: compositeEditPath,
+      });
+    }
+    // Capture on stage so dragging continues even when the pointer leaves the element/hit region.
+    stage.setPointerCapture?.(ev.pointerId);
     // Prevent the normal selection/rotate handler from selecting the timer node while we're editing sub-elements.
     (ev as any).stopImmediatePropagation?.();
     ev.preventDefault();
@@ -7000,6 +7305,16 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // Hard block: Live mode must be resistant to any editing gestures.
     if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId || compositeDragMode === "none" || !compositeSelectedSubEl || !compositeStartGeom) return;
+    const dbg = ipDebugEnabled("ip_debug_composite_drag");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][composite][drag] move", {
+        mode: compositeDragMode,
+        subId: compositeSelectedSubEl?.dataset?.subId,
+        path: compositeEditPath,
+        client: { x: ev.clientX, y: ev.clientY },
+      });
+    }
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
     const sub = compositeSelectedSubEl;
@@ -7206,26 +7521,37 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (!compositeEditTimerId) return;
     const timerEl = engine.getNodeElement(compositeEditTimerId);
     if (!timerEl) return;
+    // Only persist when a drag actually happened; otherwise we'll spam saves and may send an empty path.
+    if (compositeDragMode === "none") return;
+    if (!compositeEditPath) return;
     if (compositeSelectedSubEl) compositeSelectedSubEl.style.cursor = "grab";
 
     // Persist composite geometries from the in-memory model (no DOM-rect measuring -> no jitter / size drift).
     const geoms: any = compositeGeomsByPath[compositeEditPath] ?? {};
     const payload: any = { compositePath: compositeEditPath, geoms };
-    // Timer/sound composites also persist elements.pr (so axis arrow edits are saved).
-    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && compositeEditPath === compositeEditTimerId) {
+    // Always persist geoms for the ACTIVE level.
+    void _debugCompositeSaveFetch(`${BACKEND}/api/composite/save`, payload, {
+      kind: compositeEditKind,
+      where: "composite-pointerup",
+      compositePath: compositeEditPath
+    });
+
+    // Timer/sound: axis arrow edits mutate the ROOT elements.pr regardless of which level is active.
+    // (Arrows are currently authored in `groups/<id>/elements.pr`, not in `plot/elements.pr`.)
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId) {
       const layer =
         compositeEditKind === "timer"
           ? engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".timer-sub-layer")
           : engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".sound-sub-layer");
       const elementsPr = String((layer as any)?.__elementsPr ?? "");
-      if (elementsPr.trim()) payload.elementsPr = elementsPr;
+      if (elementsPr.trim()) {
+        void _debugCompositeSaveFetch(
+          `${BACKEND}/api/composite/save`,
+          { compositePath: compositeEditTimerId, geoms: compositeGeomsByPath[compositeEditTimerId] ?? {}, elementsPr },
+          { kind: compositeEditKind, where: "composite-pointerup-elementsPr", compositePath: compositeEditTimerId }
+        );
+      }
     }
-    void fetch(`${BACKEND}/api/composite/save`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      // Save into the folder that owns the dragged element (supports nested folders).
-      body: JSON.stringify(payload)
-    });
 
     compositeDragMode = "none";
     compositeActiveHandle = null;
@@ -7233,6 +7559,134 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     compositeArrowDrag = null;
     setBodyCursor("");
   });
+
+  // Composite edit background panning:
+  // When in group mode, dragging on "disabled"/non-editable parts should behave like background and pan.
+  // Examples:
+  // - timer/sound plot canvas region
+  // - plot-arrow hitboxes when not near endpoints
+  // - any empty space inside the isolated node
+  let compositePan:
+    | null
+    | {
+        pointerId: number;
+        lastX: number;
+        lastY: number;
+      } = null;
+  const startCompositePan = (ev: PointerEvent) => {
+    compositePan = { pointerId: ev.pointerId, lastX: ev.clientX, lastY: ev.clientY };
+    setBodyCursor("grabbing");
+    try {
+      stage.setPointerCapture?.(ev.pointerId);
+    } catch {
+      // ignore
+    }
+  };
+  const stopCompositePan = () => {
+    if (!compositePan) return;
+    compositePan = null;
+    setBodyCursor("");
+  };
+  stage.addEventListener(
+    "pointerdown",
+    (ev) => {
+      if (getAppMode() !== "edit") return;
+      if (!compositeEditTimerId) return;
+      if (ev.button !== 0) return;
+      if (compositePan) return;
+      // If the user is actively manipulating a sub-element/handle, do NOT pan.
+      const t = ev.target as HTMLElement;
+      if (t.closest(".handle") || t.closest(".anchor-dot")) return;
+
+      const rootEl = engine.getNodeElement(compositeEditTimerId);
+      if (!rootEl) return;
+
+      // IMPORTANT:
+      // Do NOT use the raw event target to decide pan vs select; disabled layers (canvas/plot)
+      // may be the event target even when a selectable `.comp-sub` is geometrically under the cursor.
+      // Instead: pick the smallest composite sub by bbox and only pan if nothing selectable exists.
+    const picked = _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY, { activeCompPath: compositeEditPath });
+      const kind = String(picked?.dataset.kind ?? "");
+      const dbg = ipDebugEnabled("ip_debug_composite_hit");
+      if (dbg) {
+        // eslint-disable-next-line no-console
+        console.log("[ip][composite][hit] pan-check", {
+          activePath: compositeEditPath,
+          picked: picked
+            ? { subId: picked.dataset.subId, kind: picked.dataset.kind, compPath: picked.dataset.compPath, cls: picked.className }
+            : null,
+          client: { x: ev.clientX, y: ev.clientY },
+        });
+      }
+      if (picked && kind !== "plot-region") {
+        // Special-case plot arrows: only treat as selectable near endpoints; otherwise allow pan.
+        if (kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
+          const layer =
+            compositeEditKind === "timer"
+              ? rootEl.querySelector<HTMLElement>(".timer-sub-layer")
+              : rootEl.querySelector<HTMLElement>(".sound-sub-layer");
+          const specs: any[] = (layer as any)?.__arrowSpecs ?? [];
+          const requestedArrowId = String(picked.dataset.arrowId ?? "");
+          if (Array.isArray(specs) && specs.length > 0) {
+            const { ox, oy, xLen, yLen } = _plotRectCss(rootEl);
+            const toClient = (u: number, vUp: number) => ({ x: ox + u * xLen, y: oy - vUp * yLen });
+            const px = ev.clientX;
+            const py = ev.clientY;
+            let bestD2 = Number.POSITIVE_INFINITY;
+            for (const a of specs) {
+              const id = String(a?.id ?? "");
+              if (!id) continue;
+              if (requestedArrowId && id !== requestedArrowId) continue;
+              const p1 = toClient(Number(a.x0 ?? 0), Number(a.y0 ?? 0));
+              const p2 = toClient(Number(a.x1 ?? 1), Number(a.y1 ?? 0));
+              const d1 = (p1.x - px) ** 2 + (p1.y - py) ** 2;
+              const d2 = (p2.x - px) ** 2 + (p2.y - py) ** 2;
+              bestD2 = Math.min(bestD2, d1, d2);
+            }
+            const THRESH_PX = 32;
+            const nearEndpoint = Number.isFinite(bestD2) && bestD2 <= THRESH_PX * THRESH_PX;
+            if (nearEndpoint) {
+              // Let the normal composite arrow selection/drag handler run.
+              return;
+            }
+          }
+          // Not near endpoints => treat as background pan.
+        } else {
+          // Any normal selectable sub (text/buttons/etc): do NOT pan.
+          // NOTE: most selectable elements don't set data-kind, so `kind === ""` is normal here.
+          return;
+        }
+      }
+
+      // No selectable sub under cursor (or plot-region / non-endpoint arrow): pan.
+      startCompositePan(ev);
+      if (dbg) {
+        // eslint-disable-next-line no-console
+        console.log("[ip][composite][hit] start-pan", { activePath: compositeEditPath });
+      }
+      (ev as any).stopImmediatePropagation?.();
+      ev.preventDefault();
+    },
+    { capture: true }
+  );
+  stage.addEventListener(
+    "pointermove",
+    (ev) => {
+      if (!compositePan) return;
+      if (getAppMode() !== "edit") return;
+      if (!compositeEditTimerId) return;
+      const cam = engine.getCamera();
+      const dx = ev.clientX - compositePan.lastX;
+      const dy = ev.clientY - compositePan.lastY;
+      compositePan.lastX = ev.clientX;
+      compositePan.lastY = ev.clientY;
+      engine.setCamera({ cx: cam.cx - dx / cam.zoom, cy: cam.cy - dy / cam.zoom, zoom: cam.zoom });
+      ev.preventDefault();
+    },
+    { capture: true }
+  );
+  window.addEventListener("pointerup", () => stopCompositePan(), { capture: true });
+  window.addEventListener("pointercancel", () => stopCompositePan(), { capture: true });
 
   window.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape") (window as any).__ip_exitCompositeEdit?.();
