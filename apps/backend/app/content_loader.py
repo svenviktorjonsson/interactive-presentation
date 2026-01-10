@@ -1019,7 +1019,7 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
         if kw == "graph":
             # Simple scatter plot, backed by generic sources.
             # Syntax:
-            # graph[name=...,xSource=t_table[0],ySource=t_table[1],xLabel=x,yLabel=y,grid=on,color=white]
+            # graph[name=...,xSource=t_table.c1,ySource=t_table.c2,xLabel=x,yLabel=y,grid=on,color=white]
             x_src = str(params.get("xSource") or params.get("xsource") or "").strip()
             y_src = str(params.get("ySource") or params.get("ysource") or "").strip()
             # Back-compat (older syntax):
@@ -1027,9 +1027,9 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
             x_header = str(params.get("xHeader") or params.get("xheader") or "").strip()
             y_header = str(params.get("yHeader") or params.get("yheader") or "").strip()
             if (not x_src or not y_src) and table_id and x_header and y_header:
-                # Convert legacy to source syntax (assumes 0/1 columns when headers are unknown).
-                x_src = x_src or f"{table_id}[0]"
-                y_src = y_src or f"{table_id}[1]"
+                # Convert legacy to column syntax (1-based, bracket-free).
+                x_src = x_src or f"{table_id}.c1"
+                y_src = y_src or f"{table_id}.c2"
 
             x_label = str(params.get("xLabel") or params.get("xlabel") or "x").strip() or "x"
             y_label = str(params.get("yLabel") or params.get("ylabel") or "y").strip() or "y"
@@ -1048,6 +1048,59 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "color": color,
             }
             _apply_style_params(nodes_by_id[name], params)
+            # Load composite-local geometries + elements.pr so the client can render editable sub-elements
+            # (axis arrows + labels) when entering composite edit, like timer/sound.
+            try:
+                pres_dir = path.parent
+                base = pres_dir / "groups" / str(name)
+
+                def load_geoms(csv_path: Path) -> dict[str, Any]:
+                    if not csv_path.exists():
+                        return {}
+                    out: dict[str, Any] = {}
+                    with csv_path.open("r", encoding="utf-8", newline="") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            sid = (row.get("id") or "").strip()
+                            if not sid or sid.startswith("#"):
+                                continue
+                            try:
+                                out[sid] = {
+                                    "x": float((row.get("x") or "0").strip() or 0),
+                                    "y": float((row.get("y") or "0").strip() or 0),
+                                    "w": float((row.get("w") or "1").strip() or 1),
+                                    "h": float((row.get("h") or "1").strip() or 1),
+                                    "rotationDeg": float((row.get("rotationDeg") or "0").strip() or 0),
+                                    "anchor": (row.get("anchor") or "topLeft").strip() or "topLeft",
+                                    "align": (row.get("align") or "").strip(),
+                                    "parent": (row.get("parent") or "").strip(),
+                                }
+                            except Exception:
+                                continue
+                    return out
+
+                nodes_by_id[name]["compositeGeometriesByPath"] = {"": load_geoms(base / "geometries.csv")}
+
+                # Default elementsText if none exists on disk.
+                default_elements = (
+                    "# graph composite elements (draft)\n"
+                    "# Delete the whole `groups/<name>/` folder to regenerate defaults.\n"
+                    "# Args passed to graph[...] can be used as {{arg}} placeholders here.\n\n"
+                    "text[name=x_label]: {{xLabel}}\n"
+                    "text[name=y_label]: {{yLabel}}\n\n"
+                    "arrow[name=x_axis, from=(0,0), to=(1.05,0), color=white, width=0.006]\n"
+                    "arrow[name=y_axis, from=(0,0), to=(0,1.05), color=white, width=0.006]\n"
+                )
+                try:
+                    root_el = base / "elements.pr"
+                    if root_el.exists():
+                        nodes_by_id[name]["elementsText"] = root_el.read_text(encoding="utf-8")
+                    else:
+                        nodes_by_id[name]["elementsText"] = default_elements
+                except Exception:
+                    nodes_by_id[name]["elementsText"] = default_elements
+            except Exception:
+                pass
             if current_view:
                 current_view["show"].append(name)
             else:

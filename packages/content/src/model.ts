@@ -9,6 +9,7 @@ export type NodeType =
   | "group"
   | "bullets"
   | "table"
+  | "graph"
   | "arrow"
   | "line"
   | "sound"
@@ -157,6 +158,24 @@ export interface LineNodeModel extends BaseNodeModel {
   color?: string;
   /** Stroke width in CSS pixels. */
   width?: number;
+  /**
+   * Optional junction IDs for polyline/graph connectivity.
+   * If present, endpoints that share the same join ID are considered connected.
+   */
+  p1Join?: string;
+  p2Join?: string;
+}
+
+export interface GraphNodeModel extends BaseNodeModel {
+  type: "graph";
+  /** Source column syntax: "<tableId>[<colIdx>]" (0-based). */
+  xSource?: string;
+  /** Source column syntax: "<tableId>[<colIdx>]" (0-based). */
+  ySource?: string;
+  xLabel?: string;
+  yLabel?: string;
+  grid?: "on" | "off" | boolean;
+  color?: string;
 }
 
 export interface SoundNodeModel extends BaseNodeModel {
@@ -228,6 +247,7 @@ export type NodeModel =
   | HtmlFrameNodeModel
   | BulletsNodeModel
   | TableNodeModel
+  | GraphNodeModel
   | ArrowNodeModel
   | LineNodeModel
   | SoundNodeModel

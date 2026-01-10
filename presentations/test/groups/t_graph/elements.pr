@@ -1,0 +1,11 @@
+# graph composite elements (draft)
+# Delete the whole `groups/<name>/` folder to regenerate defaults.
+# Args passed to graph[...] can be used as {{arg}} placeholders here.
+
+# Default labels (editable in composite mode):
+text[name=x_label]: {{xLabel}}
+text[name=y_label]: {{yLabel}}
+
+# Default arrows (editable in composite mode):
+arrow[name=x_axis, from=(0,0), to=(1.05,0), color=white, width=0.006]
+arrow[name=y_axis, from=(0,0), to=(0,1.05), color=white, width=0.006]

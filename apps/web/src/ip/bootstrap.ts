@@ -2546,122 +2546,379 @@ function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: H
 }
 
 let __graphRafStarted = false;
+function getGraphTimerCanvas(nodeEl: HTMLElement) {
+  // Graph reuses the timer base widget DOM (timer-frame + timer-canvas).
+  // The engine creates the canvas; if it's missing for any reason, skip drawing.
+  return nodeEl.querySelector<HTMLCanvasElement>(":scope canvas.timer-canvas");
+}
+
+function ensureGraphCompositeLayer(engine: Engine, graphId: string) {
+  const m = engine.getModel();
+  const node = m?.nodes.find((n) => (n as any).id === graphId) as any;
+  const el = engine.getNodeElement(graphId);
+  if (!node || !el) return null;
+
+  // Graph base widget is provided by engine (timer-frame + timer-canvas).
+
+  const frame = el.querySelector<HTMLElement>(":scope > .timer-frame") ?? el;
+  let layer = frame.querySelector<HTMLElement>(":scope > .graph-sub-layer");
+  if (!layer) {
+    layer = document.createElement("div");
+    layer.className = "graph-sub-layer";
+    layer.dataset.graphId = graphId;
+    layer.style.position = "absolute";
+    layer.style.inset = "0";
+    layer.style.overflow = "visible";
+    layer.style.pointerEvents = "none";
+    // Ensure the overlay is above the frame/canvas.
+    layer.style.zIndex = "3";
+    frame.appendChild(layer);
+
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.classList.add("graph-sub-svg");
+    svg.style.position = "absolute";
+    svg.style.inset = "0";
+    svg.style.width = "100%";
+    svg.style.height = "100%";
+    svg.style.overflow = "visible";
+    svg.style.pointerEvents = "none";
+    layer.append(svg);
+
+    // Plot group: optional nested composite level.
+    const plotGroup = document.createElement("div");
+    plotGroup.className = "graph-sub comp-sub comp-group graph-sub-plotgroup";
+    plotGroup.dataset.subId = "plot";
+    plotGroup.dataset.compPath = graphId;
+    plotGroup.dataset.groupPath = `${graphId}/plot`;
+    plotGroup.style.position = "absolute";
+    plotGroup.style.pointerEvents = "none";
+    plotGroup.style.zIndex = "10";
+    plotGroup.style.background = "transparent";
+    layer.append(plotGroup);
+    (layer as any).__plotGroup = plotGroup;
+
+    // Hit layers for axis arrows (editable in composite edit mode).
+    const mkArrowHit = (arrowId: string) => {
+      const container = ((layer as any).__plotGroup as HTMLElement | null) ?? layer!;
+      const h = document.createElement("div");
+      h.className = "graph-sub graph-sub-arrow-hit comp-sub";
+      h.dataset.subId = arrowId;
+      h.dataset.compPath = graphId;
+      h.dataset.kind = "plot-arrow";
+      h.dataset.arrowId = arrowId;
+      h.style.position = "absolute";
+      h.style.pointerEvents = "none";
+      h.style.zIndex = "20";
+      container.append(h);
+      return h;
+    };
+    mkArrowHit("x_axis");
+    mkArrowHit("y_axis");
+
+    const geoms: Record<string, any> = (node.compositeGeometriesByPath?.[""] ?? node.compositeGeometries ?? {}) as any;
+    // Default plot region = canonical plot rect used by the renderer.
+    geoms["plot"] = geoms["plot"] ?? {
+      x: PLOT_FRACS.leftF,
+      y: PLOT_FRACS.topF,
+      w: PLOT_FRACS.rightF - PLOT_FRACS.leftF,
+      h: PLOT_FRACS.bottomF - PLOT_FRACS.topF,
+      rotationDeg: 0,
+      anchor: "topLeft",
+      align: "left",
+    };
+
+    const text = String(node.elementsText ?? "");
+    const lines = text.split(/\r?\n/);
+    const arrowSpecs: Array<{ id: string; x0: number; y0: number; x1: number; y1: number; color: string; width: number }> = [];
+    for (const ln0 of lines) {
+      const ln = ln0.trim();
+      if (!ln || ln.startsWith("#")) continue;
+
+      const mt = ln.match(/^text\[name=(?<id>[a-zA-Z_]\w*)\]\s*:\s*(?<content>.*)$/);
+      if (mt?.groups) {
+        const sid = mt.groups.id;
+        const content = mt.groups.content ?? "";
+        const g = geoms[sid] ?? { x: 0.5, y: 0.5, w: 0.4, h: 0.1, rotationDeg: 0, anchor: "centerCenter", align: "center" };
+        const d = document.createElement("div");
+        d.className = "graph-sub graph-sub-text comp-sub";
+        d.dataset.subId = sid;
+        d.dataset.compPath = graphId;
+        d.dataset.template = content;
+        const contentEl = document.createElement("div");
+        contentEl.className = "graph-sub-content";
+        contentEl.style.width = "100%";
+        contentEl.style.height = "100%";
+        contentEl.style.display = "grid";
+        contentEl.style.placeItems = "center";
+        d.append(contentEl);
+        d.style.position = "absolute";
+        d.style.left = `${(g.x ?? 0.5) * 100}%`;
+        d.style.top = `${(g.y ?? 0.5) * 100}%`;
+        d.style.width = `${(g.w ?? 0.4) * 100}%`;
+        d.style.height = `${(g.h ?? 0.1) * 100}%`;
+        d.style.transform = "translate(-50%, -50%)";
+        d.style.padding = "0";
+        d.style.borderRadius = "0";
+        d.style.border = "none";
+        d.style.background = "transparent";
+        d.style.color = "rgba(255,255,255,0.92)";
+        d.style.userSelect = "none";
+        d.style.pointerEvents = "none";
+        d.style.zIndex = "30";
+        d.style.whiteSpace = "nowrap";
+        d.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+        d.style.fontWeight = "400";
+        d.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+        const rot = Number(g.rotationDeg ?? 0);
+        if (rot) d.style.rotate = `${rot}deg`;
+        layer.append(d);
+        continue;
+      }
+
+      const ma = ln.match(/^arrow\[(?<params>[^\]]+)\]$/);
+      if (ma?.groups?.params) {
+        const p = _parseInlineParams(ma.groups.params);
+        const sid = String(p.name ?? "").trim();
+        if (!sid) continue;
+        const vec = (raw: any, def: { x: number; y: number }) => {
+          const s = String(raw ?? "").trim();
+          const m2 = s.match(/^\(\s*([\-0-9.]+)\s*,\s*([\-0-9.]+)\s*\)\s*$/);
+          if (!m2) return def;
+          const x = Number(m2[1]);
+          const y = Number(m2[2]);
+          return Number.isFinite(x) && Number.isFinite(y) ? { x, y } : def;
+        };
+        const fr = vec(p.from, { x: 0, y: 0 });
+        const to = vec(p.to, { x: 1, y: 0 });
+        const col = String(p.color ?? "white") || "white";
+        const w = Number(String(p.width ?? "").trim());
+        arrowSpecs.push({ id: sid, x0: fr.x, y0: fr.y, x1: to.x, y1: to.y, color: col, width: Number.isFinite(w) ? w : 0.006 });
+        continue;
+      }
+    }
+    (layer as any).__arrowSpecs = arrowSpecs;
+    (layer as any).__textGeoms = geoms;
+
+    // Sync plot region geom -> DOM box + dataset fracs so canvas and arrow mapping follow it.
+    const pg = (geoms["plot"] ??= {
+      x: PLOT_FRACS.leftF,
+      y: PLOT_FRACS.topF,
+      w: PLOT_FRACS.rightF - PLOT_FRACS.leftF,
+      h: PLOT_FRACS.bottomF - PLOT_FRACS.topF,
+      rotationDeg: 0,
+      anchor: "topLeft",
+      align: "left",
+    });
+    const ptl = anchorToTopLeftWorld({ x: Number(pg.x), y: Number(pg.y), w: Number(pg.w), h: Number(pg.h), anchor: String(pg.anchor ?? "topLeft") } as any);
+    const leftF = ptl.x;
+    const topF = ptl.y;
+    const rightF = leftF + Number(pg.w);
+    const bottomF = topF + Number(pg.h);
+    el.dataset.plotLeftF = String(leftF);
+    el.dataset.plotRightF = String(rightF);
+    el.dataset.plotTopF = String(topF);
+    el.dataset.plotBottomF = String(bottomF);
+    if (plotGroup) {
+      plotGroup.style.left = `${leftF * 100}%`;
+      plotGroup.style.top = `${topF * 100}%`;
+      plotGroup.style.width = `${Number(pg.w) * 100}%`;
+      plotGroup.style.height = `${Number(pg.h) * 100}%`;
+      plotGroup.dataset.anchor = "topLeft";
+      plotGroup.style.transform = "translate(0%, 0%)";
+    }
+  }
+  return layer;
+}
+
+function layoutGraphCompositeTexts(graphEl: HTMLElement, layer: HTMLElement) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .graph-sub-text"));
+  const hPx = Number(graphEl.dataset.graphHpx ?? "0");
+  const wPx = Number(graphEl.dataset.graphWpx ?? "0");
+  const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : graphEl.getBoundingClientRect();
+  for (const t of els) {
+    const sid = t.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const h = Number(g.h ?? 0.1);
+    const fontPx = Math.max(1, box.height * h * 0.85);
+    t.style.fontSize = `${fontPx}px`;
+    t.style.lineHeight = `${fontPx}px`;
+  }
+}
+
+function renderGraphCompositeTexts(graphEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
+  const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
+  const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .graph-sub-text"));
+  const compositeId = String((window as any).__ip_compositeEditId ?? "");
+  const compositeKind = String((window as any).__ip_compositeEditKind ?? "");
+  const isGroupEditing = (window as any).__ip_compositeEditing && compositeKind === "graph" && compositeId === String(graphEl.dataset.nodeId ?? "");
+  const appMode = getAppMode();
+  const hPx = Number(graphEl.dataset.graphHpx ?? "0");
+  const wPx = Number(graphEl.dataset.graphWpx ?? "0");
+  const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : graphEl.getBoundingClientRect();
+
+  for (const t of els) {
+    const sid = t.dataset.subId ?? "";
+    const g = geoms[sid] ?? {};
+    const x = Number(g.x ?? 0.5);
+    const y = Number(g.y ?? 0.5);
+    const w = Number(g.w ?? 0.4);
+    const h = Number(g.h ?? 0.1);
+    t.style.left = `${x * 100}%`;
+    t.style.top = `${y * 100}%`;
+    t.style.width = `${w * 100}%`;
+    t.style.height = `${h * 100}%`;
+    t.style.rotate = `${Number(g.rotationDeg ?? 0)}deg`;
+    t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+
+    const fontPx = Math.max(1, box.height * h * 0.85);
+    t.style.fontSize = `${fontPx}px`;
+    t.style.lineHeight = `${fontPx}px`;
+
+    const tpl = t.dataset.template ?? "";
+    const resolved = applyDataBindings(tpl, data);
+    const prev = t.dataset.rawText ?? "";
+    if (prev !== resolved) {
+      t.dataset.rawText = resolved;
+      const contentEl = t.querySelector<HTMLElement>(":scope .graph-sub-content");
+      if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
+    }
+
+    const interactive = appMode === "edit" && isGroupEditing;
+    t.style.pointerEvents = interactive ? "auto" : "none";
+    t.style.cursor = interactive ? "grab" : "default";
+  }
+}
+
+function renderGraphCompositeArrows(graphEl: HTMLElement, layer: HTMLElement) {
+  const svg = layer.querySelector<SVGSVGElement>(":scope > .graph-sub-svg");
+  if (!svg) return;
+  const specs: any[] = (layer as any).__arrowSpecs ?? [];
+  if (!Array.isArray(specs) || specs.length === 0) {
+    svg.replaceChildren();
+    return;
+  }
+
+  const cachedW = Number(graphEl.dataset.graphWpx ?? "0");
+  const cachedH = Number(graphEl.dataset.graphHpx ?? "0");
+  const rect = graphEl.getBoundingClientRect();
+  const w = cachedW > 1 ? cachedW : Math.max(1, rect.width);
+  const h = cachedH > 1 ? cachedH : Math.max(1, rect.height);
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+
+  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
+  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
+  const graphId = layer.dataset.graphId ?? "graph";
+  const selectedArrowId = String((layer as any).dataset?.selectedPlotArrowId ?? "");
+
+  const fr = _plotFracsForEl(graphEl);
+  const ox = fr.leftF * w;
+  const oy = fr.bottomF * h;
+  const xLen = (fr.rightF - fr.leftF) * w;
+  const yLen = (fr.bottomF - fr.topF) * h;
+  const mapX = (u: number) => ox + u * xLen;
+  const mapY = (vUp: number) => oy - vUp * yLen;
+
+  const dataMin = Math.max(1, Math.min(xLen, yLen));
+
+  for (const a of specs) {
+    const relW = typeof a.width === "number" && isFinite(a.width) ? a.width : 0.006;
+    const lwPx = Math.max(0.5, Math.min(16, relW * dataMin));
+    const headWPx = 3 * lwPx;
+    const headLPx = 5 * lwPx;
+
+    const x1 = mapX(Number(a.x0 ?? 0));
+    const y1 = mapY(Number(a.y0 ?? 0));
+    const x2 = mapX(Number(a.x1 ?? 1));
+    const y2 = mapY(Number(a.y1 ?? 1));
+
+    const plotGroup = (layer as any).__plotGroup as HTMLElement | null;
+    const hit = (plotGroup ?? layer).querySelector<HTMLElement>(
+      `:scope > .graph-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`
+    );
+    if (hit) {
+      const padPx = 24;
+      const minX = Math.min(x1, x2) - padPx;
+      const maxX = Math.max(x1, x2) + padPx;
+      const minY = Math.min(y1, y2) - padPx;
+      const maxY = Math.max(y1, y2) + padPx;
+      hit.style.left = `${((minX - ox) / Math.max(1e-9, xLen)) * 100}%`;
+      hit.style.top = `${((minY - (oy - yLen)) / Math.max(1e-9, yLen)) * 100}%`;
+      hit.style.width = `${((maxX - minX) / Math.max(1e-9, xLen)) * 100}%`;
+      hit.style.height = `${((maxY - minY) / Math.max(1e-9, yLen)) * 100}%`;
+    }
+
+    const markerId = `arrowhead-${graphId}-${a.id}`;
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
+    marker.setAttribute("id", markerId);
+    marker.setAttribute("markerUnits", "userSpaceOnUse");
+    marker.setAttribute("markerWidth", String(headLPx));
+    marker.setAttribute("markerHeight", String(headWPx));
+    marker.setAttribute("refX", "0");
+    marker.setAttribute("refY", String(headWPx / 2));
+    marker.setAttribute("orient", "auto");
+
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", `M0,0 L${headLPx},${headWPx / 2} L0,${headWPx} Z`);
+    path.setAttribute("fill", a.color ?? "white");
+    marker.append(path);
+    defs.append(marker);
+
+    const isSelected = selectedArrowId && String(a.id ?? "") === selectedArrowId;
+    if (isSelected) {
+      const glow = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      glow.setAttribute("x1", String(x1));
+      glow.setAttribute("y1", String(y1));
+      glow.setAttribute("x2", String(x2));
+      glow.setAttribute("y2", String(y2));
+      glow.setAttribute("stroke", "rgba(110,168,255,0.95)");
+      glow.setAttribute("stroke-width", String(Math.min(48, lwPx + 10)));
+      glow.setAttribute("stroke-linecap", "round");
+      g.append(glow);
+    }
+
+    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+    line.setAttribute("x1", String(x1));
+    line.setAttribute("y1", String(y1));
+    line.setAttribute("x2", String(x2));
+    line.setAttribute("y2", String(y2));
+    line.setAttribute("stroke", a.color ?? "white");
+    line.setAttribute("stroke-width", String(lwPx));
+    line.setAttribute("stroke-linecap", "round");
+    line.setAttribute("marker-end", `url(#${markerId})`);
+    g.append(line);
+  }
+
+  svg.replaceChildren(defs, g);
+}
+
 function ensureGraphRendering(engine: Engine) {
   if (__graphRafStarted) return;
   __graphRafStarted = true;
 
-  const ensureGraphFrame = (nodeEl: HTMLElement) => {
-    let frame = nodeEl.querySelector<HTMLElement>(":scope > .ip-graph-frame");
-    if (!frame) {
-      frame = document.createElement("div");
-      frame.className = "ip-graph-frame";
-      frame.style.position = "absolute";
-      frame.style.inset = "0";
-      frame.style.border = "1px solid rgba(255,255,255,0.14)";
-      frame.style.borderRadius = "14px";
-      frame.style.background = "rgba(15,17,24,0.55)";
-      frame.style.boxShadow = "0 14px 40px rgba(0,0,0,0.35)";
-      frame.style.overflow = "hidden";
-      frame.style.pointerEvents = "none";
-      nodeEl.appendChild(frame);
-      // If the engine default node doesn't set positioning context, make sure it does.
-      if (!nodeEl.style.position) nodeEl.style.position = "absolute";
-    }
-    return frame;
-  };
-
-  const ensureGraphCanvas = (nodeEl: HTMLElement) => {
-    const frame = ensureGraphFrame(nodeEl);
-    let c = frame.querySelector<HTMLCanvasElement>("canvas.ip-graph-canvas");
-    if (!c) {
-      c = document.createElement("canvas");
-      c.className = "ip-graph-canvas";
-      c.style.position = "absolute";
-      c.style.inset = "0";
-      c.style.width = "100%";
-      c.style.height = "100%";
-      c.style.pointerEvents = "none";
-      frame.appendChild(c);
-    }
-    return c;
-  };
-
-  const drawAxisLabel = (ctx: CanvasRenderingContext2D, rectCss: DOMRect, dpr: number, x: number, y: number, text: string, rotRad = 0) => {
-    const fontCssPx = Math.max(12, Math.min(64, rectCss.height * 0.032));
-    const fontPx = Math.round(fontCssPx * dpr);
-    ctx.save();
-    ctx.font = `${fontPx}px KaTeX_Main, Times New Roman, serif`;
-    ctx.fillStyle = "rgba(255,255,255,0.82)";
-    ctx.translate(x, y);
-    if (rotRad) ctx.rotate(rotRad);
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, 0, 0);
-    ctx.restore();
-  };
-
   const drawGraphNode = (nodeEl: HTMLElement, n: any, model: any) => {
-    const canvas = ensureGraphCanvas(nodeEl);
-    const prep = prepareCanvas(nodeEl, canvas, PLOT_FRACS);
+    const canvas = getGraphTimerCanvas(nodeEl);
+    if (!canvas) return;
+    // Use the same plot fracs as timer/sound so styling aligns exactly.
+    const prep = prepareCanvas(nodeEl, canvas, _plotFracsForEl(nodeEl));
     if (!prep) return;
     const { ctx, rect: rectCss, dpr, plot } = prep;
     const { ox, oy, xLen, yLen } = plot;
-
-    const drawAxisArrows = () => {
-      // Timer-like axis arrows (inside the plot rect).
-      const col = "rgba(255,255,255,0.75)";
-      const lw = Math.max(1, 2 * dpr);
-      const headL = Math.max(10 * dpr, 14 * dpr);
-      const headW = Math.max(7 * dpr, 10 * dpr);
-      const extend = 0.02; // extend beyond plot a bit
-
-      const drawArrow = (x0: number, y0: number, x1: number, y1: number) => {
-        const dx = x1 - x0;
-        const dy = y1 - y0;
-        const len = Math.max(1e-6, Math.hypot(dx, dy));
-        const ux = dx / len;
-        const uy = dy / len;
-        // Base of arrow head
-        const bx = x1 - ux * headL;
-        const by = y1 - uy * headL;
-        // Perpendicular
-        const px = -uy;
-        const py = ux;
-
-        ctx.save();
-        ctx.strokeStyle = col;
-        ctx.fillStyle = col;
-        ctx.lineWidth = lw;
-        ctx.lineCap = "round";
-        // Shaft
-        ctx.beginPath();
-        ctx.moveTo(x0, y0);
-        ctx.lineTo(bx, by);
-        ctx.stroke();
-        // Head
-        ctx.beginPath();
-        ctx.moveTo(x1, y1);
-        ctx.lineTo(bx + px * (headW / 2), by + py * (headW / 2));
-        ctx.lineTo(bx - px * (headW / 2), by - py * (headW / 2));
-        ctx.closePath();
-        ctx.fill();
-        ctx.restore();
-      };
-
-      // x-axis: left->right along bottom of plot
-      drawArrow(ox, oy, ox + xLen * (1 + extend), oy);
-      // y-axis: bottom->top along left of plot
-      drawArrow(ox, oy, ox, oy - yLen * (1 + extend));
-    };
 
     // Resolve sources.
     // Source syntax: "<tableId>[<colIdx>]" (0-based).
     const parseSource = (raw: any): { tableId: string; col: number } | null => {
       const s = String(raw ?? "").trim();
       if (!s) return null;
-      const m = s.match(/^([a-zA-Z_]\w*)\[(\d+)\]$/);
-      if (!m) return null;
-      return { tableId: m[1], col: Number(m[2]) };
+      // Preferred syntax (easier to parse in .pr): "<tableId>.c<1-based>"
+      // Example: t_table.c1 (first column), t_table.c2 (second)
+      const mDot = s.match(/^([a-zA-Z_]\w*)\.c(\d+)$/);
+      if (mDot) {
+        const c1 = Number(mDot[2]);
+        if (!Number.isFinite(c1) || c1 < 1) return null;
+        return { tableId: mDot[1], col: c1 - 1 };
+      }
+      return null;
     };
     const xs = parseSource((n as any).xSource);
     const ys = parseSource((n as any).ySource);
@@ -2672,8 +2929,12 @@ function ensureGraphRendering(engine: Engine) {
       const rows: any[][] = Array.isArray(tableNode?.rows) ? tableNode.rows : [];
       for (let r = 0; r < rows.length; r++) {
         const rr = rows[r] ?? [];
-        const x0 = Number(String(rr?.[xs.col] ?? "").trim());
-        const y0 = Number(String(rr?.[ys.col] ?? "").trim());
+        const xs0 = String(rr?.[xs.col] ?? "").trim();
+        const ys0 = String(rr?.[ys.col] ?? "").trim();
+        // Empty cells should not create points (avoid accidental (0,0) clusters).
+        if (!xs0 || !ys0) continue;
+        const x0 = Number(xs0);
+        const y0 = Number(ys0);
         if (!Number.isFinite(x0) || !Number.isFinite(y0)) continue; // skips header automatically
         pts.push({ x: x0, y: y0 });
       }
@@ -2727,17 +2988,7 @@ function ensureGraphRendering(engine: Engine) {
     }
     ctx.restore();
 
-    // Axes (timer-like arrows) on top of the plot.
-    drawAxisArrows();
-
     drawTicksAndLabels({ ctx, plot, rectCss, dpr, lineWidthPx: 2, xTicks, yTicks });
-
-    // Axis labels
-    const xLabel = String(n.xLabel ?? "x");
-    const yLabel = String(n.yLabel ?? "y");
-    // Place labels just outside the plot, but inside the node frame.
-    drawAxisLabel(ctx, rectCss, dpr, ox + xLen / 2, Math.min(rectCss.height * dpr - 16 * dpr, oy + Math.max(28 * dpr, rectCss.height * 0.08 * dpr)), xLabel, 0);
-    drawAxisLabel(ctx, rectCss, dpr, Math.max(16 * dpr, rectCss.width * 0.04 * dpr), oy - yLen / 2, yLabel, -Math.PI / 2);
   };
 
   const raf = () => {
@@ -2747,6 +2998,13 @@ function ensureGraphRendering(engine: Engine) {
         if (String((n as any)?.type ?? "") !== "graph") continue;
         const el = engine.getNodeElement(String((n as any).id));
         if (!el) continue;
+        // Always ensure composite overlays exist so labels/arrows render like timer/sound.
+        const layer = ensureGraphCompositeLayer(engine, String((n as any).id));
+        if (layer) {
+          renderGraphCompositeArrows(el, layer);
+          layoutGraphCompositeTexts(el, layer);
+          renderGraphCompositeTexts(el, layer, { xLabel: String((n as any).xLabel ?? "x"), yLabel: String((n as any).yLabel ?? "y") });
+        }
         drawGraphNode(el, n, cur);
       }
     }
@@ -4160,14 +4418,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       type: "table",
       space,
       delimiter: ";",
-      hstyle: "||c|c|c||",
+      hstyle: "||c|c|c|c||",
       vstyle: "|b||c|...|",
-      rows: [
-        ["C1", "C2", "C3"],
-        ["1", "2", "3"],
-        ["4", "5", "6"],
-        ["7", "8", "9"]
-      ],
+      // Default: 20 rows x 4 columns, empty (Excel-like data entry).
+      rows: Array.from({ length: 20 }, () => Array.from({ length: 4 }, () => "")),
       transform: {
         x: isScreen ? pxToFrac(pos).x : pos.x,
         y: isScreen ? pxToFrac(pos).y : pos.y,
@@ -5473,10 +5727,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   };
 
   const pickCompositeRootAtClientPoint = (model: any, x: number, y: number) => {
-    let best: { id: string; kind: "timer" | "sound" | "choices"; area: number } | null = null;
+      let best: { id: string; kind: "timer" | "sound" | "choices" | "graph"; area: number } | null = null;
     for (const n of model?.nodes ?? []) {
       const kind = String(n?.type ?? "");
-      if (kind !== "timer" && kind !== "sound" && kind !== "choices") continue;
+        if (kind !== "timer" && kind !== "sound" && kind !== "choices" && kind !== "graph") continue;
       const el = engine.getNodeElement(String(n.id));
       if (!el) continue;
       const rotDeg = Number(n?.transform?.rotationDeg ?? 0) || 0;
@@ -5490,7 +5744,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     return best;
   };
 
-  function collectCompositeRectsClient(type: "timer" | "sound", nodeEl: HTMLElement, layer: HTMLElement): DOMRect[] {
+  function collectCompositeRectsClient(type: "timer" | "sound" | "graph", nodeEl: HTMLElement, layer: HTMLElement): DOMRect[] {
     const rects: DOMRect[] = [];
     rects.push(nodeEl.getBoundingClientRect());
 
@@ -5517,7 +5771,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
     }
 
-    // Legacy header bar (present when composite buttons are not used).
+    // Legacy header bar (timer/sound only).
+    if (type === "timer" || type === "sound") {
     const headerSel = type === "timer" ? ".timer-header" : ".sound-header";
     const headerEl = nodeEl.querySelector<HTMLElement>(headerSel);
     if (headerEl) {
@@ -5527,6 +5782,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         const br = btn.getBoundingClientRect();
         if (!(br.width > 0.5 && br.height > 0.5)) continue;
         rects.push(br);
+        }
       }
     }
 
@@ -5591,16 +5847,18 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   }
 
   const effectiveNodeRectClient = (nodeEl: HTMLElement, node: any) => {
-    // For timer/sound, include all internal comp-sub elements that may extend outside the root.
+    // For timer/sound/graph, include internal comp-sub elements that may extend outside the root.
     // For other nodes, return null (use nodeEl rect).
     const type = String(node?.type ?? "");
-    if (type !== "timer" && type !== "sound") return null;
+    if (type !== "timer" && type !== "sound" && type !== "graph") return null;
     const rootId = String(node?.id ?? nodeEl.dataset.nodeId ?? "");
     if (!rootId) return null;
     const layer =
       type === "timer"
         ? ensureTimerCompositeLayer(engine, rootId)
-        : ensureSoundCompositeLayer(engine, rootId);
+        : type === "sound"
+          ? ensureSoundCompositeLayer(engine, rootId)
+          : ensureGraphCompositeLayer(engine, rootId);
     if (!layer) return null;
     const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
     const rects = collectCompositeRectsClient(type as any, nodeEl, layer);
@@ -5784,7 +6042,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       // Critical: while editing timer/sound composites, do NOT let the normal node selection/drag handler run.
       // Otherwise it can select/drag the composite root in capture phase and stop propagation,
       // preventing sub-element selection (which looks like "clicking a label selects the full rect").
-      if (compositeEditTimerId && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
+      if (compositeEditTimerId && (compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph")) {
         return;
       }
 
@@ -5830,7 +6088,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (!node || !nodeEl) return;
 
       // Composite roots: implement our own "double click" detection (native dblclick can be suppressed by pointer handling).
-      if (!compositeEditTimerId && (node.type === "timer" || node.type === "sound" || node.type === "choices")) {
+      if (!compositeEditTimerId && (node.type === "timer" || node.type === "sound" || node.type === "choices" || node.type === "graph")) {
         const now = performance.now();
         const prev = lastCompositeClick;
         const dt = prev && prev.id === activeId ? now - prev.tMs : Infinity;
@@ -5848,6 +6106,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           lastCompositeClick = null;
           if (node.type === "timer") enterTimerCompositeEdit(activeId);
           else if (node.type === "sound") enterSoundCompositeEdit(activeId);
+          else if (node.type === "graph") enterGraphCompositeEdit(activeId);
           else enterChoicesCompositeEdit(activeId);
           ev.preventDefault();
           (ev as any).stopImmediatePropagation?.();
@@ -6049,12 +6308,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         continue;
       }
       if (isSel && selected.size === 1) {
-        // While editing a composite, timer/sound should edit sub-elements only (no root handles).
-        if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && n.id === compositeEditTimerId)
+        // While editing a composite, timer/sound/graph should edit sub-elements only (no root handles).
+        if ((compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph") && compositeEditTimerId && n.id === compositeEditTimerId)
           el.querySelector(".handles")?.remove();
         else {
           // Composite roots: draw selection using the effective bbox so buttons/labels are included.
-          if (n.type === "timer" || n.type === "sound") {
+          if (n.type === "timer" || n.type === "sound" || n.type === "graph") {
             const eff = effectiveNodeRectClient(el, n);
             if (eff && eff.width > 2 && eff.height > 2) {
               const box = ensureCompositeSelBoxEl();
@@ -6067,7 +6326,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
               const rotDeg = Number((n as any)?.transform?.rotationDeg ?? 0) || 0;
               box.style.transform = `rotate(${rotDeg}deg)`;
               box.dataset.anchor = String((n as any)?.transform?.anchor ?? "centerCenter");
-              // IMPORTANT: this composite selection box is the ONLY visible selection box for timer/sound.
+              // IMPORTANT: this composite selection box is the ONLY visible selection box for timer/sound/graph.
               // Hide the default node outline and remove its handles (we render handles on the composite box).
               el.style.outline = "none";
               el.querySelector(".handles")?.remove();
@@ -6075,7 +6334,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
               // Keep it synced during pan/zoom/viewport resize.
               startCompositeSelectionBoxRaf();
             }
-            // (No node handles for timer/sound; handled by composite selection box.)
+            // (No node handles for timer/sound/graph; handled by composite selection box.)
           } else {
             ensureHandles(el);
           }
@@ -6677,8 +6936,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           };
           grid.append(
             mkText("color", "color", "white"),
-            mkText("xSource", "xSource", "t_table[0]"),
-            mkText("ySource", "ySource", "t_table[1]"),
+            mkText("xSource", "xSource", "t_table.c1"),
+            mkText("ySource", "ySource", "t_table.c2"),
             mkText("xLabel", "xLabel", "x"),
             mkText("yLabel", "yLabel", "y"),
             mkSel("grid", "grid", ["on", "off"])
@@ -7378,7 +7637,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
   // Composite edit mode (timer/choices): allow editing sub-elements without opening the regular modal.
   let compositeEditTimerId: string | null = null; // composite root node id
-  let compositeEditKind: "timer" | "choices" | "sound" = "timer";
+  let compositeEditKind: "timer" | "choices" | "sound" | "graph" = "timer";
   let compositeEditPath: string = "";
   const compositePathStack: string[] = [];
   const compositeGeomsByPath: Record<string, any> = {};
@@ -7601,6 +7860,69 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         e.querySelector(":scope > .handles")?.remove();
       }
     }
+    applyCompositeLevelDimming();
+  };
+
+  const enterGraphCompositeEdit = (graphId: string) => {
+    const dbg = ipDebugEnabled("ip_debug_dblclick");
+    if (dbg) {
+      // eslint-disable-next-line no-console
+      console.log("[ip][dblclick] enterGraphCompositeEdit()", { graphId });
+    }
+    // Avoid conflicting isolate modes.
+    exitScreenEdit();
+    compositeEditKind = "graph";
+    compositeEditTimerId = graphId;
+    (engine as any).__ip_lastCompositeId = graphId;
+    (window as any).__ip_compositeEditId = graphId;
+    (window as any).__ip_compositeEditKind = "graph";
+    clearSelection();
+    const el = engine.getNodeElement(graphId);
+    if (!el) return;
+    el.querySelector(".handles")?.remove();
+
+    // Isolate: dim all other nodes in the scene.
+    compositeHiddenEls = [];
+    const model = engine.getModel();
+    for (const n of model?.nodes ?? []) {
+      if (n.id === graphId) continue;
+      const e2 = engine.getNodeElement(n.id);
+      if (!e2) continue;
+      e2.classList.add("ip-dim-node");
+      compositeHiddenEls.push(e2);
+    }
+
+    const layer = ensureGraphCompositeLayer(engine, graphId);
+    if (layer) layer.style.pointerEvents = "auto";
+    el.dataset.compositeEditing = "1";
+    compositeGeomsByPath[graphId] = (layer as any)?.__textGeoms ?? {};
+
+    for (const sub of Array.from(layer?.querySelectorAll<HTMLElement>(".comp-sub") ?? [])) {
+      // Lock the plot/data reference region.
+      if (sub.dataset.subId === "plot" || sub.dataset.kind === "plot-region") {
+        sub.style.pointerEvents = "none";
+        sub.style.cursor = "default";
+        sub.style.background = "transparent";
+        sub.style.outline = "none";
+        sub.style.opacity = "1";
+      } else {
+        sub.style.pointerEvents = "auto";
+        sub.style.cursor = "grab";
+      }
+      sub.style.border = "none";
+      if (sub.dataset.kind !== "plot-region") sub.style.background = "transparent";
+      sub.style.borderRadius = "0";
+      sub.style.padding = "0";
+    }
+
+    const modeBtn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+    if (modeBtn) modeBtn.textContent = "Exit group edit";
+    (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
+    (window as any).__ip_compositeEditing = true;
+    compositeEditPath = graphId;
+    (window as any).__ip_dbg_compositeEditPath = compositeEditPath;
+    compositePathStack.length = 0;
+    compositePathStack.push(graphId);
     applyCompositeLevelDimming();
   };
 
@@ -7871,6 +8193,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const ov = el?.querySelector<HTMLElement>(".sound-overlay");
       if (ov) ov.style.display = "block";
       const layer = el?.querySelector<HTMLElement>(".sound-sub-layer");
+      if (layer) {
+        layer.style.pointerEvents = "none";
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
+      if (el) el.dataset.compositeEditing = "0";
+    } else if (compositeEditKind === "graph") {
+      const layer = el?.querySelector<HTMLElement>(".graph-sub-layer");
       if (layer) {
         layer.style.pointerEvents = "none";
         delete (layer.dataset as any).selectedPlotArrowId;
@@ -8153,10 +8482,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (!compositeEditTimerId && model) {
       const x = ev.clientX;
       const y = ev.clientY;
-      let best: { id: string; kind: "timer" | "sound" | "choices"; area: number } | null = null;
+    let best: { id: string; kind: "timer" | "sound" | "choices" | "graph"; area: number } | null = null;
       for (const n of model.nodes as any[]) {
         const kind = String(n?.type ?? "");
-        if (kind !== "timer" && kind !== "sound" && kind !== "choices") continue;
+      if (kind !== "timer" && kind !== "sound" && kind !== "choices" && kind !== "graph") continue;
         const el = engine.getNodeElement(String(n.id));
         if (!el) continue;
         const rotDeg = Number(n?.transform?.rotationDeg ?? 0) || 0;
@@ -8185,6 +8514,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         }
         if (best.kind === "timer") enterTimerCompositeEdit(best.id);
         else if (best.kind === "sound") enterSoundCompositeEdit(best.id);
+      else if (best.kind === "graph") enterGraphCompositeEdit(best.id);
         else enterChoicesCompositeEdit(best.id);
         (ev as any).stopImmediatePropagation?.();
         ev.preventDefault();
@@ -8202,12 +8532,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const selId = Array.from(selected)[0];
       const selNode: any = model.nodes.find((n: any) => String(n.id) === String(selId));
       const selEl = selNode ? engine.getNodeElement(String(selNode.id)) : null;
-      if (selNode && selEl && (selNode.type === "timer" || selNode.type === "sound")) {
+      if (selNode && selEl && (selNode.type === "timer" || selNode.type === "sound" || selNode.type === "graph")) {
         const eff = effectiveNodeRectClient(selEl, selNode);
         const rotDeg = Number(selNode?.transform?.rotationDeg ?? 0) || 0;
         if (eff && isPointInRotatedRectClient(eff as any, rotDeg, ev.clientX, ev.clientY)) {
           if (selNode.type === "timer") enterTimerCompositeEdit(String(selNode.id));
           else enterSoundCompositeEdit(String(selNode.id));
+          if (selNode.type === "graph") enterGraphCompositeEdit(String(selNode.id));
           (ev as any).stopImmediatePropagation?.();
           ev.preventDefault();
           return;
@@ -8305,6 +8636,125 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         return;
       }
     }
+    if (compositeEditTimerId && compositeEditKind === "graph") {
+      const sub = target.closest<HTMLElement>(".graph-sub-text");
+      if (sub) {
+        // Graph uses the same save endpoint as other composites; we persist the edited line into elements.pr.
+        const graphId = compositeEditTimerId;
+        const layer = engine.getNodeElement(graphId)?.querySelector<HTMLElement>(".graph-sub-layer");
+        if (!layer) return;
+        const subId = sub.dataset.subId ?? "";
+        if (!subId) return;
+
+        const backdrop = document.createElement("div");
+        backdrop.className = "modal-backdrop";
+        const modal = document.createElement("div");
+        modal.className = "modal";
+        modal.style.width = "min(820px, calc(100vw - 40px))";
+        modal.style.height = "min(520px, calc(100vh - 40px))";
+
+        const header = document.createElement("div");
+        header.className = "modal-header";
+        header.innerHTML = `<div class="modal-title">Edit text: <code>${subId}</code></div>`;
+        const body = document.createElement("div");
+        body.style.padding = "14px";
+        body.style.display = "grid";
+        body.style.gridTemplateRows = "auto 1fr";
+        body.style.gap = "12px";
+
+        const taWrap = document.createElement("div");
+        taWrap.className = "field";
+        taWrap.innerHTML = `<label>Text</label>`;
+        const ta = document.createElement("textarea");
+        ta.value = sub.dataset.template ?? "";
+        ta.style.width = "100%";
+        ta.style.height = "120px";
+        ta.style.resize = "vertical";
+        taWrap.append(ta);
+
+        const preview = document.createElement("div");
+        preview.className = "field";
+        preview.innerHTML = `<label>Preview</label>`;
+        const pv = document.createElement("div");
+        pv.style.border = "1px solid rgba(255,255,255,0.12)";
+        pv.style.borderRadius = "12px";
+        pv.style.padding = "12px";
+        pv.style.minHeight = "120px";
+        pv.style.background = "rgba(255,255,255,0.04)";
+        pv.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
+        pv.style.fontWeight = "400";
+        preview.append(pv);
+
+        const m0 = engine.getModel();
+        const n0: any = m0?.nodes.find((n: any) => String(n.id) === String(graphId));
+        const renderPreview = () => {
+          const templ = applyDataBindings(ta.value, { name: graphId, xLabel: n0?.xLabel ?? "x", yLabel: n0?.yLabel ?? "y" });
+          pv.innerHTML = renderTextWithKatexToHtml(templ).replaceAll("\n", "<br/>");
+        };
+        ta.addEventListener("input", renderPreview);
+        renderPreview();
+
+        const footer = document.createElement("div");
+        footer.style.display = "flex";
+        footer.style.justifyContent = "flex-end";
+        footer.style.gap = "10px";
+        footer.style.padding = "12px 14px";
+        footer.style.borderTop = "1px solid rgba(255,255,255,0.12)";
+        const btnCancel = document.createElement("button");
+        btnCancel.className = "btn";
+        btnCancel.textContent = "Cancel";
+        const btnSave = document.createElement("button");
+        btnSave.className = "btn primary";
+        btnSave.textContent = "Save";
+        footer.append(btnCancel, btnSave);
+
+        modal.append(header, body, footer);
+        body.append(taWrap, preview);
+        backdrop.append(modal);
+        document.body.append(backdrop);
+
+        const close = () => backdrop.remove();
+        btnCancel.addEventListener("click", close);
+        modal.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+        backdrop.addEventListener("pointerdown", (ev) => {
+          if (ev.target === backdrop) close();
+        });
+
+        btnSave.addEventListener("click", () => {
+          const newText = ta.value.replaceAll("\r\n", "\n");
+          sub.dataset.template = newText;
+
+          const src = String((layer as any).__elementsPr ?? "");
+          const lines = src.split(/\r?\n/);
+          const out: string[] = [];
+          const re = new RegExp(`^\\s*text\\[name=${subId.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\]\\s*:\\s*(.*)$`);
+          let replaced = false;
+          for (const ln of lines) {
+            if (!replaced && re.test(ln)) {
+              out.push(`text[name=${subId}]: ${newText.replaceAll("\n", " ")}`);
+              replaced = true;
+            } else {
+              out.push(ln);
+            }
+          }
+          if (!replaced) out.push(`text[name=${subId}]: ${newText.replaceAll("\n", " ")}`);
+          const nextText = out.join("\n").replaceAll("\r\n", "\n");
+          (layer as any).__elementsPr = nextText;
+
+          const geoms: any = (layer as any).__textGeoms ?? {};
+          void _debugCompositeSaveFetch(
+            `${BACKEND}/api/composite/save`,
+            { compositePath: graphId, geoms, elementsPr: nextText },
+            { kind: "graph", where: "text-editor-save", compositePath: graphId }
+          );
+          close();
+        });
+
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+    }
     if (compositeEditTimerId && compositeEditKind === "choices") {
       // Nested levels: double-click a group container to enter its coordinate system.
       const grp = target.closest<HTMLElement>(".comp-sub");
@@ -8364,6 +8814,11 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       ev.preventDefault();
       return;
     }
+    if (node?.type === "graph") {
+      enterGraphCompositeEdit(id);
+      ev.preventDefault();
+      return;
+    }
     await openEditorModal(id);
   });
 
@@ -8379,6 +8834,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         ? rootEl.querySelector<HTMLElement>(".timer-sub-layer")
         : compositeEditKind === "sound"
           ? rootEl.querySelector<HTMLElement>(".sound-sub-layer")
+          : compositeEditKind === "graph"
+            ? rootEl.querySelector<HTMLElement>(".graph-sub-layer")
           : rootEl.querySelector<HTMLElement>(".choices-sub-layer");
     if (!layer) return;
     // Do NOT enforce a separate composite bbox gate here.
@@ -8393,6 +8850,39 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         ? directSub
         : _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY, { activeCompPath: compositeEditPath });
     if (!sub) return;
+
+    // Composite sub-elements: implement our own "double click" for sub-text editing.
+    // Native dblclick can be suppressed by pointer capture + preventDefault during composite drag.
+    // This makes timer/sound/graph text editing consistent.
+    if ((sub.classList.contains("timer-sub-text") || sub.classList.contains("sound-sub-text") || sub.classList.contains("graph-sub-text")) && compositeEditTimerId) {
+      const now = performance.now();
+      const sid = String(sub.dataset.subId ?? "");
+      const prev = (stage as any).__ip_lastCompositeSubClick as
+        | { compId: string; subId: string; tMs: number; x: number; y: number }
+        | null
+        | undefined;
+      const dt = prev && prev.compId === compositeEditTimerId && prev.subId === sid ? now - prev.tMs : Infinity;
+      const d = prev && prev.compId === compositeEditTimerId && prev.subId === sid ? Math.hypot(ev.clientX - prev.x, ev.clientY - prev.y) : Infinity;
+      const isDouble = dt <= 350 && d <= 6;
+      (stage as any).__ip_lastCompositeSubClick = { compId: compositeEditTimerId, subId: sid, tMs: now, x: ev.clientX, y: ev.clientY };
+      if (isDouble) {
+        (stage as any).__ip_lastCompositeSubClick = null;
+        if (sub.classList.contains("timer-sub-text") && compositeEditKind === "timer") {
+          openCompositeTextEditor(compositeEditTimerId, sub);
+        } else if (sub.classList.contains("graph-sub-text") && compositeEditKind === "graph") {
+          // Reuse the dblclick handler behavior by dispatching a dblclick event won’t work reliably,
+          // so we call the same editor path directly (implemented in the dblclick handler).
+          const fake = new MouseEvent("dblclick", { clientX: ev.clientX, clientY: ev.clientY, bubbles: true, cancelable: true });
+          // Let the existing stage dblclick handler open the graph text editor (it checks compositeEditKind/id).
+          stage.dispatchEvent(fake);
+        } else if (sub.classList.contains("sound-sub-text") && compositeEditKind === "sound") {
+          // Sound composite doesn't currently have a dedicated text editor; fall back to no-op for now.
+        }
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
+    }
     const dbg = ipDebugEnabled("ip_debug_composite_drag");
     if (dbg) {
       // eslint-disable-next-line no-console
@@ -8421,14 +8911,15 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     for (const e of Array.from(timerEl.querySelectorAll<HTMLElement>(".comp-sub"))) e.classList.remove("is-selected");
     sub.classList.add("is-selected");
     // If selecting anything other than a plot-arrow, clear plot-arrow selection glow.
-    if (!(sub.dataset.kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound"))) {
+    if (!(sub.dataset.kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph"))) {
       delete (layer.dataset as any).selectedPlotArrowId;
       if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
       else if (compositeEditKind === "sound") renderSoundCompositeArrows(timerEl, layer);
+      else if (compositeEditKind === "graph") renderGraphCompositeArrows(timerEl, layer);
     }
 
     // Composite axis arrows (timer/sound): drag endpoints in plot coords (no bbox handles).
-    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && sub.dataset.kind === "plot-arrow") {
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph") && sub.dataset.kind === "plot-arrow") {
       const specs: any[] = (layer as any).__arrowSpecs ?? [];
       if (!Array.isArray(specs) || specs.length === 0) return;
       const requestedArrowId = String(sub.dataset.arrowId ?? "");
@@ -8436,7 +8927,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (requestedArrowId) {
         layer.dataset.selectedPlotArrowId = requestedArrowId;
         if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
-        else renderSoundCompositeArrows(timerEl, layer);
+        else if (compositeEditKind === "sound") renderSoundCompositeArrows(timerEl, layer);
+        else renderGraphCompositeArrows(timerEl, layer);
       } else {
         delete (layer.dataset as any).selectedPlotArrowId;
       }
@@ -8639,11 +9131,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     if (compositeDragMode === "arrow" && compositeArrowDrag) {
       const cad = compositeArrowDrag;
-      if (!(compositeEditKind === "timer" || compositeEditKind === "sound")) return;
+      if (!(compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph")) return;
       const layer =
         compositeEditKind === "timer"
           ? timerEl.querySelector<HTMLElement>(".timer-sub-layer")
-          : timerEl.querySelector<HTMLElement>(".sound-sub-layer");
+          : compositeEditKind === "sound"
+            ? timerEl.querySelector<HTMLElement>(".sound-sub-layer")
+            : timerEl.querySelector<HTMLElement>(".graph-sub-layer");
       if (!layer) return;
       const specs: any[] = (layer as any).__arrowSpecs ?? [];
       if (!Array.isArray(specs) || specs.length === 0) return;
@@ -8875,11 +9369,13 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     // Timer/sound: axis arrow edits mutate the ROOT elements.pr regardless of which level is active.
     // (Arrows are currently authored in `groups/<id>/elements.pr`, not in `plot/elements.pr`.)
-    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId) {
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph") && compositeEditTimerId) {
       const layer =
         compositeEditKind === "timer"
           ? engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".timer-sub-layer")
-          : engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".sound-sub-layer");
+          : compositeEditKind === "sound"
+            ? engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".sound-sub-layer")
+            : engine.getNodeElement(compositeEditTimerId)?.querySelector<HTMLElement>(".graph-sub-layer");
       const elementsPr = String((layer as any)?.__elementsPr ?? "");
       if (elementsPr.trim()) {
         void _debugCompositeSaveFetch(
@@ -8960,7 +9456,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
       if (picked && kind !== "plot-region") {
       // Plot arrows: behave like normal arrows in root mode (selectable in the middle too).
-        if (kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
+        if (kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph")) {
               return;
         } else {
           // Any normal selectable sub (text/buttons/etc): do NOT pan.
@@ -9134,7 +9630,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // In composite edit mode:
     // - Timer/Sound: never select/rotate the composite root itself (edit sub-elements only).
     // - Choices: allow selecting/resizing the root (so the whole composite can be scaled).
-    if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && id === compositeEditTimerId) {
+    if ((compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph") && compositeEditTimerId && id === compositeEditTimerId) {
       pickedEl?.querySelector?.(".handles")?.remove?.();
       ev.preventDefault();
       return;
