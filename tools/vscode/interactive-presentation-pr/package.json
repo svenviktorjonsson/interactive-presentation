@@ -1,0 +1,37 @@
+{
+  "name": "interactive-presentation-pr",
+  "displayName": "Interactive Presentation (.pr) Language",
+  "description": "Syntax highlighting for Interactive Presentation .pr DSL (presentation.pr, elements.pr).",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "UNLICENSED",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "ippr",
+        "aliases": [
+          "Interactive Presentation (.pr)",
+          "ippr"
+        ],
+        "extensions": [
+          ".pr"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "ippr",
+        "scopeName": "source.ippr",
+        "path": "./syntaxes/ippr.tmLanguage.json"
+      }
+    ]
+  }
+}
+

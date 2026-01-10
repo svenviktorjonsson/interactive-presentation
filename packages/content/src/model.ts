@@ -5,6 +5,7 @@ export type NodeType =
   | "image"
   | "qr"
   | "htmlFrame"
+  | "video"
   | "group"
   | "bullets"
   | "table"
@@ -102,6 +103,23 @@ export interface ImageNodeModel extends BaseNodeModel {
 export interface HtmlFrameNodeModel extends BaseNodeModel {
   type: "htmlFrame";
   src: string;
+}
+
+export interface VideoNodeModel extends BaseNodeModel {
+  type: "video";
+  /** URL or local media path (e.g. /media/demo.mp4). YouTube URLs are embedded automatically by the renderer. */
+  src: string;
+  /**
+   * Thumbnail spec (shown before first play and after ended).
+   * Supported forms:
+   * - time string: "MM:SS" or "HH:MM:SS" (capture a frame for local videos; YouTube falls back to its default thumb)
+   * - url/path: "/media/thumb.jpg" or "https://..." (uses that image directly)
+   *
+   * Back-compat: `poster` is still supported.
+   */
+  thumbnail?: string;
+  /** Back-compat alias for thumbnail (image URL/path only). */
+  poster?: string;
 }
 
 export interface BulletsNodeModel extends BaseNodeModel {

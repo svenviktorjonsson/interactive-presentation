@@ -7,11 +7,13 @@
     { "include": "#element-screen" },
     { "include": "#element-view" },
     { "include": "#element-arrow" },
+    { "include": "#element-lines" },
     { "include": "#element-bullets" },
     { "include": "#element-choices" },
     { "include": "#element-timer" },
     { "include": "#element-sound" },
     { "include": "#element-table" },
+    { "include": "#element-graph" },
     { "include": "#element-generic" },
     { "include": "#content" }
   ],
@@ -47,6 +49,18 @@
     "element-arrow": {
       "name": "meta.element.arrow.pr",
       "match": "^(arrow)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "meta.content.pr" }
+      }
+    },
+    "element-lines": {
+      "name": "meta.element.lines.pr",
+      "match": "^(lines|line)(\\[)([^\\]]*)(\\])(:)?(.*)$",
       "captures": {
         "1": { "name": "entity.name.function.element.pr" },
         "2": { "name": "punctuation.definition.attributes.begin.pr" },
@@ -122,6 +136,18 @@
           "match": ";"
         }
       ]
+    },
+    "element-graph": {
+      "name": "meta.element.graph.pr",
+      "match": "^(graph)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "meta.content.pr" }
+      }
     },
     "element-generic": {
       "name": "meta.element.generic.pr",
@@ -239,6 +265,11 @@
                 { "name": "punctuation.definition.group.begin.pr", "match": "\\(" },
                 { "name": "punctuation.definition.group.end.pr", "match": "\\)" },
                 { "name": "punctuation.separator.comma.pr", "match": "," },
+                {
+                  "comment": "time literal (mm:ss, mm:ss.fraction, hh:mm:ss, hh:mm:ss.fraction)",
+                  "name": "constant.numeric.pr",
+                  "match": "(?<![0-9])(?:\\d{2}:\\d{2}(?::\\d{2})?)(?:\\.\\d+)?(?![0-9])"
+                },
                 { "name": "constant.numeric.pr", "match": "-?(?:\\d+\\.?\\d*|\\.\\d+)" }
               ]
             }
@@ -318,6 +349,11 @@
                 {
                   "name": "support.constant.known.pr",
                   "match": "\\b(true|false)\\b"
+                },
+                {
+                  "comment": "time literal (mm:ss, mm:ss.fraction, hh:mm:ss, hh:mm:ss.fraction)",
+                  "name": "constant.numeric.pr",
+                  "match": "(?<![0-9])(?:\\d{2}:\\d{2}(?::\\d{2})?)(?:\\.\\d+)?(?![0-9])"
                 },
                 {
                   "name": "constant.numeric.pr",

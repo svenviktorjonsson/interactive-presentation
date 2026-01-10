@@ -468,8 +468,15 @@ export class Engine {
       const color = String(n.color ?? "white");
       const opacity = typeof n.opacity === "number" ? Math.max(0, Math.min(1, n.opacity)) : 1;
       // In Screen Edit mode, dim any world-space elements (including canvas-rendered arrow/line).
+      // In Composite (group) edit mode, dim any nodes that the app layer marked as "disabled" via ip-dim-node.
+      const domEl = this.domNodes.get(String(n.id))?.el ?? null;
+      const isDimmedByUi = !!domEl?.classList?.contains("ip-dim-node");
       const finalOpacity =
-        (window as any).__ip_screenEditing && n.space === "world" ? opacity * 0.1 : opacity;
+        (window as any).__ip_screenEditing && n.space === "world"
+          ? opacity * 0.1
+          : (window as any).__ip_compositeEditing && isDimmedByUi
+            ? opacity * 0.1
+            : opacity;
       const wRaw = Number(n.width ?? 4);
       const selected = document.documentElement.dataset.ipMode === "edit"
         ? !!this.domNodes.get(String(n.id))?.el?.classList?.contains("is-selected")

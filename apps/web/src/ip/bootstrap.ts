@@ -42,6 +42,18 @@ let lastContextScreen: { x: number; y: number } | null = null;
 let enterScreenEdit: () => void = () => {};
 let exitScreenEdit: () => void = () => {};
 
+// Table editing (single-click, Excel-like)
+let __activeTableEdit:
+  | null
+  | {
+      tableId: string;
+      row: number;
+      col: number;
+      td: HTMLTableCellElement;
+      input: HTMLInputElement;
+      beforeValue: string;
+    } = null;
+
 // Presentation started state: controls whether polling for timer/choices happens.
 // Only true in Live mode; false in Edit mode. Defaults to false on app load.
 let presentationStarted = false;
@@ -108,6 +120,7 @@ function _pickSmallestCompositeSub(
   // then we can fall back to arrows.
   let bestNormal: { el: HTMLElement; area: number; z: number; order: number } | null = null;
   let bestArrow: { el: HTMLElement; area: number; z: number; order: number } | null = null;
+  const rootId = String((root as any)?.dataset?.nodeId ?? "");
   for (let i = 0; i < subs.length; i++) {
     const el = subs[i];
     if (opts?.excludeEl && el === opts.excludeEl) continue;
@@ -115,7 +128,16 @@ function _pickSmallestCompositeSub(
     if (activePath) {
       const p = String(el.dataset.compPath ?? "");
       // In a nested composite level, ONLY allow selecting elements whose compPath matches that level.
-      if (p !== activePath) continue;
+      if (p !== activePath) {
+        // Exception: axis arrow hitboxes (plot-arrow) are authored in the root `elements.pr`
+        // but live geometrically in the plot coordinate system. Allow selecting them while
+        // editing the plot level as well.
+        const kind0 = String(el.dataset.kind ?? "");
+        const isPlotArrow = kind0 === "plot-arrow";
+        const isPlotLevel = !!rootId && activePath === `${rootId}/plot`;
+        const isRootPath = !!rootId && p === rootId;
+        if (!(isPlotArrow && isPlotLevel && isRootPath)) continue;
+      }
     }
     // Hard-disable plot region overlays: they are internal helpers and should never be selectable.
     // (Older DOM could be missing dataset.kind, so also match by class/subId.)
@@ -1700,7 +1722,9 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
       const h = document.createElement("div");
       h.className = "timer-sub timer-sub-arrow-hit comp-sub";
       h.dataset.subId = arrowId;
-      h.dataset.compPath = `${timerId}/plot`;
+      // Axis arrows are authored in the root `groups/<id>/elements.pr` and should be editable
+      // immediately when entering composite edit (no need to enter the nested plot level).
+      h.dataset.compPath = timerId;
       h.dataset.kind = "plot-arrow";
       h.dataset.arrowId = arrowId;
       h.style.position = "absolute";
@@ -1885,8 +1909,9 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
       }
 
       // arrow[name=id,from=(x,y),to=(x,y),color=...,width=...]
+      // Be whitespace-tolerant: elements.pr is user-authored and may contain spaces after commas.
       const ma = ln.match(
-        /^arrow\[name=(?<id>[a-zA-Z_]\w*),from=\((?<x0>-?(?:\d+\.?\d*|\.\d+)),(?<y0>-?(?:\d+\.?\d*|\.\d+))\),to=\((?<x1>-?(?:\d+\.?\d*|\.\d+)),(?<y1>-?(?:\d+\.?\d*|\.\d+))\)(?:,color=(?<color>[^,\]]+))?(?:,width=(?<width>-?(?:\d+\.?\d*|\.\d+)))?\]$/
+        /^arrow\[\s*name=(?<id>[a-zA-Z_]\w*)\s*,\s*from=\(\s*(?<x0>-?(?:\d+\.?\d*|\.\d+))\s*,\s*(?<y0>-?(?:\d+\.?\d*|\.\d+))\s*\)\s*,\s*to=\(\s*(?<x1>-?(?:\d+\.?\d*|\.\d+))\s*,\s*(?<y1>-?(?:\d+\.?\d*|\.\d+))\s*\)(?:\s*,\s*color=(?<color>[^,\]]+))?(?:\s*,\s*width=(?<width>-?(?:\d+\.?\d*|\.\d+)))?\s*\]\s*$/
       );
       if (ma?.groups) {
         const sid = ma.groups.id;
@@ -1934,7 +1959,8 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     const h = document.createElement("div");
     h.className = "timer-sub timer-sub-arrow-hit comp-sub";
     h.dataset.subId = arrowId;
-    h.dataset.compPath = `${timerId}/plot`;
+    // See mkArrowHit(): axis arrows should be editable at the root composite level.
+    h.dataset.compPath = timerId;
     h.dataset.kind = "plot-arrow";
     h.dataset.arrowId = arrowId;
     h.style.position = "absolute";
@@ -1982,7 +2008,9 @@ function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
 function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, data: Record<string, string | number>) {
   const geoms: Record<string, any> = (layer as any).__textGeoms ?? {};
   const els = Array.from(layer.querySelectorAll<HTMLElement>(":scope .timer-sub-text"));
-  const isGroupEditing = timerEl.dataset.compositeEditing === "1";
+  const compositeId = String((window as any).__ip_compositeEditId ?? "");
+  const compositeKind = String((window as any).__ip_compositeEditKind ?? "");
+  const isGroupEditing = (window as any).__ip_compositeEditing && compositeKind === "timer" && compositeId === String(timerEl.dataset.nodeId ?? "");
   const appMode = getAppMode();
   // Prefer engine-provided pixel size to avoid reflow jitter; fall back to DOM rect.
   const hPx = Number(timerEl.dataset.timerHpx ?? "0");
@@ -2029,6 +2057,30 @@ function renderTimerCompositeTexts(timerEl: HTMLElement, layer: HTMLElement, dat
     const interactive = appMode === "edit" && isGroupEditing;
     t.style.pointerEvents = interactive ? "auto" : "none";
     t.style.cursor = interactive ? "grab" : "default";
+
+    // DEBUG (low-noise, but always-on when the bug happens):
+    // If we are in timer composite edit, texts must never become non-interactive.
+    // Log the first time we observe a violation for this timer element.
+    if (!interactive && (window as any).__ip_compositeEditing && compositeKind === "timer" && compositeId === String(timerEl.dataset.nodeId ?? "")) {
+      const key = `${compositeId}|${appMode}|${String(timerEl.dataset.compositeEditing ?? "")}`;
+      const prev = (timerEl as any).__ip_dbg_bad_text_pe_key;
+      if (prev !== key) {
+        (timerEl as any).__ip_dbg_bad_text_pe_key = key;
+        // eslint-disable-next-line no-console
+        console.warn("[ip][bug] timer text became non-interactive during composite edit", {
+          timerId: compositeId,
+          appMode,
+          winCompositeEditing: !!(window as any).__ip_compositeEditing,
+          winCompositeKind: compositeKind,
+          winCompositeId: compositeId,
+          elCompositeEditing: timerEl.dataset.compositeEditing,
+          textSubId: t.dataset.subId,
+          computedPE: window.getComputedStyle(t).pointerEvents,
+          inlinePE: t.style.pointerEvents,
+          compositeEditPath: (window as any).__ip_dbg_compositeEditPath,
+        });
+      }
+    }
   }
 }
 
@@ -2041,7 +2093,9 @@ function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLElement, d
     hPx > 0 && wPx > 0
       ? { width: wPx, height: hPx }
       : timerEl.getBoundingClientRect();
-  const isGroupEditing = timerEl.dataset.compositeEditing === "1";
+  const compositeId = String((window as any).__ip_compositeEditId ?? "");
+  const compositeKind = String((window as any).__ip_compositeEditKind ?? "");
+  const isGroupEditing = (window as any).__ip_compositeEditing && compositeKind === "timer" && compositeId === String(timerEl.dataset.nodeId ?? "");
   const appMode = getAppMode();
   for (const boxEl of els) {
     const sid = boxEl.dataset.subId ?? "";
@@ -2143,6 +2197,7 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
   const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
   const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
   const timerId = layer.dataset.timerId ?? "timer";
+  const selectedArrowId = String((layer as any).dataset?.selectedPlotArrowId ?? "");
 
   // Map arrow coordinates in "data-rect space":
   // u in [0..1] across x, v in [0..1] up y. Allow >1 to extend beyond the rect.
@@ -2204,6 +2259,20 @@ function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
     path.setAttribute("fill", a.color ?? "white");
     marker.append(path);
     defs.append(marker);
+
+    const isSelected = selectedArrowId && String(a.id ?? "") === selectedArrowId;
+    if (isSelected) {
+      // Root-mode parity: draw a thick blue stroke behind the arrow (glow), like the canvas arrows.
+      const glow = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      glow.setAttribute("x1", String(x1));
+      glow.setAttribute("y1", String(y1));
+      glow.setAttribute("x2", String(x2));
+      glow.setAttribute("y2", String(y2));
+      glow.setAttribute("stroke", "rgba(110,168,255,0.95)");
+      glow.setAttribute("stroke-width", String(Math.min(48, lwPx + 10)));
+      glow.setAttribute("stroke-linecap", "round");
+      g.append(glow);
+    }
 
     const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
     line.setAttribute("x1", String(x1));
@@ -2476,6 +2545,216 @@ function ensureSoundStreaming(engine: Engine, model: PresentationModel, stage: H
   }, 1500);
 }
 
+let __graphRafStarted = false;
+function ensureGraphRendering(engine: Engine) {
+  if (__graphRafStarted) return;
+  __graphRafStarted = true;
+
+  const ensureGraphFrame = (nodeEl: HTMLElement) => {
+    let frame = nodeEl.querySelector<HTMLElement>(":scope > .ip-graph-frame");
+    if (!frame) {
+      frame = document.createElement("div");
+      frame.className = "ip-graph-frame";
+      frame.style.position = "absolute";
+      frame.style.inset = "0";
+      frame.style.border = "1px solid rgba(255,255,255,0.14)";
+      frame.style.borderRadius = "14px";
+      frame.style.background = "rgba(15,17,24,0.55)";
+      frame.style.boxShadow = "0 14px 40px rgba(0,0,0,0.35)";
+      frame.style.overflow = "hidden";
+      frame.style.pointerEvents = "none";
+      nodeEl.appendChild(frame);
+      // If the engine default node doesn't set positioning context, make sure it does.
+      if (!nodeEl.style.position) nodeEl.style.position = "absolute";
+    }
+    return frame;
+  };
+
+  const ensureGraphCanvas = (nodeEl: HTMLElement) => {
+    const frame = ensureGraphFrame(nodeEl);
+    let c = frame.querySelector<HTMLCanvasElement>("canvas.ip-graph-canvas");
+    if (!c) {
+      c = document.createElement("canvas");
+      c.className = "ip-graph-canvas";
+      c.style.position = "absolute";
+      c.style.inset = "0";
+      c.style.width = "100%";
+      c.style.height = "100%";
+      c.style.pointerEvents = "none";
+      frame.appendChild(c);
+    }
+    return c;
+  };
+
+  const drawAxisLabel = (ctx: CanvasRenderingContext2D, rectCss: DOMRect, dpr: number, x: number, y: number, text: string, rotRad = 0) => {
+    const fontCssPx = Math.max(12, Math.min(64, rectCss.height * 0.032));
+    const fontPx = Math.round(fontCssPx * dpr);
+    ctx.save();
+    ctx.font = `${fontPx}px KaTeX_Main, Times New Roman, serif`;
+    ctx.fillStyle = "rgba(255,255,255,0.82)";
+    ctx.translate(x, y);
+    if (rotRad) ctx.rotate(rotRad);
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, 0, 0);
+    ctx.restore();
+  };
+
+  const drawGraphNode = (nodeEl: HTMLElement, n: any, model: any) => {
+    const canvas = ensureGraphCanvas(nodeEl);
+    const prep = prepareCanvas(nodeEl, canvas, PLOT_FRACS);
+    if (!prep) return;
+    const { ctx, rect: rectCss, dpr, plot } = prep;
+    const { ox, oy, xLen, yLen } = plot;
+
+    const drawAxisArrows = () => {
+      // Timer-like axis arrows (inside the plot rect).
+      const col = "rgba(255,255,255,0.75)";
+      const lw = Math.max(1, 2 * dpr);
+      const headL = Math.max(10 * dpr, 14 * dpr);
+      const headW = Math.max(7 * dpr, 10 * dpr);
+      const extend = 0.02; // extend beyond plot a bit
+
+      const drawArrow = (x0: number, y0: number, x1: number, y1: number) => {
+        const dx = x1 - x0;
+        const dy = y1 - y0;
+        const len = Math.max(1e-6, Math.hypot(dx, dy));
+        const ux = dx / len;
+        const uy = dy / len;
+        // Base of arrow head
+        const bx = x1 - ux * headL;
+        const by = y1 - uy * headL;
+        // Perpendicular
+        const px = -uy;
+        const py = ux;
+
+        ctx.save();
+        ctx.strokeStyle = col;
+        ctx.fillStyle = col;
+        ctx.lineWidth = lw;
+        ctx.lineCap = "round";
+        // Shaft
+        ctx.beginPath();
+        ctx.moveTo(x0, y0);
+        ctx.lineTo(bx, by);
+        ctx.stroke();
+        // Head
+        ctx.beginPath();
+        ctx.moveTo(x1, y1);
+        ctx.lineTo(bx + px * (headW / 2), by + py * (headW / 2));
+        ctx.lineTo(bx - px * (headW / 2), by - py * (headW / 2));
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      };
+
+      // x-axis: left->right along bottom of plot
+      drawArrow(ox, oy, ox + xLen * (1 + extend), oy);
+      // y-axis: bottom->top along left of plot
+      drawArrow(ox, oy, ox, oy - yLen * (1 + extend));
+    };
+
+    // Resolve sources.
+    // Source syntax: "<tableId>[<colIdx>]" (0-based).
+    const parseSource = (raw: any): { tableId: string; col: number } | null => {
+      const s = String(raw ?? "").trim();
+      if (!s) return null;
+      const m = s.match(/^([a-zA-Z_]\w*)\[(\d+)\]$/);
+      if (!m) return null;
+      return { tableId: m[1], col: Number(m[2]) };
+    };
+    const xs = parseSource((n as any).xSource);
+    const ys = parseSource((n as any).ySource);
+
+    const pts: Array<{ x: number; y: number }> = [];
+    if (xs && ys && xs.tableId === ys.tableId) {
+      const tableNode: any = (model?.nodes ?? []).find((nn: any) => String(nn?.id) === xs.tableId);
+      const rows: any[][] = Array.isArray(tableNode?.rows) ? tableNode.rows : [];
+      for (let r = 0; r < rows.length; r++) {
+        const rr = rows[r] ?? [];
+        const x0 = Number(String(rr?.[xs.col] ?? "").trim());
+        const y0 = Number(String(rr?.[ys.col] ?? "").trim());
+        if (!Number.isFinite(x0) || !Number.isFinite(y0)) continue; // skips header automatically
+        pts.push({ x: x0, y: y0 });
+      }
+    }
+
+    // Bounds (auto)
+    let xMin = 0, xMax = 1, yMin = 0, yMax = 1;
+    if (pts.length) {
+      xMin = Math.min(...pts.map((p) => p.x));
+      xMax = Math.max(...pts.map((p) => p.x));
+      yMin = Math.min(...pts.map((p) => p.y));
+      yMax = Math.max(...pts.map((p) => p.y));
+      const xSpan = Math.max(1e-9, xMax - xMin);
+      const ySpan = Math.max(1e-9, yMax - yMin);
+      xMin -= xSpan * 0.08;
+      xMax += xSpan * 0.08;
+      yMin -= ySpan * 0.08;
+      yMax += ySpan * 0.08;
+    }
+    const xSpan = Math.max(1e-9, xMax - xMin);
+    const ySpan = Math.max(1e-9, yMax - yMin);
+
+    const fmt = (v: number) => {
+      const av = Math.abs(v);
+      if (av >= 1000) return String(Math.round(v));
+      if (av >= 10) return v.toFixed(1);
+      return v.toFixed(2);
+    };
+    const xTickVals = niceTicks(xMin, xMax, 6, [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000], fmt);
+    const yTickVals = niceTicks(yMin, yMax, 6, [0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000], fmt);
+    const xTicks: Array<{ xFrac: number; label: string }> = xTickVals.map((t) => ({ xFrac: t.frac, label: t.label }));
+    const yTicks: Array<{ yFrac: number; label: string }> = yTickVals.map((t) => ({ yFrac: t.frac, label: t.label }));
+    if (String(n.grid ?? "on").toLowerCase() !== "off") drawGrid(ctx, plot, dpr, xTicks, yTicks);
+
+    // Clip points to plot rect
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(ox, oy - yLen, xLen, yLen);
+    ctx.clip();
+    const col = String(n.color ?? "white") || "white";
+    const dotR = Math.max(2 * dpr, 3.5 * dpr);
+    ctx.fillStyle = col;
+    for (const p of pts) {
+      const xf = (p.x - xMin) / xSpan;
+      const yf = (p.y - yMin) / ySpan;
+      const x = ox + xf * xLen;
+      const y = oy - yf * yLen;
+      ctx.beginPath();
+      ctx.arc(x, y, dotR, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // Axes (timer-like arrows) on top of the plot.
+    drawAxisArrows();
+
+    drawTicksAndLabels({ ctx, plot, rectCss, dpr, lineWidthPx: 2, xTicks, yTicks });
+
+    // Axis labels
+    const xLabel = String(n.xLabel ?? "x");
+    const yLabel = String(n.yLabel ?? "y");
+    // Place labels just outside the plot, but inside the node frame.
+    drawAxisLabel(ctx, rectCss, dpr, ox + xLen / 2, Math.min(rectCss.height * dpr - 16 * dpr, oy + Math.max(28 * dpr, rectCss.height * 0.08 * dpr)), xLabel, 0);
+    drawAxisLabel(ctx, rectCss, dpr, Math.max(16 * dpr, rectCss.width * 0.04 * dpr), oy - yLen / 2, yLabel, -Math.PI / 2);
+  };
+
+  const raf = () => {
+    const cur = engine.getModel();
+    if (cur) {
+      for (const n of (cur.nodes as any[]) ?? []) {
+        if (String((n as any)?.type ?? "") !== "graph") continue;
+        const el = engine.getNodeElement(String((n as any).id));
+        if (!el) continue;
+        drawGraphNode(el, n, cur);
+      }
+    }
+    window.requestAnimationFrame(raf);
+  };
+  window.requestAnimationFrame(raf);
+}
+
 function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
   const m = engine.getModel();
   const node = m?.nodes.find((n) => (n as any).id === soundId) as any;
@@ -2526,7 +2805,9 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
       const h = document.createElement("div");
       h.className = "sound-sub sound-sub-arrow-hit comp-sub";
       h.dataset.subId = arrowId;
-      h.dataset.compPath = `${soundId}/plot`;
+      // Axis arrows are authored in the root `groups/<id>/elements.pr` and should be editable
+      // immediately when entering composite edit.
+      h.dataset.compPath = soundId;
       h.dataset.kind = "plot-arrow";
       h.dataset.arrowId = arrowId;
       h.style.position = "absolute";
@@ -2676,7 +2957,7 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
       }
 
       const ma = ln.match(
-        /^arrow\[name=(?<id>[a-zA-Z_]\w*),from=\((?<x0>-?(?:\d+\.?\d*|\.\d+)),(?<y0>-?(?:\d+\.?\d*|\.\d+))\),to=\((?<x1>-?(?:\d+\.?\d*|\.\d+)),(?<y1>-?(?:\d+\.?\d*|\.\d+))\)(?:,color=(?<color>[^,\]]+))?(?:,width=(?<width>-?(?:\d+\.?\d*|\.\d+)))?\]$/
+        /^arrow\[\s*name=(?<id>[a-zA-Z_]\w*)\s*,\s*from=\(\s*(?<x0>-?(?:\d+\.?\d*|\.\d+))\s*,\s*(?<y0>-?(?:\d+\.?\d*|\.\d+))\s*\)\s*,\s*to=\(\s*(?<x1>-?(?:\d+\.?\d*|\.\d+))\s*,\s*(?<y1>-?(?:\d+\.?\d*|\.\d+))\s*\)(?:\s*,\s*color=(?<color>[^,\]]+))?(?:\s*,\s*width=(?<width>-?(?:\d+\.?\d*|\.\d+)))?\s*\]\s*$/
       );
       if (ma?.groups) {
         const sid = ma.groups.id;
@@ -2705,7 +2986,8 @@ function ensureSoundCompositeLayer(engine: Engine, soundId: string) {
     const h = document.createElement("div");
     h.className = "sound-sub sound-sub-arrow-hit comp-sub";
     h.dataset.subId = arrowId;
-    h.dataset.compPath = `${soundId}/plot`;
+    // See mkArrowHit(): axis arrows should be editable at the root composite level.
+    h.dataset.compPath = soundId;
     h.dataset.kind = "plot-arrow";
     h.dataset.arrowId = arrowId;
     h.style.position = "absolute";
@@ -2774,7 +3056,9 @@ function renderSoundCompositeTexts(soundEl: HTMLElement, layer: HTMLElement, dat
   const hPx = Number(soundEl.dataset.soundHpx ?? "0");
   const wPx = Number(soundEl.dataset.soundWpx ?? "0");
   const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
-  const isGroupEditing = soundEl.dataset.compositeEditing === "1";
+  const compositeId = String((window as any).__ip_compositeEditId ?? "");
+  const compositeKind = String((window as any).__ip_compositeEditKind ?? "");
+  const isGroupEditing = (window as any).__ip_compositeEditing && compositeKind === "sound" && compositeId === String(soundEl.dataset.nodeId ?? "");
   for (const t of els) {
     const sid = t.dataset.subId ?? "";
     const g = geoms[sid] ?? {};
@@ -2817,7 +3101,9 @@ function renderSoundCompositeButtons(soundEl: HTMLElement, layer: HTMLElement, d
   const hPx = Number(soundEl.dataset.soundHpx ?? "0");
   const wPx = Number(soundEl.dataset.soundWpx ?? "0");
   const box = hPx > 0 && wPx > 0 ? { width: wPx, height: hPx } : soundEl.getBoundingClientRect();
-  const isGroupEditing = soundEl.dataset.compositeEditing === "1";
+  const compositeId = String((window as any).__ip_compositeEditId ?? "");
+  const compositeKind = String((window as any).__ip_compositeEditKind ?? "");
+  const isGroupEditing = (window as any).__ip_compositeEditing && compositeKind === "sound" && compositeId === String(soundEl.dataset.nodeId ?? "");
   const appMode = getAppMode();
   for (const boxEl of els) {
     const sid = boxEl.dataset.subId ?? "";
@@ -2881,6 +3167,7 @@ function renderSoundCompositeArrows(soundEl: HTMLElement, layer: HTMLElement) {
   const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
   const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
   const soundId = layer.dataset.soundId ?? "sound";
+  const selectedArrowId = String((layer as any).dataset?.selectedPlotArrowId ?? "");
 
   const fr = _plotFracsForEl(soundEl);
   const ox = fr.leftF * w;
@@ -2931,6 +3218,18 @@ function renderSoundCompositeArrows(soundEl: HTMLElement, layer: HTMLElement) {
     path.setAttribute("fill", a.color ?? "white");
     marker.append(path);
     defs.append(marker);
+    const isSelected = selectedArrowId && String(a.id ?? "") === selectedArrowId;
+    if (isSelected) {
+      const glow = document.createElementNS("http://www.w3.org/2000/svg", "line");
+      glow.setAttribute("x1", String(x1));
+      glow.setAttribute("y1", String(y1));
+      glow.setAttribute("x2", String(x2));
+      glow.setAttribute("y2", String(y2));
+      glow.setAttribute("stroke", "rgba(110,168,255,0.95)");
+      glow.setAttribute("stroke-width", String(Math.min(48, lwPx + 10)));
+      glow.setAttribute("stroke-linecap", "round");
+      g.append(glow);
+    }
     const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
     line.setAttribute("x1", String(x1));
     line.setAttribute("y1", String(y1));
@@ -2959,7 +3258,7 @@ function gridSpacingForZoom(zoom: number, baseWorld = 100) {
   return { spacing0, spacing1, t };
 }
 
-type DragMode = "none" | "move" | "resize" | "rotate" | "line";
+type DragMode = "none" | "move" | "resize" | "rotate" | "line" | "graph";
 
 const _cursorSvgCss = (svg: string, hotX: number, hotY: number, fallback: string) => {
   const encoded = encodeURIComponent(svg).replace(/'/g, "%27").replace(/"/g, "%22");
@@ -3566,6 +3865,51 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const redoStack: PresentationModel[] = [];
   const cloneModel = (m: PresentationModel): PresentationModel => JSON.parse(JSON.stringify(m)) as PresentationModel;
 
+  // If the engine model is replaced while we're in isolate modes (composite edit / group edit / screen edit),
+  // the engine recreates DOM nodes, which can drop dataset/class-based interaction state.
+  // Wrap setModel once to re-apply those states deterministically after any setModel().
+  const anyEngine = engine as any;
+  if (!anyEngine.__ip_setModelWrapped) {
+    anyEngine.__ip_setModelWrapped = true;
+    const origSetModel = engine.setModel.bind(engine);
+    engine.setModel = ((m: any) => {
+      origSetModel(m);
+      try {
+        // Re-apply regular group edit dimming (if active).
+        const gid = activeGroupEditId?.();
+        if (gid) {
+          // applyGroupEditDimming is defined later in this closure; guard defensively.
+          try {
+            (anyEngine.__ip_applyGroupEditDimming ?? applyGroupEditDimming)?.();
+          } catch {}
+        }
+        // Re-apply composite edit marker + layer pointer-events (if active).
+        const cid = (window as any).__ip_compositeEditing ? (anyEngine.__ip_compositeEditTimerId ?? null) : null;
+        // We don't have closure access to compositeEditTimerId here, so also probe the DOM for the marker.
+        const compositeId =
+          typeof (window as any).__ip_compositeEditing === "boolean" && (window as any).__ip_compositeEditing
+            ? (anyEngine.__ip_lastCompositeId ?? null)
+            : null;
+        void cid;
+        const id = String(compositeId ?? "");
+        if (id) {
+          const el = engine.getNodeElement(id);
+          if (el && el.dataset.compositeEditing !== "1") {
+            const prev = el.dataset.compositeEditing;
+            el.dataset.compositeEditing = "1";
+            const layer =
+              el.querySelector<HTMLElement>(".timer-sub-layer") ?? el.querySelector<HTMLElement>(".sound-sub-layer") ?? null;
+            if (layer) layer.style.pointerEvents = "auto";
+            // eslint-disable-next-line no-console
+            console.log("[ip][dbg] restored compositeEditing after setModel", { id, prev });
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }) as any;
+  }
+
   const getActiveViewId = () => stage.dataset.viewId || activeViewId || "home";
 
   const nextId = (prefix: string) => {
@@ -3625,8 +3969,36 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     return pts.map((p) => ({ x: ax + p.x * cos - p.y * sin, y: ay + p.x * sin + p.y * cos }));
   };
 
+  // Regular group edit (node type "group"):
+  // Outside group edit, clicks on children resolve to the top-most group for ergonomics.
+  // Inside group edit, children should be directly selectable/editable.
+  const groupEditStack: string[] = [];
+  let groupHiddenEls: HTMLElement[] = [];
+  let groupRefEl: HTMLElement | null = null;
+  const activeGroupEditId = () => (groupEditStack.length > 0 ? groupEditStack[groupEditStack.length - 1]! : null);
+  const isDescendantOf = (id0: string, ancestorId: string, model: any) => {
+    const seen = new Set<string>();
+    let id = String(id0 ?? "");
+    const anc = String(ancestorId ?? "");
+    if (!id || !anc) return false;
+    while (true) {
+      if (id === anc) return true;
+      if (seen.has(id)) return false;
+      seen.add(id);
+      const n: any = model?.nodes?.find((x: any) => String(x.id) === id);
+      const p = String(n?.parentId ?? "").trim();
+      if (!p) return false;
+      id = p;
+    }
+  };
+  let enterGroupEdit: (groupId: string) => void = () => {};
+  let exitGroupEditLevel: () => void = () => {};
+
   const resolveSelectableId = (id0: string) => {
     const m = engine.getModel();
+    const gid = activeGroupEditId();
+    // In group edit mode: do NOT bubble selection to the parent group.
+    if (gid && m && isDescendantOf(id0, gid, m)) return String(id0);
     let id = id0;
     const seen = new Set<string>();
     while (true) {
@@ -3637,6 +4009,88 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (!p) return id;
       id = p;
     }
+  };
+
+  // --- Parent/group transforms (mirror engine layout) ---
+  const _worldTransformForId = (id0: string, model: any, memo?: Map<string, any>, resolving?: Set<string>): any => {
+    const id = String(id0 ?? "");
+    if (!id || !model) return null;
+    const mm = memo ?? new Map<string, any>();
+    const rs = resolving ?? new Set<string>();
+    if (mm.has(id)) return mm.get(id);
+    if (rs.has(id)) return null;
+    rs.add(id);
+    const node: any = model.nodes.find((n: any) => String(n.id) === id);
+    if (!node || node.space !== "world") {
+      rs.delete(id);
+      mm.set(id, node?.transform ?? null);
+      return node?.transform ?? null;
+    }
+    const parentId = String(node.parentId ?? "").trim();
+    if (!parentId) {
+      rs.delete(id);
+      mm.set(id, node.transform ?? null);
+      return node.transform ?? null;
+    }
+    const pt = _worldTransformForId(parentId, model, mm, rs) ?? (model.nodes.find((n: any) => String(n.id) === parentId) as any)?.transform;
+    const pr = (Number(pt?.rotationDeg ?? 0) * Math.PI) / 180;
+    const cos = Math.cos(pr);
+    const sin = Math.sin(pr);
+    const scale = Math.max(1e-6, Number(pt?.h ?? 1));
+    const lt = node.transform ?? { x: 0, y: 0, w: 0.1, h: 0.05 };
+    const lx = Number(lt.x ?? 0) * scale;
+    const ly = Number(lt.y ?? 0) * scale;
+    const rx = lx * cos - ly * sin;
+    const ry = lx * sin + ly * cos;
+    const out = {
+      x: Number(pt?.x ?? 0) + rx,
+      y: Number(pt?.y ?? 0) + ry,
+      w: Number(lt.w ?? 0.1) * scale,
+      h: Number(lt.h ?? 0.05) * scale,
+      rotationDeg: Number(pt?.rotationDeg ?? 0) + Number(lt.rotationDeg ?? 0),
+      anchor: lt.anchor ?? pt?.anchor ?? "topLeft"
+    };
+    rs.delete(id);
+    mm.set(id, out);
+    return out;
+  };
+
+  const _uiNodeForId = (id: string, model: any) => {
+    const node: any = model?.nodes?.find((n: any) => String(n.id) === String(id));
+    if (!node) return { node: null, ui: null, parentWorld: null };
+    const parentId = String(node.parentId ?? "").trim();
+    if (!parentId || node.space !== "world") return { node, ui: node, parentWorld: null };
+    const memo = new Map<string, any>();
+    const worldT = _worldTransformForId(id, model, memo, new Set<string>());
+    const parentWorld = _worldTransformForId(parentId, model, memo, new Set<string>());
+    const ui = { ...node, transform: worldT ?? node.transform };
+    return { node, ui, parentWorld };
+  };
+
+  const _worldPointToLocal = (parentWorld: any, worldX: number, worldY: number) => {
+    const pr = (Number(parentWorld?.rotationDeg ?? 0) * Math.PI) / 180;
+    const cos = Math.cos(pr);
+    const sin = Math.sin(pr);
+    const scale = Math.max(1e-6, Number(parentWorld?.h ?? 1));
+    const dx = worldX - Number(parentWorld?.x ?? 0);
+    const dy = worldY - Number(parentWorld?.y ?? 0);
+    const lx = (dx * cos + dy * sin) / scale;
+    const ly = (-dx * sin + dy * cos) / scale;
+    return { x: lx, y: ly };
+  };
+
+  const _toLocalTransformFromWorld = (worldT: any, parentWorld: any, localAnchor: string | undefined) => {
+    if (!parentWorld) return worldT;
+    const p = _worldPointToLocal(parentWorld, Number(worldT?.x ?? 0), Number(worldT?.y ?? 0));
+    const scale = Math.max(1e-6, Number(parentWorld?.h ?? 1));
+    return {
+      x: p.x,
+      y: p.y,
+      w: Number(worldT?.w ?? 0.1) / scale,
+      h: Number(worldT?.h ?? 0.05) / scale,
+      rotationDeg: Number(worldT?.rotationDeg ?? 0) - Number(parentWorld?.rotationDeg ?? 0),
+      anchor: localAnchor ?? "topLeft"
+    };
   };
 
   // Context menu removed (toolbar replaces it).
@@ -3859,13 +4313,14 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const addLineFromTo = async (
     from: { x: number; y: number },
     to: { x: number; y: number },
-    opts?: { space?: "world" | "screen" }
+    opts?: { space?: "world" | "screen"; select?: boolean }
   ) => {
     const model = engine.getModel();
     if (!model) return;
     const before = cloneModel(model);
     const id = nextId("line");
     const space = opts?.space === "screen" ? "screen" : "world";
+    const selectNew = opts?.select !== false;
 
     const wPx = 4; // default stroke px
     const cam = engine.getCamera();
@@ -3893,6 +4348,68 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const wN = space === "screen" ? w0 / Math.max(1, scr.w) : w0;
     const hN = space === "screen" ? h0 / Math.max(1, scr.h) : h0;
 
+    // Persist connectivity between line segments via junction IDs.
+    // - Each endpoint gets a join ID (p1Join / p2Join).
+    // - If the endpoint is close to an existing endpoint, reuse its join ID (creating it if missing).
+    const tolPx = 10;
+    const tolPx2 = tolPx * tolPx;
+    const newParentId = ""; // lines currently live at root; keep joins within the same parentId
+    const ensureJoin = (n0: any, key: "p1Join" | "p2Join") => {
+      const v = String(n0?.[key] ?? "").trim();
+      if (v) return v;
+      const j = nextId("j");
+      (n0 as any)[key] = j;
+      return j;
+    };
+    const endpointUiPt = (n0: any, which: "p1" | "p2") => {
+      const { ui } = _uiNodeForId(String(n0.id), model);
+      const tN = (ui as any)?.transform ?? n0.transform ?? {};
+      const fr = (n0 as any).from ?? { x: 0, y: 0.5 };
+      const tt = (n0 as any).to ?? { x: 1, y: 0.5 };
+      const tl = anchorToTopLeftWorld({
+        x: Number(tN.x ?? 0),
+        y: Number(tN.y ?? 0),
+        w: Number(tN.w ?? 1),
+        h: Number(tN.h ?? 1),
+        anchor: tN.anchor ?? "topLeft"
+      } as any);
+      const w = Math.max(1e-9, Number(tN.w ?? 1));
+      const h = Math.max(1e-9, Number(tN.h ?? 1));
+      const p1 = { x: tl.x + Number(fr.x ?? 0) * w, y: tl.y + Number(fr.y ?? 0) * h };
+      const p2 = { x: tl.x + Number(tt.x ?? 1) * w, y: tl.y + Number(tt.y ?? 0) * h };
+      return which === "p1" ? p1 : p2;
+    };
+    const uiToScreen = (sp: "world" | "screen", p: { x: number; y: number }) =>
+      sp === "world" ? worldToScreen(p, cam as any, scr as any) : { x: p.x * scr.w, y: p.y * scr.h };
+
+    // New endpoints in screen pixels (stable distance metric)
+    const newP1s = space === "world" ? worldToScreen(from, cam as any, scr as any) : { x: from.x, y: from.y };
+    const newP2s = space === "world" ? worldToScreen(to, cam as any, scr as any) : { x: to.x, y: to.y };
+
+    const pickExistingJoin = (pScreen: { x: number; y: number }) => {
+      let best: { n0: any; end: "p1" | "p2"; d2: number } | null = null;
+      for (const n0 of model.nodes as any[]) {
+        if (!n0 || String(n0.type) !== "line") continue;
+        if (String(n0.space ?? "world") !== space) continue;
+        const pid = String((n0 as any).parentId ?? "").trim();
+        if (pid !== newParentId) continue;
+        const q1 = endpointUiPt(n0, "p1");
+        const q2 = endpointUiPt(n0, "p2");
+        const q1s = uiToScreen(space, q1);
+        const q2s = uiToScreen(space, q2);
+        const d1 = (q1s.x - pScreen.x) ** 2 + (q1s.y - pScreen.y) ** 2;
+        const d2 = (q2s.x - pScreen.x) ** 2 + (q2s.y - pScreen.y) ** 2;
+        if (d1 <= tolPx2 && (!best || d1 < best.d2)) best = { n0, end: "p1", d2: d1 };
+        if (d2 <= tolPx2 && (!best || d2 < best.d2)) best = { n0, end: "p2", d2: d2 };
+      }
+      if (!best) return null;
+      const key = best.end === "p1" ? "p1Join" : "p2Join";
+      return ensureJoin(best.n0, key);
+    };
+
+    const p1Join = pickExistingJoin(newP1s) ?? nextId("j");
+    const p2Join = pickExistingJoin(newP2s) ?? nextId("j");
+
     const node: any = {
       id,
       type: "line",
@@ -3901,6 +4418,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       to: { x: tx, y: ty },
       color: "white",
       width: wPx,
+      p1Join,
+      p2Join,
       transform: { x: xN, y: yN, w: wN, h: hN, anchor: "topLeft", rotationDeg: 0 }
     };
     model.nodes.push(node);
@@ -3916,14 +4435,29 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
     engine.setModel(cloneModel(model));
     hydrateTextMath(engine, model);
+    if (selectNew) {
     selected.clear();
     selected.add(id);
     applySelection();
+    }
     await commit(before);
   };
 
-  const getOverlayEl = () =>
-    stage.querySelector<HTMLElement>(".overlay") ?? stage;
+  // IMPORTANT: `engine.setModel()` clears the engine overlay DOM subtree.
+  // The segment-draft preview must live OUTSIDE that subtree, otherwise it disappears after the first segment.
+  const getDraftLayerEl = () => {
+    let el = stage.querySelector<HTMLElement>(".ip-draft-layer");
+    if (!el) {
+      el = document.createElement("div");
+      el.className = "ip-draft-layer";
+      el.style.position = "absolute";
+      el.style.inset = "0";
+      el.style.pointerEvents = "none";
+      el.style.zIndex = "2"; // above the engine overlay (z=1)
+      stage.appendChild(el);
+    }
+    return el;
+  };
 
   const snapWorldPoint = (p: { x: number; y: number }, cam: any) => {
     const { spacing0, spacing1, t } = gridSpacingForZoom(Number(cam?.zoom ?? 1));
@@ -4025,11 +4559,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       // Only left click should start/commit drawing. Right click cancels (handled by contextmenu).
       if (ev.button !== 0) return;
       const t = ev.target as HTMLElement;
+      const isSegmentTool = tool === "arrow" || tool === "line";
       // Don’t interfere with normal manipulation when clicking nodes/handles/UI.
       if (
         t.closest(".edit-toolbox") ||
-        t.closest(".node") ||
-        t.closest(".handles") ||
+        (!isSegmentTool && t.closest(".node")) ||
+        (!isSegmentTool && t.closest(".handles")) ||
         t.closest(".modal") ||
         t.closest(".mode-toggle")
       )
@@ -4056,10 +4591,57 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       }
       if (tool === "arrow" || tool === "line") {
         const kind: "arrow" | "line" = tool === "line" ? "line" : "arrow";
-        const overlay = getOverlayEl();
+        const overlay = getDraftLayerEl();
 
-        // Snap point placement to grid ONLY while Shift is held and only in world space.
-        if (space === "world" && ev.shiftKey) pos = snapWorldPoint(pos, cam as any);
+        // Shift snapping while placing:
+        // - world: snap to junction if closer than grid; otherwise grid
+        // - screen: snap to junction within tolerance
+        if (ev.shiftKey) {
+          const modelNow = engine.getModel();
+          const tolPx = 12;
+          const tolPx2 = tolPx * tolPx;
+          const toScreenPt = (p: { x: number; y: number }) =>
+            space === "world" ? worldToScreen(p, cam as any, scr as any) : { x: p.x, y: p.y }; // already px in screen space
+          const dist2px = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+            const dx = a.x - b.x;
+            const dy = a.y - b.y;
+            return dx * dx + dy * dy;
+          };
+
+          // Collect line endpoints in the same space.
+          const junctions: Array<{ x: number; y: number }> = [];
+          for (const n0 of (modelNow?.nodes as any[]) ?? []) {
+            if (!n0 || String(n0.type) !== "line") continue;
+            if (String(n0.space ?? "world") !== space) continue;
+            const { ui } = modelNow ? _uiNodeForId(String(n0.id), modelNow) : { ui: null as any };
+            const tN = (ui as any)?.transform ?? n0.transform ?? {};
+            const fr = (n0 as any).from ?? { x: 0, y: 0.5 };
+            const to = (n0 as any).to ?? { x: 1, y: 0.5 };
+            const tl = anchorToTopLeftWorld({ x: Number(tN.x ?? 0), y: Number(tN.y ?? 0), w: Number(tN.w ?? 1), h: Number(tN.h ?? 1), anchor: tN.anchor ?? "topLeft" } as any);
+            const w = Math.max(1e-9, Number(tN.w ?? 1));
+            const h = Math.max(1e-9, Number(tN.h ?? 1));
+            const q1 = { x: tl.x + Number(fr.x ?? 0) * w, y: tl.y + Number(fr.y ?? 0) * h };
+            const q2 = { x: tl.x + Number(to.x ?? 1) * w, y: tl.y + Number(to.y ?? 0) * h };
+            junctions.push(q1, q2);
+          }
+
+          // Nearest junction.
+          const ps = toScreenPt(pos as any);
+          let bestJ: { p: { x: number; y: number }; d2: number } | null = null;
+          for (const j of junctions) {
+            const d2 = dist2px(toScreenPt(j), ps);
+            if (!bestJ || d2 < bestJ.d2) bestJ = { p: j, d2 };
+          }
+
+          if (space === "world") {
+            const gridPt = snapWorldPoint(pos as any, cam as any);
+            const gridD2 = dist2px(toScreenPt(gridPt), ps);
+            if (bestJ && bestJ.d2 <= tolPx2 && bestJ.d2 < gridD2 - 1e-6) pos = bestJ.p as any;
+            else pos = gridPt as any;
+          } else {
+            if (bestJ && bestJ.d2 <= tolPx2) pos = bestJ.p as any;
+          }
+        }
 
         const posScreen = space === "screen" ? pos : worldToScreen(pos, cam as any, scr as any);
 
@@ -4079,7 +4661,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           syncViewBox();
           updateSegmentPreview(segmentDraft, posScreen);
         } else {
-          // Second click: commit node to the model and remove preview.
+          // Next click: commit node to the model.
           if (segmentDraft.kind !== kind || segmentDraft.space !== space) {
             // If the user switched tool/space mid-draft, cancel and restart cleanly.
             segmentDraft.previewSvg.remove();
@@ -4090,10 +4672,20 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
             updateSegmentPreview(segmentDraft, posScreen);
           } else {
             const start = segmentDraft.start;
+            // Commit a segment
+            if (kind === "line") {
+              // Polyline behavior: keep drafting; next segment starts at the previous endpoint.
+              void addLineFromTo(start, pos, { space, select: false });
+              segmentDraft.start = pos;
+              segmentDraft.startScreen = posScreen;
+              // Reset preview to a zero-length segment at the new anchor; pointermove will extend it.
+              updateSegmentPreview(segmentDraft, posScreen);
+            } else {
+              // Arrow behavior: single segment, then stop.
             segmentDraft.previewSvg.remove();
             segmentDraft = null;
-            if (kind === "line") void addLineFromTo(start, pos, { space });
-            else void addArrowFromTo(start, pos, { space });
+              void addArrowFromTo(start, pos, { space });
+            }
           }
         }
         ev.preventDefault();
@@ -4112,7 +4704,49 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const scr = engine.getScreen();
       const screenPos = { x: ev.clientX - r.left, y: ev.clientY - r.top };
       let pos = segmentDraft.space === "screen" ? screenPos : screenToWorld(screenPos, cam as any, scr as any);
-      if (segmentDraft.space === "world" && ev.shiftKey) pos = snapWorldPoint(pos, cam as any);
+      if (ev.shiftKey) {
+        const modelNow = engine.getModel();
+        const tolPx = 12;
+        const tolPx2 = tolPx * tolPx;
+        const space: "world" | "screen" = segmentDraft.space;
+        const toScreenPt = (p: { x: number; y: number }) =>
+          space === "world" ? worldToScreen(p, cam as any, scr as any) : { x: p.x, y: p.y };
+        const dist2px = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          return dx * dx + dy * dy;
+        };
+        const junctions: Array<{ x: number; y: number }> = [];
+        for (const n0 of (modelNow?.nodes as any[]) ?? []) {
+          if (!n0 || String(n0.type) !== "line") continue;
+          if (String(n0.space ?? "world") !== space) continue;
+          const { ui } = modelNow ? _uiNodeForId(String(n0.id), modelNow) : { ui: null as any };
+          const tN = (ui as any)?.transform ?? n0.transform ?? {};
+          const fr = (n0 as any).from ?? { x: 0, y: 0.5 };
+          const to = (n0 as any).to ?? { x: 1, y: 0.5 };
+          const tl = anchorToTopLeftWorld({ x: Number(tN.x ?? 0), y: Number(tN.y ?? 0), w: Number(tN.w ?? 1), h: Number(tN.h ?? 1), anchor: tN.anchor ?? "topLeft" } as any);
+          const w = Math.max(1e-9, Number(tN.w ?? 1));
+          const h = Math.max(1e-9, Number(tN.h ?? 1));
+          const q1 = { x: tl.x + Number(fr.x ?? 0) * w, y: tl.y + Number(fr.y ?? 0) * h };
+          const q2 = { x: tl.x + Number(to.x ?? 1) * w, y: tl.y + Number(to.y ?? 0) * h };
+          junctions.push(q1, q2);
+        }
+        const ps = toScreenPt(pos as any);
+        let bestJ: { p: { x: number; y: number }; d2: number } | null = null;
+        for (const j of junctions) {
+          const d2 = dist2px(toScreenPt(j), ps);
+          if (!bestJ || d2 < bestJ.d2) bestJ = { p: j, d2 };
+        }
+
+        if (space === "world") {
+          const gridPt = snapWorldPoint(pos as any, cam as any);
+          const gridD2 = dist2px(toScreenPt(gridPt), ps);
+          if (bestJ && bestJ.d2 <= tolPx2 && bestJ.d2 < gridD2 - 1e-6) pos = bestJ.p as any;
+          else pos = gridPt as any;
+        } else {
+          if (bestJ && bestJ.d2 <= tolPx2) pos = bestJ.p as any;
+        }
+      }
       const posScreen = segmentDraft.space === "screen" ? pos : worldToScreen(pos, cam as any, scr as any);
       // Keep preview stroke matching final canvas stroke scaling (world space scales with zoom).
       const z = segmentDraft.space === "world" ? Number(cam.zoom ?? 1) : 1;
@@ -4120,7 +4754,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       segmentDraft.lineEl.setAttribute("stroke-width", String(previewStroke));
       segmentDraft.lineEl.setAttribute("stroke-dasharray", `${10 * z} ${10 * z}`);
       // Keep viewBox stable with overlay resizing.
-      const overlay = getOverlayEl();
+      const overlay = getDraftLayerEl();
       const w = Math.max(1, overlay.clientWidth);
       const h = Math.max(1, overlay.clientHeight);
       segmentDraft.previewSvg.setAttribute("viewBox", `0 0 ${w} ${h}`);
@@ -4135,6 +4769,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (segmentDraft) {
       segmentDraft.previewSvg.remove();
       segmentDraft = null;
+      ev.preventDefault();
     }
   });
 
@@ -4146,9 +4781,24 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (segmentDraft) {
       segmentDraft.previewSvg.remove();
       segmentDraft = null;
+      return; // cancel preview only
     }
     clearSelection();
   });
+
+  // Ensure table edit is committed when clicking elsewhere (works in live+edit).
+  window.addEventListener(
+    "pointerdown",
+    (ev) => {
+      if (!__activeTableEdit) return;
+      const t = ev.target as HTMLElement;
+      if (t === __activeTableEdit.input || t.closest(".ip-table-input")) return;
+      // If clicking inside the same cell, allow the input to handle it.
+      if (t.closest("td.table-cell") === __activeTableEdit.td) return;
+      void _endActiveTableEdit({ commit: true });
+    },
+    { capture: true }
+  );
 
   const addImageAt = async (
     pos: { x: number; y: number },
@@ -4325,6 +4975,176 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   let startNodesById: Record<string, any> | null = null;
   let startAngleRad = 0;
   let startRotationDeg = 0;
+  // When dragging a line junction (endpoint) or moving a whole segment,
+  // move all coincident endpoints together so lines behave like a graph (shared junction nodes).
+  let junctionDrag:
+    | null
+    | {
+        movedId: string;
+        space: "world" | "screen";
+        // Links for each endpoint of the moved segment (so mid-drag keeps both junctions connected).
+        p1Links: Array<{ id: string; end: "p1" | "p2"; other: { x: number; y: number }; parentWorldT: any | null }>;
+        p2Links: Array<{ id: string; end: "p1" | "p2"; other: { x: number; y: number }; parentWorldT: any | null }>;
+        // Candidate junctions for snap-to-graph (endpoints of other lines).
+        junctions: Array<{ x: number; y: number }>;
+      } = null;
+
+  // When dragging far from the stroke (>20px), translate the entire connected component of lines ("graph drag").
+  let graphDrag:
+    | null
+    | {
+        ids: string[];
+        space: "world" | "screen";
+        // Reference point for snapping translation (in the same space units).
+        ref: { x: number; y: number };
+      } = null;
+
+  const _collectConnectedLineIds = (
+    seedId: string,
+    model: any,
+    space: "world" | "screen",
+    cam: any,
+    scr: any,
+    parentId: string
+  ) => {
+    // Prefer explicit join IDs if present; fall back to proximity-based welding for legacy segments.
+    const joinToLineIds = new Map<string, string[]>();
+    const joinsByLineId = new Map<string, string[]>();
+    for (const n0 of (model?.nodes as any[]) ?? []) {
+      if (!n0 || String(n0.type) !== "line") continue;
+      if (String(n0.space ?? "world") !== space) continue;
+      const pid = String((n0 as any)?.parentId ?? "").trim();
+      if (pid !== String(parentId ?? "").trim()) continue;
+      const nid = String(n0.id ?? "");
+      if (!nid) continue;
+      const j1 = String((n0 as any).p1Join ?? "").trim();
+      const j2 = String((n0 as any).p2Join ?? "").trim();
+      const js = [j1, j2].filter(Boolean);
+      if (js.length) {
+        joinsByLineId.set(nid, js);
+        for (const j of js) {
+          const arr = joinToLineIds.get(j) ?? [];
+          arr.push(nid);
+          joinToLineIds.set(j, arr);
+        }
+      }
+    }
+    const seedJoins = joinsByLineId.get(seedId) ?? [];
+    if (seedJoins.length && joinToLineIds.size) {
+      const visited = new Set<string>();
+      const q: string[] = [seedId];
+      visited.add(seedId);
+      while (q.length) {
+        const cur = q.shift()!;
+        const js = joinsByLineId.get(cur) ?? [];
+        for (const j of js) {
+          const neigh = joinToLineIds.get(j) ?? [];
+          for (const id of neigh) {
+            if (visited.has(id)) continue;
+            visited.add(id);
+            q.push(id);
+          }
+        }
+      }
+      return Array.from(visited);
+    }
+
+    const tolPx = 10;
+    const tolPx2 = tolPx * tolPx;
+    const cell = tolPx;
+
+    const toScreenPt = (p: { x: number; y: number }) =>
+      space === "world" ? worldToScreen(p, cam as any, scr as any) : { x: p.x * scr.w, y: p.y * scr.h };
+
+    const dist2 = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+      const dx = a.x - b.x;
+      const dy = a.y - b.y;
+      return dx * dx + dy * dy;
+    };
+
+    // Compute line endpoints in `space` units + their screen px projection.
+    const lineIds: string[] = [];
+    const endpointsById = new Map<string, { p1: { s: { x: number; y: number } }; p2: { s: { x: number; y: number } } }>();
+    const buckets = new Map<string, Array<{ id: string; s: { x: number; y: number } }>>();
+    const put = (id: string, s: { x: number; y: number }) => {
+      const cx = Math.floor(s.x / cell);
+      const cy = Math.floor(s.y / cell);
+      const k = `${cx},${cy}`;
+      const arr = buckets.get(k) ?? [];
+      arr.push({ id, s });
+      buckets.set(k, arr);
+    };
+
+    for (const n0 of (model?.nodes as any[]) ?? []) {
+      if (!n0 || String(n0.type) !== "line") continue;
+      if (String(n0.space ?? "world") !== space) continue;
+      const pid = String((n0 as any)?.parentId ?? "").trim();
+      if (pid !== String(parentId ?? "").trim()) continue;
+
+      const nid = String(n0.id ?? "");
+      if (!nid) continue;
+      lineIds.push(nid);
+
+      const { ui } = _uiNodeForId(nid, model);
+      const tN = (ui as any)?.transform ?? n0.transform ?? {};
+      const fr = (n0 as any).from ?? { x: 0, y: 0.5 };
+      const to = (n0 as any).to ?? { x: 1, y: 0.5 };
+      const tl = anchorToTopLeftWorld({
+        x: Number(tN.x ?? 0),
+        y: Number(tN.y ?? 0),
+        w: Number(tN.w ?? 1),
+        h: Number(tN.h ?? 1),
+        anchor: tN.anchor ?? "topLeft"
+      } as any);
+      const w = Math.max(1e-9, Number(tN.w ?? 1));
+      const h = Math.max(1e-9, Number(tN.h ?? 1));
+      const p1 = { x: tl.x + Number(fr.x ?? 0) * w, y: tl.y + Number(fr.y ?? 0) * h };
+      const p2 = { x: tl.x + Number(to.x ?? 1) * w, y: tl.y + Number(to.y ?? 0) * h };
+      const s1 = toScreenPt(p1);
+      const s2 = toScreenPt(p2);
+      endpointsById.set(nid, { p1: { s: s1 }, p2: { s: s2 } });
+      put(nid, s1);
+      put(nid, s2);
+    }
+
+    if (!endpointsById.has(seedId)) return [seedId];
+
+    const visited = new Set<string>();
+    const q: string[] = [seedId];
+    visited.add(seedId);
+
+    const neighborsFor = (s: { x: number; y: number }) => {
+      const cx = Math.floor(s.x / cell);
+      const cy = Math.floor(s.y / cell);
+      const out: Array<{ id: string; s: { x: number; y: number } }> = [];
+      for (let dx = -1; dx <= 1; dx++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          const k = `${cx + dx},${cy + dy}`;
+          const arr = buckets.get(k);
+          if (arr) out.push(...arr);
+        }
+      }
+      return out;
+    };
+
+    while (q.length) {
+      const cur = q.shift()!;
+      const e = endpointsById.get(cur);
+      if (!e) continue;
+      const pts = [e.p1.s, e.p2.s];
+      for (const p of pts) {
+        for (const cand of neighborsFor(p)) {
+          if (visited.has(cand.id)) continue;
+          if (dist2(cand.s, p) <= tolPx2) {
+            visited.add(cand.id);
+            q.push(cand.id);
+          }
+        }
+      }
+    }
+
+    return Array.from(visited);
+  };
   // For composite-heavy nodes (timer/sound) we delay starting drag until the user actually moves,
   // otherwise the immediate pointerdown preventDefault can suppress native dblclick.
   let pendingCompositeDrag:
@@ -4482,6 +5302,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       stage.style.cursor = "";
       return;
     }
+    // If hovering interactive UI chrome, do not show editor cursors (avoid fighting with controls).
     if (elAt.closest(".edit-toolbox") || elAt.closest(".modal") || elAt.closest(".mode-toggle")) {
       stage.style.cursor = "";
       return;
@@ -4507,36 +5328,95 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
     const model = engine.getModel();
 
+    // Pick the smallest node under the cursor (root-mode behavior), but based on the browser's
+    // hit-test stack (`elementsFromPoint`) so non-interactive reference boxes never affect picking/cursors.
+    function pickSmallestRawNodeIdAtClientPoint(model0: any, x: number, y: number): string | null {
+      if (!model0) return null;
+      const gid = activeGroupEditId();
+      const els = (document.elementsFromPoint?.(x, y) ?? []) as HTMLElement[];
+      let best: { id: string; size: number; order: number } | null = null;
+      for (let i = 0; i < els.length; i++) {
+        const e = els[i] as any;
+        const nodeEl = (e?.closest?.(".node") as HTMLElement | null) ?? null;
+        if (!nodeEl?.dataset?.nodeId) continue;
+        const rawId = String(nodeEl.dataset.nodeId ?? "");
+        if (!rawId) continue;
+        // Group edit scope: only descendants are interactive; group root is reference.
+        if (gid) {
+          if (rawId === gid) continue;
+          if (!isDescendantOf(rawId, gid, model0)) continue;
+        }
+        const n0: any = model0.nodes.find((n: any) => String(n.id) === rawId);
+        if (!n0) continue;
+        // Screen edit scope
+        if (screenEditMode) {
+          if (String(n0?.space ?? "world") !== "screen") continue;
+        } else {
+          if (String(n0?.space ?? "world") === "screen") continue;
+        }
+        const type = String(n0?.type ?? "");
+        const r0 = nodeEl.getBoundingClientRect();
+        if (!(r0.width > 0.5 && r0.height > 0.5)) continue;
+        let size = Math.max(1e-6, r0.width * r0.height);
+        if (type === "arrow" || type === "line") {
+          const seg = hitTestSegmentHandle(nodeEl, x, y);
+          if (!seg) continue;
+          const fx = Number(nodeEl.dataset.fromX ?? "0");
+          const fy = Number(nodeEl.dataset.fromY ?? "0.5");
+          const tx = Number(nodeEl.dataset.toX ?? "1");
+          const ty = Number(nodeEl.dataset.toY ?? "0.5");
+          const p1 = { x: r0.left + fx * r0.width, y: r0.top + fy * r0.height };
+          const p2 = { x: r0.left + tx * r0.width, y: r0.top + ty * r0.height };
+          const lenPx = Math.max(1, Math.hypot(p2.x - p1.x, p2.y - p1.y));
+          const wRaw = Number((n0 as any)?.width ?? 4);
+          const cam = engine.getCamera();
+          const strokePx =
+            wRaw <= 1
+              ? Math.max(1, wRaw * Math.max(1, Math.min(r0.width, r0.height)))
+              : Math.max(1, wRaw * (String((n0 as any)?.space ?? "world") === "world" ? Number(cam.zoom ?? 1) : 1));
+          size = Math.max(1e-6, lenPx * strokePx);
+        }
+        const cand = { id: rawId, size, order: i };
+        if (!best) best = cand;
+        else if (cand.size < best.size - 1e-6) best = cand;
+        else if (Math.abs(cand.size - best.size) <= 1e-6) {
+          // Tie: choose the topmost element (earlier in elementsFromPoint list).
+          if (cand.order < best.order) best = cand;
+        }
+      }
+      return best?.id ?? null;
+    }
+
     // Prefer showing "grab" when hovering ANY node body, even if not selected.
-    const hoveredNodeEl = elAt.closest<HTMLElement>(".node");
-    if (hoveredNodeEl?.dataset.nodeId && model) {
-      const rawId = hoveredNodeEl.dataset.nodeId;
-      const id = resolveSelectableId(rawId);
-      const node: any = model.nodes.find((n: any) => n.id === id);
-      if (node) {
+    if (model) {
+      const rawPicked = pickSmallestRawNodeIdAtClientPoint(model, clientX, clientY);
+      const id = rawPicked ? resolveSelectableId(rawPicked) : "";
+      const nodeEl = id ? engine.getNodeElement(id) : null;
+      const { ui: node } = id ? _uiNodeForId(id, model) : { ui: null as any };
+      if (node && nodeEl) {
         if (node.type === "arrow" || node.type === "line") {
-          const seg = hitTestSegmentHandle(hoveredNodeEl, clientX, clientY);
+          const seg = hitTestSegmentHandle(nodeEl, clientX, clientY);
           stage.style.cursor = seg ? "grab" : "";
           return;
         }
 
         // If hovering the selected node, keep handle cursors + interior grab.
         if (selected.size === 1 && selected.has(id)) {
-          const hnd = hitTestTransformHandleForNode(hoveredNodeEl, node, clientX, clientY);
+          const hnd = hitTestTransformHandleForNode(nodeEl, node, clientX, clientY);
           if (hnd) {
             stage.style.cursor = cursorForHandleWithRotation(hnd, Number(node?.transform?.rotationDeg ?? 0));
             return;
           }
-          stage.style.cursor = isPointInsideNodeInteriorForNode(hoveredNodeEl, node, clientX, clientY) ? "grab" : "";
+          stage.style.cursor = isPointInsideNodeInteriorForNode(nodeEl, node, clientX, clientY) ? "grab" : "";
           return;
         }
 
         // Unselected node: show grab anywhere inside its rect.
-        const eff = effectiveNodeRectClient(hoveredNodeEl, node);
+        const eff = effectiveNodeRectClient(nodeEl, node);
         if (eff) {
           stage.style.cursor = isPointInRotatedRectClient(eff, Number(node?.transform?.rotationDeg ?? 0), clientX, clientY) ? "grab" : "";
         } else {
-          const { lx, ly, hw, hh } = localPtForRect(hoveredNodeEl.getBoundingClientRect(), Number(node?.transform?.rotationDeg ?? 0), clientX, clientY);
+          const { lx, ly, hw, hh } = localPtForRect(nodeEl.getBoundingClientRect(), Number(node?.transform?.rotationDeg ?? 0), clientX, clientY);
           stage.style.cursor = Math.abs(lx) <= hw && Math.abs(ly) <= hh ? "grab" : "";
         }
         return;
@@ -4547,7 +5427,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // still show handle cursors.
     if (selected.size === 1 && model) {
       const id = Array.from(selected)[0];
-      const node: any = model.nodes.find((n: any) => n.id === id);
+      const { ui: node } = _uiNodeForId(id, model);
       const nodeEl = engine.getNodeElement(id);
       if (node && nodeEl) {
         if (node.type === "arrow" || node.type === "line") {
@@ -5112,6 +5992,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   const finishDrag = async () => {
     // Always clear pending composite drag.
     pendingCompositeDrag = null;
+    junctionDrag = null;
+    graphDrag = null;
     if (dragMode === "none" && !startSnapshot) return;
     dragMode = "none";
     activeHandle = null;
@@ -5214,6 +6096,87 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
   };
 
+  const applyGroupEditDimming = () => {
+    const model = engine.getModel();
+    const gid = activeGroupEditId();
+    // Clear previous dimming.
+    for (const e of groupHiddenEls) e.classList.remove("ip-dim-node");
+    groupHiddenEls = [];
+    if (groupRefEl) groupRefEl.classList.remove("ip-group-ref");
+    groupRefEl = null;
+    if (!gid || !model) return;
+    for (const n of model.nodes as any[]) {
+      const id = String(n?.id ?? "");
+      if (!id) continue;
+      const el = engine.getNodeElement(id);
+      if (!el) continue;
+      if (id === gid) {
+        // The group root is a REFERENCE element in group edit:
+        // - keep it visible (faint)
+        // - never allow it to capture pointer events / selection
+        el.classList.remove("ip-dim-node");
+        el.classList.add("ip-group-ref");
+        groupRefEl = el;
+        continue;
+      }
+      const inSubtree = isDescendantOf(id, gid, model);
+      if (inSubtree) {
+        el.classList.remove("ip-dim-node");
+      } else {
+        el.classList.add("ip-dim-node");
+        groupHiddenEls.push(el);
+      }
+    }
+  };
+
+  enterGroupEdit = (groupId: string) => {
+    if (getAppMode() !== "edit") return;
+    const model = engine.getModel();
+    const gid = String(groupId ?? "");
+    if (!gid || !model) return;
+    const node: any = model.nodes.find((n: any) => String(n.id) === gid);
+    if (!node || String(node.type) !== "group") return;
+    // Avoid conflicting isolate modes.
+    exitScreenEdit();
+    (window as any).__ip_exitCompositeEdit?.();
+    if (groupEditStack[groupEditStack.length - 1] !== gid) groupEditStack.push(gid);
+    clearSelection();
+    applyGroupEditDimming();
+    // Refresh hover cursor immediately (so it matches root mode without needing a mouse move).
+    {
+      const mx = (window as any).__ip_lastMouseX;
+      const my = (window as any).__ip_lastMouseY;
+      if (typeof mx === "number" && typeof my === "number") updateStageCursorFromClientPoint(mx, my);
+    }
+    const modeBtn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+    if (modeBtn) modeBtn.textContent = "Exit group edit";
+    (window as any).__ip_exitGroupEdit = exitGroupEditLevel;
+  };
+
+  exitGroupEditLevel = () => {
+    if (groupEditStack.length === 0) return;
+    groupEditStack.pop();
+    clearSelection();
+    applyGroupEditDimming();
+    if (groupEditStack.length === 0) {
+      for (const e of groupHiddenEls) e.classList.remove("ip-dim-node");
+      groupHiddenEls = [];
+      if (groupRefEl) groupRefEl.classList.remove("ip-group-ref");
+      groupRefEl = null;
+      const wrap = document.querySelector<HTMLElement>(".mode-toggle");
+      const mode = (wrap?.dataset.mode ?? "edit").toLowerCase();
+      const btn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+      if (btn) btn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
+      delete (window as any).__ip_exitGroupEdit;
+    }
+    // Refresh hover cursor immediately after exit.
+    {
+      const mx = (window as any).__ip_lastMouseX;
+      const my = (window as any).__ip_lastMouseY;
+      if (typeof mx === "number" && typeof my === "number") updateStageCursorFromClientPoint(mx, my);
+    }
+  };
+
   const selectOne = (id: string) => {
     selected.clear();
     selected.add(id);
@@ -5246,6 +6209,168 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     await saveModel(after);
   };
 
+  const _tableCellFlatIdx0 = (rows: any[][], row: number, col: number) => {
+    let idx = 0;
+    for (let r = 0; r < row; r++) idx += (rows?.[r]?.length ?? 0);
+    return idx + col;
+  };
+
+  const _tableColCount = (rows: any[][]) => {
+    const headerLen = Array.isArray(rows?.[0]) ? rows[0].length : 0;
+    // Fallback: max row length
+    const maxLen = Math.max(0, ...((rows ?? []) as any[]).map((r) => (Array.isArray(r) ? r.length : 0)));
+    return Math.max(1, headerLen, maxLen);
+  };
+
+  const _ensureTableCellExists = (tableId: string, row: number, col: number) => {
+    const model = engine.getModel();
+    if (!model) return;
+    const node: any = model.nodes.find((n: any) => String(n.id) === tableId);
+    if (!node) return;
+    const rows = (node.rows ?? []).map((r: any) => (Array.isArray(r) ? [...r] : [])) as string[][];
+    const colCount = _tableColCount(rows as any);
+    while (rows.length <= row) rows.push(new Array(colCount).fill(""));
+    while ((rows[row]?.length ?? 0) < colCount) rows[row].push("");
+    // Ensure at least up to `col`.
+    while ((rows[row]?.length ?? 0) <= col) rows[row].push("");
+    engine.updateNode(tableId, { rows } as any);
+  };
+
+  const _findTableCellTd = (tableId: string, row: number, col: number) => {
+    const nodeEl = engine.getNodeElement(tableId);
+    const table = nodeEl?.querySelector("table") as HTMLTableElement | null;
+    const tr = table?.rows?.[row] ?? null;
+    const td = (tr?.cells?.[col] as HTMLTableCellElement | undefined) ?? null;
+    if (!td) return null;
+    if (!td.classList.contains("table-cell")) td.classList.add("table-cell");
+    return td;
+  };
+
+  const _gotoNextTableCell = async (tableId: string, row: number, col: number) => {
+    const model = engine.getModel();
+    const node: any = model?.nodes?.find?.((n: any) => String(n.id) === tableId);
+    const rows = (node?.rows ?? []) as any[][];
+    const colCount = _tableColCount(rows as any);
+    let nr = row;
+    let nc = col + 1;
+    if (nc >= colCount) {
+      nr = row + 1;
+      nc = 0;
+    }
+    // Extend table if needed (wrap beyond last row).
+    _ensureTableCellExists(tableId, nr, nc);
+    // Allow engine to rebuild DOM before locating cell.
+    await new Promise<void>((r) => setTimeout(() => r(), 0));
+    const td2 = _findTableCellTd(tableId, nr, nc);
+    if (td2) await _beginTableCellEdit(td2, tableId, nr, nc);
+  };
+
+  const _endActiveTableEdit = async (opts?: { commit?: boolean }) => {
+    const a = __activeTableEdit;
+    if (!a) return;
+    __activeTableEdit = null;
+    const td = a.td;
+    const val = String(a.input.value ?? "");
+    const shouldCommit = opts?.commit !== false;
+    // Remove input first (engine updates may rebuild DOM).
+    try {
+      a.input.remove();
+    } catch {}
+    if (!shouldCommit) {
+      (td.dataset as any).raw = a.beforeValue;
+      renderTextToElement(td, a.beforeValue);
+      return;
+    }
+    if (val === a.beforeValue) {
+      (td.dataset as any).raw = val;
+      renderTextToElement(td, val);
+      return;
+    }
+
+    const model = engine.getModel();
+    if (!model) return;
+    const node: any = model.nodes.find((n: any) => String(n.id) === a.tableId);
+    if (!node) return;
+
+    const before = getAppMode() === "edit" ? cloneModel(model) : null;
+    const rows = (node.rows ?? []).map((r: any) => (Array.isArray(r) ? [...r] : [])) as string[][];
+    while (rows.length <= a.row) rows.push([]);
+    while ((rows[a.row]?.length ?? 0) <= a.col) rows[a.row].push("");
+    rows[a.row][a.col] = val;
+
+    engine.updateNode(a.tableId, { rows } as any);
+    // Re-hydrate math in table cells (engine sets data-raw on td).
+    const after = engine.getModel();
+    if (after) hydrateTextMath(engine, after);
+
+    // Expose state for consumers.
+    (window as any).__ip_tableData = (window as any).__ip_tableData ?? {};
+    (window as any).__ip_tableData[a.tableId] = rows;
+
+    // Dispatch a generic change event (listen by id) and include both flat and 2D indices.
+    const cellIdx0 = _tableCellFlatIdx0(rows as any, a.row, a.col);
+    const detail = { id: a.tableId, row: a.row, col: a.col, cellIdx: cellIdx0, index: cellIdx0 + 1, value: val };
+    window.dispatchEvent(new CustomEvent(`${a.tableId}-change`, { detail }));
+    // Persist only in edit mode.
+    await commit(before);
+  };
+
+  const _beginTableCellEdit = async (td: HTMLTableCellElement, tableId: string, row: number, col: number) => {
+    // Finish any previous edit first (commit).
+    await _endActiveTableEdit({ commit: true });
+
+    const raw = String((td.dataset as any).raw ?? td.textContent ?? "");
+    td.innerHTML = "";
+
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = raw;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    input.className = "ip-table-input";
+    input.style.width = "100%";
+    input.style.height = "100%";
+    input.style.border = "none";
+    input.style.outline = "none";
+    input.style.background = "transparent";
+    input.style.color = "rgba(255,255,255,0.95)";
+    input.style.font = "inherit";
+    input.style.padding = "0 6px";
+    // Let selection/caret work even in live mode.
+    (td.style as any).userSelect = "text";
+
+    td.appendChild(input);
+    __activeTableEdit = { tableId, row, col, td, input, beforeValue: raw };
+
+    // Focus on next tick to ensure DOM is ready.
+    queueMicrotask(() => {
+      try {
+        input.focus();
+        input.select();
+      } catch {}
+    });
+
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        const cur = __activeTableEdit;
+        if (!cur) return;
+        void (async () => {
+          const { tableId, row, col } = cur;
+          await _endActiveTableEdit({ commit: true });
+          await _gotoNextTableCell(tableId, row, col);
+        })();
+        return;
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        void _endActiveTableEdit({ commit: false });
+        return;
+      }
+    });
+    input.addEventListener("blur", () => void _endActiveTableEdit({ commit: true }));
+  };
+
   const deleteSelection = async () => {
     const model = engine.getModel();
     if (!model) return;
@@ -5255,7 +6380,8 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const del = new Set(selected);
     model.nodes = model.nodes.filter((n) => !del.has(n.id));
     for (const v of model.views) v.show = v.show.filter((id) => !del.has(id));
-    engine.setModel(model);
+    // IMPORTANT: always pass a fresh object; some engine internals assume model identity changes.
+    engine.setModel(cloneModel(model));
     await hydrateQrImages(engine, model);
     hydrateTextMath(engine, model);
     selected.clear();
@@ -5433,6 +6559,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           return;
         }
 
+        if (state.type === "video") {
+          body.append(mkText("src", "src", "YouTube URL or /media/<file>.mp4 (or just <file>.mp4)"));
+          body.append(mkText("thumbnail", "thumbnail", 'Optional: "MM:SS" / "HH:MM:SS" / "/media/thumb.jpg" / "https://..."'));
+          return;
+        }
+
         if (state.type === "bullets") {
           const f = document.createElement("div");
           f.className = "field";
@@ -5507,6 +6639,51 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           });
           rowsF.append(ta);
           body.append(delimF, rowsF);
+          return;
+        }
+
+        if (state.type === "graph") {
+          const grid = document.createElement("div");
+          grid.style.display = "grid";
+          grid.style.gridTemplateColumns = "repeat(2, 1fr)";
+          grid.style.gap = "12px";
+          const mkText = (label: string, key: string, placeholder = "") => {
+            const f = document.createElement("div");
+            f.className = "field";
+            f.innerHTML = `<label>${label}</label>`;
+            const i = document.createElement("input");
+            i.type = "text";
+            i.placeholder = placeholder;
+            i.value = String((state as any)[key] ?? "");
+            i.addEventListener("input", () => ((state as any)[key] = i.value));
+            f.appendChild(i);
+            return f;
+          };
+          const mkSel = (label: string, key: string, opts: string[]) => {
+            const f = document.createElement("div");
+            f.className = "field";
+            f.innerHTML = `<label>${label}</label>`;
+            const s = document.createElement("select");
+            for (const o0 of opts) {
+              const o = document.createElement("option");
+              o.value = o0;
+              o.textContent = o0;
+              s.appendChild(o);
+            }
+            s.value = String((state as any)[key] ?? opts[0]);
+            s.addEventListener("change", () => ((state as any)[key] = s.value));
+            f.appendChild(s);
+            return f;
+          };
+          grid.append(
+            mkText("color", "color", "white"),
+            mkText("xSource", "xSource", "t_table[0]"),
+            mkText("ySource", "ySource", "t_table[1]"),
+            mkText("xLabel", "xLabel", "x"),
+            mkText("yLabel", "yLabel", "y"),
+            mkSel("grid", "grid", ["on", "off"])
+          );
+          body.append(grid);
           return;
         }
 
@@ -6219,10 +7396,15 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     | null
     | {
         arrowId: string;
-        end: "p1" | "p2";
+        end: "p1" | "p2" | "mid";
         // Start point in client space (for hover thresholding)
         startClientX: number;
         startClientY: number;
+        // For mid-drag (translate), keep initial arrow endpoints in plot coords.
+        startX0?: number;
+        startY0?: number;
+        startX1?: number;
+        startY1?: number;
       } = null;
   let compositeDrag:
     | null
@@ -6234,6 +7416,35 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         startT: number;
         box: DOMRect;
       } = null;
+
+  const clearCompositeSubSelection = () => {
+    if (!compositeEditTimerId) return;
+    const rootEl = engine.getNodeElement(compositeEditTimerId);
+    if (!rootEl) return;
+    // Clear selection chrome + state.
+    for (const e of Array.from(rootEl.querySelectorAll<HTMLElement>(".comp-sub.is-selected"))) {
+      e.classList.remove("is-selected");
+      e.querySelector(":scope > .handles")?.remove();
+    }
+    compositeSelectedSubId = null;
+    compositeSelectedSubEl = null;
+    compositeDragMode = "none";
+    compositeActiveHandle = null;
+    compositeStartGeom = null;
+    compositeArrowDrag = null;
+    // Clear plot-arrow glow (rendered on SVG), if any.
+    const layer =
+      compositeEditKind === "timer"
+        ? rootEl.querySelector<HTMLElement>(".timer-sub-layer")
+        : compositeEditKind === "sound"
+          ? rootEl.querySelector<HTMLElement>(".sound-sub-layer")
+          : null;
+    if (layer) {
+      delete (layer.dataset as any).selectedPlotArrowId;
+      if (compositeEditKind === "timer") renderTimerCompositeArrows(rootEl, layer);
+      else if (compositeEditKind === "sound") renderSoundCompositeArrows(rootEl, layer);
+    }
+  };
 
   const compositeOuterRectClient = (rootEl: HTMLElement, layer: HTMLElement) => {
     // Union bbox for the composite root + all its internal sub-elements (labels, buttons, plot, arrow hits).
@@ -6358,6 +7569,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     if (compositePathStack.length === 0) compositePathStack.push(String(compositeEditTimerId));
     if (compositePathStack[compositePathStack.length - 1] !== p) compositePathStack.push(p);
     compositeEditPath = p;
+    (window as any).__ip_dbg_compositeEditPath = compositeEditPath;
     compositeSelectedSubId = null;
     compositeSelectedSubEl = null;
     // Clear any selection chrome.
@@ -6379,6 +7591,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     }
     compositePathStack.pop();
     compositeEditPath = compositePathStack[compositePathStack.length - 1] ?? String(compositeEditTimerId);
+    (window as any).__ip_dbg_compositeEditPath = compositeEditPath;
     compositeSelectedSubId = null;
     compositeSelectedSubEl = null;
     const rootEl = engine.getNodeElement(compositeEditTimerId);
@@ -6401,6 +7614,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     exitScreenEdit();
     compositeEditKind = "timer";
     compositeEditTimerId = timerId;
+    // Track for debugging + for restoring state if engine.setModel recreates DOM.
+    (engine as any).__ip_lastCompositeId = timerId;
+    (window as any).__ip_compositeEditId = timerId;
+    (window as any).__ip_compositeEditKind = "timer";
     clearSelection();
     const el = engine.getNodeElement(timerId);
     if (!el) return;
@@ -6459,9 +7676,41 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     (window as any).__ip_exitCompositeEdit = exitTimerCompositeEdit;
     (window as any).__ip_compositeEditing = true;
     compositeEditPath = timerId;
+    (window as any).__ip_dbg_compositeEditPath = compositeEditPath;
     compositePathStack.length = 0;
     compositePathStack.push(timerId);
     applyCompositeLevelDimming();
+    // If we ever end up in a nested level on entry, warn (this used to cause "grayed out" labels).
+    if (String(compositeEditPath).includes("/")) {
+      // eslint-disable-next-line no-console
+      console.warn("[ip][dbg] timer composite entered with nested path (unexpected)", { timerId, compositeEditPath });
+    }
+
+    // Debug: verify composite texts are actually interactive right after entry.
+    // Enable with: localStorage.setItem("ip_debug_timer_text_pe", "1")
+    try {
+      const dbgPe = localStorage.getItem("ip_debug_timer_text_pe") === "1";
+      if (dbgPe) {
+        const layerNow = el.querySelector<HTMLElement>(".timer-sub-layer");
+        const texts = Array.from(layerNow?.querySelectorAll<HTMLElement>(".timer-sub-text") ?? []);
+        const sample = texts.slice(0, 6).map((t) => ({
+          id: t.dataset.subId,
+          pe: t.style.pointerEvents,
+          cursor: t.style.cursor,
+          dim: t.classList.contains("ip-composite-dim"),
+        }));
+        // eslint-disable-next-line no-console
+        console.log("[ip][dbg][timer-text-pe] after-enter", {
+          timerId,
+          appMode: getAppMode(),
+          compositeEditing: el.dataset.compositeEditing,
+          nTexts: texts.length,
+          sample,
+        });
+      }
+    } catch {
+      // ignore
+    }
   };
 
   const enterChoicesCompositeEdit = (pollId: string) => {
@@ -6474,6 +7723,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     exitScreenEdit();
     compositeEditKind = "choices";
     compositeEditTimerId = pollId;
+    (engine as any).__ip_lastCompositeId = pollId;
+    (window as any).__ip_compositeEditId = pollId;
+    (window as any).__ip_compositeEditKind = "choices";
     const el = engine.getNodeElement(pollId);
     if (!el) return;
     // Start with sub-element editing (root remains selectable via click/drag on the node itself).
@@ -6539,6 +7791,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     exitScreenEdit();
     compositeEditKind = "sound";
     compositeEditTimerId = soundId;
+    (engine as any).__ip_lastCompositeId = soundId;
+    (window as any).__ip_compositeEditId = soundId;
+    (window as any).__ip_compositeEditKind = "sound";
     clearSelection();
     const el = engine.getNodeElement(soundId);
     if (!el) return;
@@ -6591,6 +7846,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
 
   const exitTimerCompositeEdit = () => {
     if (!compositeEditTimerId) return;
+    // Clear last composite id marker (avoids restoring after setModel when not editing).
+    delete (engine as any).__ip_lastCompositeId;
+    delete (window as any).__ip_compositeEditId;
+    delete (window as any).__ip_compositeEditKind;
     const el = engine.getNodeElement(compositeEditTimerId);
     // Hard guarantee: strip any leftover sub-element selection chrome when exiting group edit.
     if (el) {
@@ -6603,13 +7862,19 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const ov = el?.querySelector<HTMLElement>(".timer-overlay");
       if (ov) ov.style.display = "block";
       const layer = el?.querySelector<HTMLElement>(".timer-sub-layer");
-      if (layer) layer.style.pointerEvents = "none";
+      if (layer) {
+        layer.style.pointerEvents = "none";
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
       if (el) el.dataset.compositeEditing = "0";
     } else if (compositeEditKind === "sound") {
       const ov = el?.querySelector<HTMLElement>(".sound-overlay");
       if (ov) ov.style.display = "block";
       const layer = el?.querySelector<HTMLElement>(".sound-sub-layer");
-      if (layer) layer.style.pointerEvents = "none";
+      if (layer) {
+        layer.style.pointerEvents = "none";
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
       if (el) el.dataset.compositeEditing = "0";
     } else {
       const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
@@ -6990,6 +8255,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // - Else: enter screen edit.
     // IMPORTANT: only treat as "background" if the click is OUTSIDE ALL node bounding boxes.
     if (!hitAnyBBox && !target.closest(".modal") && !target.closest(".ctx-menu") && !target.closest(".edit-toolbox")) {
+      // Regular group edit: background dblclick steps back one level (or exits).
+      if ((window as any).__ip_exitGroupEdit) {
+        exitGroupEditLevel();
+        ev.preventDefault();
+        return;
+      }
       if ((window as any).__ip_exitCompositeEdit) {
         // Nested composite editing: background dblclick steps back one level.
         // If we're already at the root level, this exits group edit.
@@ -7008,6 +8279,20 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         ev.preventDefault();
       }
       return;
+    }
+
+    // Regular group edit mode:
+    // - If already in group edit: double-click a group to enter nested group edit.
+    // - If not in group edit: double-click a group node to enter group edit.
+    if (model && hitNodeIdByRect) {
+      const rawId = String(hitNodeIdByRect);
+      const node: any = model.nodes.find((n: any) => String(n.id) === rawId);
+      if (node?.type === "group") {
+        enterGroupEdit(rawId);
+        (ev as any).stopImmediatePropagation?.();
+        ev.preventDefault();
+        return;
+      }
     }
 
     // In composite edit mode, double-clicking a sub-text should open the text editor (not re-enter composite mode).
@@ -7045,15 +8330,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         return;
       }
     }
-    if (compositeEditTimerId && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
-      const grp = target.closest<HTMLElement>(".comp-sub");
-      if (grp?.dataset.groupPath) {
-        enterCompositeLevel(String(grp.dataset.groupPath));
-        (ev as any).stopImmediatePropagation?.();
-        ev.preventDefault();
-        return;
-      }
-    }
+    // NOTE:
+    // We intentionally DO NOT support nested composite-level editing for timer/sound via dblclick.
+    // It was easy to enter the plot level accidentally, which dims/disables the outer labels and feels "broken".
+    // Timer/sound composite edit is a single-level workflow (root-only).
     const id = hitNodeIdByRect;
     if (!id || !model) return;
     const node = model.nodes.find((n: any) => String(n.id) === String(id)) as any;
@@ -7140,12 +8420,26 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     compositeSelectedSubEl = sub;
     for (const e of Array.from(timerEl.querySelectorAll<HTMLElement>(".comp-sub"))) e.classList.remove("is-selected");
     sub.classList.add("is-selected");
+    // If selecting anything other than a plot-arrow, clear plot-arrow selection glow.
+    if (!(sub.dataset.kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound"))) {
+      delete (layer.dataset as any).selectedPlotArrowId;
+      if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
+      else if (compositeEditKind === "sound") renderSoundCompositeArrows(timerEl, layer);
+    }
 
     // Composite axis arrows (timer/sound): drag endpoints in plot coords (no bbox handles).
     if ((compositeEditKind === "timer" || compositeEditKind === "sound") && sub.dataset.kind === "plot-arrow") {
       const specs: any[] = (layer as any).__arrowSpecs ?? [];
       if (!Array.isArray(specs) || specs.length === 0) return;
       const requestedArrowId = String(sub.dataset.arrowId ?? "");
+      // Store selection for rendering (glow on SVG line, no bbox).
+      if (requestedArrowId) {
+        layer.dataset.selectedPlotArrowId = requestedArrowId;
+        if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
+        else renderSoundCompositeArrows(timerEl, layer);
+      } else {
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
       const { ox, oy, xLen, yLen } = _plotRectCss(timerEl);
       const toClient = (u: number, vUp: number) => ({ x: ox + u * xLen, y: oy - vUp * yLen });
       const px = ev.clientX;
@@ -7163,18 +8457,29 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         if (!best || pick.d2 < best.d2) best = pick;
       }
       const THRESH_PX = 32;
-      if (!best || best.d2 > THRESH_PX * THRESH_PX) {
-        // Not near endpoints: don't start a drag (avoid confusing "selection box" behavior).
-        (ev as any).stopImmediatePropagation?.();
-        ev.preventDefault();
-        return;
-      }
+      const nearEndpoint = !!best && best.d2 <= THRESH_PX * THRESH_PX;
+      const arrowId = requestedArrowId || best?.id || "";
+      if (!arrowId) return;
+      const spec = specs.find((a: any) => String(a?.id ?? "") === arrowId);
+      if (!spec) return;
       compositeEditPath = compositeEditTimerId;
       compositeStartGeom = { x: 0, y: 0, w: 1, h: 1, rotationDeg: 0, anchor: "topLeft", align: "left" };
       compositeStart = { x: ev.clientX, y: ev.clientY };
       compositeDragMode = "arrow";
-      compositeArrowDrag = { arrowId: best.id, end: best.end, startClientX: ev.clientX, startClientY: ev.clientY };
-      setBodyCursor("crosshair");
+      compositeArrowDrag = nearEndpoint
+        ? { arrowId, end: best!.end, startClientX: ev.clientX, startClientY: ev.clientY }
+        : {
+            // Mid-drag: translate the whole arrow in plot coords.
+            arrowId,
+            end: "mid",
+            startClientX: ev.clientX,
+            startClientY: ev.clientY,
+            startX0: Number(spec.x0 ?? 0),
+            startY0: Number(spec.y0 ?? 0),
+            startX1: Number(spec.x1 ?? 1),
+            startY1: Number(spec.y1 ?? 0)
+          };
+      setBodyCursor(nearEndpoint ? "crosshair" : "grabbing");
       stage.setPointerCapture?.(ev.pointerId);
       (ev as any).stopImmediatePropagation?.();
       ev.preventDefault();
@@ -7346,16 +8651,30 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       if (!spec) return;
 
       const { ox, oy, xLen, yLen } = _plotRectCss(timerEl);
+      const clampU = (u: number) => Math.max(-1, Math.min(2, u));
+      if (cad.end === "mid") {
+        const du = (ev.clientX - cad.startClientX) / Math.max(1e-9, xLen);
+        const dv = (cad.startClientY - ev.clientY) / Math.max(1e-9, yLen); // vUp delta
+        const x0 = Number(cad.startX0 ?? spec.x0 ?? 0);
+        const y0 = Number(cad.startY0 ?? spec.y0 ?? 0);
+        const x1 = Number(cad.startX1 ?? spec.x1 ?? 1);
+        const y1 = Number(cad.startY1 ?? spec.y1 ?? 0);
+        spec.x0 = clampU(x0 + du);
+        spec.y0 = clampU(y0 + dv);
+        spec.x1 = clampU(x1 + du);
+        spec.y1 = clampU(y1 + dv);
+      } else {
       const u = (ev.clientX - ox) / Math.max(1e-9, xLen);
       const vUp = (oy - ev.clientY) / Math.max(1e-9, yLen);
-      const uu = Math.max(-1, Math.min(2, u));
-      const vv = Math.max(-1, Math.min(2, vUp));
+        const uu = clampU(u);
+        const vv = clampU(vUp);
       if (cad.end === "p1") {
         spec.x0 = uu;
         spec.y0 = vv;
       } else {
         spec.x1 = uu;
         spec.y1 = vv;
+        }
       }
 
       const fmt = (n: number) => {
@@ -7382,7 +8701,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         }
       }
       if (!replaced) out.push(nextLine);
-      (layer as any).__elementsPr = out.join("\\n");
+      // IMPORTANT: join with REAL newlines. Using "\\n" writes literal backslash-n into elements.pr,
+      // which then explodes into invalid PR content on subsequent edits.
+      (layer as any).__elementsPr = out.join("\n");
 
       if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
       else renderSoundCompositeArrows(timerEl, layer);
@@ -7395,9 +8716,25 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       let nx = px - compositeGrabOff.x;
       let ny = py - compositeGrabOff.y;
       if (ev.shiftKey) {
-        const step = 0.01;
-        nx = Math.round(nx / step) * step;
-        ny = Math.round(ny / step) * step;
+        // Snap to WORLD grid (same as root mode), projected into the active composite level box.
+        const cam = engine.getCamera();
+        const scr = engine.getScreen();
+        const stageRect = stage.getBoundingClientRect();
+        // Box top-left in stage screen coords:
+        const boxTLScreen = { x: box.left - stageRect.left, y: box.top - stageRect.top };
+        const boxTLWorld = screenToWorld(boxTLScreen, cam as any, scr as any);
+        const worldW = box.width / Math.max(1e-9, cam.zoom);
+        const worldH = box.height / Math.max(1e-9, cam.zoom);
+        // Current anchor in world coords:
+        const axW = boxTLWorld.x + nx * worldW;
+        const ayW = boxTLWorld.y + ny * worldH;
+        const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
+        const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
+        const snap = (v: number) => Math.round(v / snapSpacing) * snapSpacing;
+        const sxW = snap(axW);
+        const syW = snap(ayW);
+        nx = (sxW - boxTLWorld.x) / Math.max(1e-9, worldW);
+        ny = (syW - boxTLWorld.y) / Math.max(1e-9, worldH);
       }
       sub.style.left = `${nx * 100}%`;
       sub.style.top = `${ny * 100}%`;
@@ -7574,6 +8911,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         lastY: number;
       } = null;
   const startCompositePan = (ev: PointerEvent) => {
+    // Treat background pan as "deselect current sub-element".
+    // This matches normal editor behavior: click empty space clears selection.
+    clearCompositeSubSelection();
     compositePan = { pointerId: ev.pointerId, lastX: ev.clientX, lastY: ev.clientY };
     setBodyCursor("grabbing");
     try {
@@ -7619,38 +8959,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         });
       }
       if (picked && kind !== "plot-region") {
-        // Special-case plot arrows: only treat as selectable near endpoints; otherwise allow pan.
+      // Plot arrows: behave like normal arrows in root mode (selectable in the middle too).
         if (kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound")) {
-          const layer =
-            compositeEditKind === "timer"
-              ? rootEl.querySelector<HTMLElement>(".timer-sub-layer")
-              : rootEl.querySelector<HTMLElement>(".sound-sub-layer");
-          const specs: any[] = (layer as any)?.__arrowSpecs ?? [];
-          const requestedArrowId = String(picked.dataset.arrowId ?? "");
-          if (Array.isArray(specs) && specs.length > 0) {
-            const { ox, oy, xLen, yLen } = _plotRectCss(rootEl);
-            const toClient = (u: number, vUp: number) => ({ x: ox + u * xLen, y: oy - vUp * yLen });
-            const px = ev.clientX;
-            const py = ev.clientY;
-            let bestD2 = Number.POSITIVE_INFINITY;
-            for (const a of specs) {
-              const id = String(a?.id ?? "");
-              if (!id) continue;
-              if (requestedArrowId && id !== requestedArrowId) continue;
-              const p1 = toClient(Number(a.x0 ?? 0), Number(a.y0 ?? 0));
-              const p2 = toClient(Number(a.x1 ?? 1), Number(a.y1 ?? 0));
-              const d1 = (p1.x - px) ** 2 + (p1.y - py) ** 2;
-              const d2 = (p2.x - px) ** 2 + (p2.y - py) ** 2;
-              bestD2 = Math.min(bestD2, d1, d2);
-            }
-            const THRESH_PX = 32;
-            const nearEndpoint = Number.isFinite(bestD2) && bestD2 <= THRESH_PX * THRESH_PX;
-            if (nearEndpoint) {
-              // Let the normal composite arrow selection/drag handler run.
               return;
-            }
-          }
-          // Not near endpoints => treat as background pan.
         } else {
           // Any normal selectable sub (text/buttons/etc): do NOT pan.
           // NOTE: most selectable elements don't set data-kind, so `kind === ""` is normal here.
@@ -7689,8 +9000,44 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
   window.addEventListener("pointercancel", () => stopCompositePan(), { capture: true });
 
   window.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") (window as any).__ip_exitCompositeEdit?.();
+    if (ev.key === "Escape") {
+      (window as any).__ip_exitCompositeEdit?.();
+      (window as any).__ip_exitGroupEdit?.();
+    }
   });
+
+  // Excel-like table editing: single click enters cell edit (also allowed in live mode).
+  stage.addEventListener(
+    "pointerdown",
+    (ev) => {
+      const t = ev.target as HTMLElement;
+      const td = t.closest("td.table-cell") as HTMLTableCellElement | null;
+      if (!td) return;
+      const nodeEl = td.closest(".node") as HTMLElement | null;
+      const tableId = String(nodeEl?.dataset?.nodeId ?? "");
+      if (!tableId) return;
+
+      // Don't allow table edits while a composite/group edit dimming state is active.
+      if ((window as any).__ip_compositeEditing) return;
+
+      // Resolve row/col by DOM position.
+      const tr = td.parentElement as HTMLTableRowElement | null;
+      const table = td.closest("table") as HTMLTableElement | null;
+      if (!tr || !table) return;
+      const row = (tr as any).rowIndex ?? Array.from(table.rows).indexOf(tr);
+      const col = (td as any).cellIndex ?? Array.from(tr.children).indexOf(td);
+      if (!(row >= 0 && col >= 0)) return;
+
+      // Prevent stage selection/pan from interfering.
+      ev.preventDefault();
+      (ev as any).stopImmediatePropagation?.();
+
+      // Start editing on left click only.
+      if (ev.button !== 0) return;
+      void _beginTableCellEdit(td, tableId, row, col);
+    },
+    { capture: true }
+  );
 
   stage.addEventListener("pointerdown", (ev) => {
     // Hard block: Live mode must be resistant to any editing gestures.
@@ -7700,10 +9047,78 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const nodeEl = target.closest<HTMLElement>(".node");
     const compSubEl = target.closest<HTMLElement>(".comp-sub");
 
-    if (nodeEl?.dataset.nodeId) {
-      const id = resolveSelectableId(nodeEl.dataset.nodeId);
+    // Use smallest-hit node picking based on DOM hit stack (`elementsFromPoint`).
+    // IMPORTANT: when clicking handles/anchor dots we must not re-pick.
+    const rawPicked = !target.closest(".handle") && !anchorEl ? (() => {
       const model = engine.getModel();
-      const node = model?.nodes.find((n) => n.id === id);
+      if (!model) return null;
+      const gid = activeGroupEditId();
+      const els = (document.elementsFromPoint?.(ev.clientX, ev.clientY) ?? []) as HTMLElement[];
+      let best: { id: string; size: number; order: number } | null = null;
+      for (let i = 0; i < els.length; i++) {
+        const e = els[i] as any;
+        const nodeEl = (e?.closest?.(".node") as HTMLElement | null) ?? null;
+        if (!nodeEl?.dataset?.nodeId) continue;
+        const rawId = String(nodeEl.dataset.nodeId ?? "");
+        if (!rawId) continue;
+        if (gid) {
+          if (rawId === gid) continue;
+          if (!isDescendantOf(rawId, gid, model)) continue;
+        }
+        const n0: any = model.nodes.find((n: any) => String(n.id) === rawId);
+        if (!n0) continue;
+        if (screenEditMode) {
+          if (String(n0?.space ?? "world") !== "screen") continue;
+        } else {
+          if (String(n0?.space ?? "world") === "screen") continue;
+        }
+        const r0 = nodeEl.getBoundingClientRect();
+        if (!(r0.width > 0.5 && r0.height > 0.5)) continue;
+        const type = String(n0?.type ?? "");
+        let size = Math.max(1e-6, r0.width * r0.height);
+        if (type === "arrow" || type === "line") {
+          const seg = hitTestSegmentHandle(nodeEl, ev.clientX, ev.clientY);
+          if (!seg) continue;
+          const fx = Number(nodeEl.dataset.fromX ?? "0");
+          const fy = Number(nodeEl.dataset.fromY ?? "0.5");
+          const tx = Number(nodeEl.dataset.toX ?? "1");
+          const ty = Number(nodeEl.dataset.toY ?? "0.5");
+          const p1 = { x: r0.left + fx * r0.width, y: r0.top + fy * r0.height };
+          const p2 = { x: r0.left + tx * r0.width, y: r0.top + ty * r0.height };
+          const lenPx = Math.max(1, Math.hypot(p2.x - p1.x, p2.y - p1.y));
+          const wRaw = Number((n0 as any)?.width ?? 4);
+          const cam = engine.getCamera();
+          const strokePx =
+            wRaw <= 1
+              ? Math.max(1, wRaw * Math.max(1, Math.min(r0.width, r0.height)))
+              : Math.max(1, wRaw * (String((n0 as any)?.space ?? "world") === "world" ? Number(cam.zoom ?? 1) : 1));
+          size = Math.max(1e-6, lenPx * strokePx);
+        }
+        const cand = { id: rawId, size, order: i };
+        if (!best) best = cand;
+        else if (cand.size < best.size - 1e-6) best = cand;
+        else if (Math.abs(cand.size - best.size) <= 1e-6) {
+          if (cand.order < best.order) best = cand;
+        }
+      }
+      return best?.id ?? null;
+    })() : null;
+
+    const rawIdFromDom = nodeEl?.dataset.nodeId ? String(nodeEl.dataset.nodeId) : "";
+    const rawId = rawPicked ?? rawIdFromDom;
+    if (rawId) {
+      const id = resolveSelectableId(rawId);
+      // In regular group-edit, clicking the active group root itself should behave like background
+      // (so a click on "empty space" clears selection instead of re-selecting the group).
+      const gid = activeGroupEditId();
+      if (gid && id === gid && !ev.shiftKey && !ev.ctrlKey && !target.closest(".handle") && !target.closest(".anchor-dot")) {
+        clearSelection();
+        ev.preventDefault();
+        return;
+      }
+      const model = engine.getModel();
+      const { node: rawNode, ui: node } = model ? _uiNodeForId(id, model) : { node: null, ui: null };
+      const pickedEl = engine.getNodeElement(id) ?? nodeEl;
       // Only allow screen-space nodes in screen edit mode; block screen nodes when not in screen edit.
       if (screenEditMode && node && node.space !== "screen") {
         ev.preventDefault();
@@ -7720,7 +9135,7 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     // - Timer/Sound: never select/rotate the composite root itself (edit sub-elements only).
     // - Choices: allow selecting/resizing the root (so the whole composite can be scaled).
     if ((compositeEditKind === "timer" || compositeEditKind === "sound") && compositeEditTimerId && id === compositeEditTimerId) {
-      nodeEl.querySelector(".handles")?.remove();
+      pickedEl?.querySelector?.(".handles")?.remove?.();
       ev.preventDefault();
       return;
     }
@@ -7771,7 +9186,16 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       startSnapshot = model ? cloneModel(model) : null;
       startNodesById = {};
       for (const n of model?.nodes ?? []) {
-        if (selected.has(n.id)) startNodesById[n.id] = JSON.parse(JSON.stringify(n));
+        if (selected.has(n.id)) {
+          const snap = JSON.parse(JSON.stringify(n));
+          // For grouped nodes, store UI/world transform + parent world transform at drag start.
+          const pid = String((n as any)?.parentId ?? "").trim();
+          if (pid && (n as any)?.space === "world") {
+            const { ui, parentWorld } = _uiNodeForId(String(n.id), model);
+            (snap as any).__ui = { worldT: (ui as any)?.transform ?? null, parentWorldT: parentWorld ?? null };
+          }
+          startNodesById[n.id] = snap;
+        }
       }
       start = { x: ev.clientX, y: ev.clientY };
 
@@ -7781,24 +9205,158 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         // - endpoint balls: radius 20px
         // - translate band: within 20px of segment, excluding endpoint balls
         // - closest wins
-        const hnd = hitTestSegmentHandle(nodeEl, ev.clientX, ev.clientY);
+        const hnd = pickedEl ? hitTestSegmentHandle(pickedEl, ev.clientX, ev.clientY) : null;
         if (hnd) {
           activeHandle = hnd;
           dragMode = "line";
+          setBodyCursor("grabbing");
+          // Junction behavior for polylines:
+          // - dragging an endpoint moves all coincident endpoints (shared junction)
+          // - dragging the midpoint moves the segment AND any coincident endpoints at either end
+          junctionDrag = null;
+          if ((node as any)?.type === "line" && model) {
+            const onlyId = id;
+            const startNode: any = startNodesById?.[onlyId];
+            const sp: "world" | "screen" = (startNode?.space ?? "world") === "screen" ? "screen" : "world";
+            // Compute endpoints in the same coordinate system used by line editing (world units or screen fractions).
+            const ui0: any = (startNode as any)?.__ui ?? null;
+            const t0 = (ui0?.worldT ?? startNode?.transform ?? {}) as any;
+            const from0 = startNode?.from ?? { x: 0, y: 0.5 };
+            const to0 = startNode?.to ?? { x: 1, y: 0.5 };
+            const tl0 = anchorToTopLeftWorld({ x: Number(t0.x ?? 0), y: Number(t0.y ?? 0), w: Number(t0.w ?? 1), h: Number(t0.h ?? 1), anchor: t0.anchor ?? "topLeft" } as any);
+            const w0 = Math.max(1e-9, Number(t0.w ?? 1));
+            const h0 = Math.max(1e-9, Number(t0.h ?? 1));
+            const p1w = { x: tl0.x + Number(from0.x ?? 0) * w0, y: tl0.y + Number(from0.y ?? 0) * h0 };
+            const p2w = { x: tl0.x + Number(to0.x ?? 1) * w0, y: tl0.y + Number(to0.y ?? 0) * h0 };
+            const camNow = engine.getCamera();
+            const scrNow = engine.getScreen();
+            const tolPx = 10; // junction weld tolerance in screen pixels
+            const tolPx2 = tolPx * tolPx;
+
+            const toScreenPt = (p: { x: number; y: number }) =>
+              sp === "world" ? worldToScreen(p, camNow as any, scrNow as any) : { x: p.x * scrNow.w, y: p.y * scrNow.h };
+
+            const p1s = toScreenPt(p1w);
+            const p2s = toScreenPt(p2w);
+
+            const p1Links: Array<{ id: string; end: "p1" | "p2"; other: { x: number; y: number }; parentWorldT: any | null }> = [];
+            const p2Links: Array<{ id: string; end: "p1" | "p2"; other: { x: number; y: number }; parentWorldT: any | null }> = [];
+            const junctions: Array<{ x: number; y: number }> = [];
+            const j1 = String((startNode as any)?.p1Join ?? "").trim();
+            const j2 = String((startNode as any)?.p2Join ?? "").trim();
+            for (const n0 of model.nodes as any[]) {
+              if (!n0 || String(n0.type) !== "line") continue;
+              const nid = String(n0.id ?? "");
+              if (!nid || nid === onlyId) continue;
+              if (String(n0.space ?? "world") !== sp) continue;
+              const { ui, parentWorld } = _uiNodeForId(nid, model);
+              const tN = (ui as any)?.transform ?? n0.transform ?? {};
+              const fr = (n0 as any).from ?? { x: 0, y: 0.5 };
+              const to = (n0 as any).to ?? { x: 1, y: 0.5 };
+              const tl = anchorToTopLeftWorld({ x: Number(tN.x ?? 0), y: Number(tN.y ?? 0), w: Number(tN.w ?? 1), h: Number(tN.h ?? 1), anchor: tN.anchor ?? "topLeft" } as any);
+              const w = Math.max(1e-9, Number(tN.w ?? 1));
+              const h = Math.max(1e-9, Number(tN.h ?? 1));
+              const q1 = { x: tl.x + Number(fr.x ?? 0) * w, y: tl.y + Number(fr.y ?? 0) * h };
+              const q2 = { x: tl.x + Number(to.x ?? 1) * w, y: tl.y + Number(to.y ?? 0) * h };
+
+              // Collect snap-to-graph junction candidates.
+              junctions.push(q1, q2);
+
+              const nJ1 = String((n0 as any)?.p1Join ?? "").trim();
+              const nJ2 = String((n0 as any)?.p2Join ?? "").trim();
+
+              // Prefer join-id links if available.
+              if (j1) {
+                if (nJ1 && nJ1 === j1) p1Links.push({ id: nid, end: "p1", other: q2, parentWorldT: parentWorld ?? null });
+                else if (nJ2 && nJ2 === j1) p1Links.push({ id: nid, end: "p2", other: q1, parentWorldT: parentWorld ?? null });
+              }
+              if (j2) {
+                if (nJ1 && nJ1 === j2) p2Links.push({ id: nid, end: "p1", other: q2, parentWorldT: parentWorld ?? null });
+                else if (nJ2 && nJ2 === j2) p2Links.push({ id: nid, end: "p2", other: q1, parentWorldT: parentWorld ?? null });
+              }
+
+              // Fallback to proximity links for legacy segments that have no join IDs.
+              if (!j1 || !j2) {
+                const q1s = toScreenPt(q1);
+                const q2s = toScreenPt(q2);
+                if (!j1) {
+                  const d11 = (q1s.x - p1s.x) ** 2 + (q1s.y - p1s.y) ** 2;
+                  const d12 = (q2s.x - p1s.x) ** 2 + (q2s.y - p1s.y) ** 2;
+                  if (d11 <= tolPx2) p1Links.push({ id: nid, end: "p1", other: q2, parentWorldT: parentWorld ?? null });
+                  else if (d12 <= tolPx2) p1Links.push({ id: nid, end: "p2", other: q1, parentWorldT: parentWorld ?? null });
+                }
+                if (!j2) {
+                  const d21 = (q1s.x - p2s.x) ** 2 + (q1s.y - p2s.y) ** 2;
+                  const d22 = (q2s.x - p2s.x) ** 2 + (q2s.y - p2s.y) ** 2;
+                  if (d21 <= tolPx2) p2Links.push({ id: nid, end: "p1", other: q2, parentWorldT: parentWorld ?? null });
+                  else if (d22 <= tolPx2) p2Links.push({ id: nid, end: "p2", other: q1, parentWorldT: parentWorld ?? null });
+                }
+              }
+            }
+            if (p1Links.length > 0 || p2Links.length > 0 || junctions.length > 0) junctionDrag = { movedId: onlyId, space: sp, p1Links, p2Links, junctions };
+          }
+          (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+          ev.preventDefault();
+          return;
+        }
+        // Not close enough to the segment.
+        // For lines, treat this as "graph drag" (drag the whole connected component of lines).
+        if ((node as any)?.type === "line" && model) {
+          const onlyId = id;
+          const startNode: any = startNodesById?.[onlyId];
+          const sp: "world" | "screen" = (startNode?.space ?? "world") === "screen" ? "screen" : "world";
+          const parentId = String((startNode as any)?.parentId ?? "").trim();
+          const camNow = engine.getCamera();
+          const scrNow = engine.getScreen();
+          const ids = _collectConnectedLineIds(onlyId, model, sp, camNow as any, scrNow as any, parentId);
+
+          // Ensure we have start snapshots for all ids in the component (even if not selected).
+          const idSet = new Set(ids);
+          for (const n0 of model.nodes as any[]) {
+            const nid = String(n0?.id ?? "");
+            if (!nid || !idSet.has(nid)) continue;
+            if (startNodesById[nid]) continue;
+            const snap = JSON.parse(JSON.stringify(n0));
+            const pid = String((n0 as any)?.parentId ?? "").trim();
+            if (pid && (n0 as any)?.space === "world") {
+              const { ui, parentWorld } = _uiNodeForId(String(nid), model);
+              (snap as any).__ui = { worldT: (ui as any)?.transform ?? null, parentWorldT: parentWorld ?? null };
+            }
+            startNodesById[nid] = snap;
+          }
+
+          // Reference point for snapping translation: use seed p1.
+          const ui0: any = (startNodesById[onlyId] as any)?.__ui ?? null;
+          const t0 = (ui0?.worldT ?? (startNodesById[onlyId] as any)?.transform ?? {}) as any;
+          const from0 = (startNodesById[onlyId] as any)?.from ?? { x: 0, y: 0.5 };
+          const tl0 = anchorToTopLeftWorld({
+            x: Number(t0.x ?? 0),
+            y: Number(t0.y ?? 0),
+            w: Number(t0.w ?? 1),
+            h: Number(t0.h ?? 1),
+            anchor: t0.anchor ?? "topLeft"
+          } as any);
+          const w0 = Math.max(1e-9, Number(t0.w ?? 1));
+          const h0 = Math.max(1e-9, Number(t0.h ?? 1));
+          const p1 = { x: tl0.x + Number(from0.x ?? 0) * w0, y: tl0.y + Number(from0.y ?? 0) * h0 };
+
+          graphDrag = { ids, space: sp, ref: p1 };
+          dragMode = "graph";
+          activeHandle = null;
           setBodyCursor("grabbing");
           (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
           ev.preventDefault();
           return;
         }
-        // Not close enough to the segment; fall back to normal move behavior.
-      } else if (selected.size === 1 && nodeEl) {
-        const hnd = hitTestTransformHandle(nodeEl, node, ev.clientX, ev.clientY);
+        // Otherwise fall back to normal move behavior.
+      } else if (selected.size === 1 && pickedEl) {
+        const hnd = hitTestTransformHandle(pickedEl, node, ev.clientX, ev.clientY);
         if (hnd) {
           activeHandle = hnd;
           dragMode = activeHandle === "rot" || activeHandle.startsWith("rot-") ? "rotate" : "resize";
           setBodyCursor(cursorForHandleWithRotation(activeHandle, Number((node as any)?.transform?.rotationDeg ?? 0)));
           if (dragMode === "rotate") {
-            const r = nodeEl.getBoundingClientRect();
+            const r = pickedEl.getBoundingClientRect();
             const cx = r.left + r.width / 2;
             const cy = r.top + r.height / 2;
             startAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
@@ -7828,6 +9386,81 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const cam = engine.getCamera();
     const scr = engine.getScreen();
 
+    if (dragMode === "graph" && graphDrag) {
+      const sp = graphDrag.space;
+      let ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
+      let ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
+
+      // Shift snap: snap translation using a reference point.
+      if (ev.shiftKey && sp === "world") {
+        const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
+        const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
+        const snap = (v: number) => Math.round(v / snapSpacing) * snapSpacing;
+        const refNew = { x: graphDrag.ref.x + ddx, y: graphDrag.ref.y + ddy };
+        const refSnap = { x: snap(refNew.x), y: snap(refNew.y) };
+        ddx = refSnap.x - graphDrag.ref.x;
+        ddy = refSnap.y - graphDrag.ref.y;
+      }
+
+      const idSet = new Set(graphDrag.ids);
+      for (const id of graphDrag.ids) {
+        const startNode: any = startNodesById[id];
+        if (!startNode) continue;
+        if (String(startNode.type ?? "") !== "line") continue;
+        // Safety: only move the captured component
+        if (!idSet.has(id)) continue;
+
+        const ui0: any = (startNode as any).__ui ?? null;
+        const parentWorldT: any = ui0?.parentWorldT ?? null;
+        const t0 = (ui0?.worldT ?? startNode.transform ?? {}) as any;
+        const from0 = startNode.from ?? { x: 0, y: 0.5 };
+        const to0 = startNode.to ?? { x: 1, y: 0.5 };
+        const tl0 = anchorToTopLeftWorld({
+          x: Number(t0.x ?? 0),
+          y: Number(t0.y ?? 0),
+          w: Number(t0.w ?? 1),
+          h: Number(t0.h ?? 1),
+          anchor: t0.anchor ?? "topLeft"
+        } as any);
+        const w0 = Math.max(1e-9, Number(t0.w ?? 1));
+        const h0 = Math.max(1e-9, Number(t0.h ?? 1));
+        let p1 = { x: tl0.x + Number(from0.x ?? 0) * w0, y: tl0.y + Number(from0.y ?? 0) * h0 };
+        let p2 = { x: tl0.x + Number(to0.x ?? 1) * w0, y: tl0.y + Number(to0.y ?? 0) * h0 };
+
+        p1 = { x: p1.x + ddx, y: p1.y + ddy };
+        p2 = { x: p2.x + ddx, y: p2.y + ddy };
+
+        // Refit bbox around the translated endpoints.
+        let minX = Math.min(p1.x, p2.x);
+        let minY = Math.min(p1.y, p2.y);
+        let maxX = Math.max(p1.x, p2.x);
+        let maxY = Math.max(p1.y, p2.y);
+        const minSize = sp === "world" ? 10 : 0.005;
+        if (maxX - minX < minSize) {
+          const cx = (minX + maxX) / 2;
+          minX = cx - minSize / 2;
+          maxX = cx + minSize / 2;
+        }
+        if (maxY - minY < minSize) {
+          const cy = (minY + maxY) / 2;
+          minY = cy - minSize / 2;
+          maxY = cy + minSize / 2;
+        }
+        const w1 = maxX - minX;
+        const h1 = maxY - minY;
+        const fx = (p1.x - minX) / w1;
+        const fy = (p1.y - minY) / h1;
+        const tx = (p2.x - minX) / w1;
+        const ty = (p2.y - minY) / h1;
+
+        const worldOut = { x: minX, y: minY, w: w1, h: h1, anchor: "topLeft", rotationDeg: 0 } as any;
+        const localOut = parentWorldT ? _toLocalTransformFromWorld(worldOut, parentWorldT, "topLeft") : worldOut;
+        engine.updateNode(id, { transform: localOut as any, from: { x: fx, y: fy }, to: { x: tx, y: ty } } as any);
+      }
+      applySelection();
+      return;
+    }
+
     if (dragMode === "line" && selected.size === 1) {
       const onlyId = Array.from(selected)[0];
       const startNode: any = startNodesById[onlyId];
@@ -7836,7 +9469,10 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
       const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
 
-      const t0 = startNode.transform ?? {};
+      // Grouped nodes: use world transform for UI math, then convert back to local.
+      const ui0: any = (startNode as any).__ui ?? null;
+      const parentWorldT: any = ui0?.parentWorldT ?? null;
+      const t0 = (ui0?.worldT ?? startNode.transform ?? {}) as any;
       const from0 = startNode.from ?? { x: 0, y: 0.5 };
       const to0 = startNode.to ?? { x: 1, y: 0.5 };
       const tl0 = anchorToTopLeftWorld({ x: Number(t0.x ?? 0), y: Number(t0.y ?? 0), w: Number(t0.w ?? 1), h: Number(t0.h ?? 1), anchor: t0.anchor ?? "topLeft" } as any);
@@ -7856,8 +9492,51 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         p2 = { x: p2.x + ddx, y: p2.y + ddy };
       }
 
-      // Snap (Shift) for world-space only.
-      if (ev.shiftKey && sp === "world") {
+      // Shift snapping:
+      // - Endpoint drag: snap to existing junction if it's closer (in screen px) than the nearest grid point.
+      // - Mid drag: keep existing grid snap behavior (translate both by a single snapped delta).
+      if (ev.shiftKey) {
+        const tolPx = 12;
+        const tolPx2 = tolPx * tolPx;
+        const toScreenPt = (p: { x: number; y: number }) =>
+          sp === "world" ? worldToScreen(p, cam as any, scr as any) : { x: p.x * scr.w, y: p.y * scr.h };
+        const dist2px = (a: { x: number; y: number }, b: { x: number; y: number }) => {
+          const dx = a.x - b.x;
+          const dy = a.y - b.y;
+          return dx * dx + dy * dy;
+        };
+
+        const snapEndpoint = (p: { x: number; y: number }) => {
+          const ps = toScreenPt(p);
+          // Nearest junction (endpoints of other lines, collected on pointerdown).
+          const js = junctionDrag?.junctions ?? [];
+          let bestJ: { p: { x: number; y: number }; d2: number } | null = null;
+          for (const j of js) {
+            const d2 = dist2px(toScreenPt(j), ps);
+            if (!bestJ || d2 < bestJ.d2) bestJ = { p: j, d2 };
+          }
+
+          if (sp === "world") {
+            const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
+            const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
+            const snap = (v: number) => Math.round(v / snapSpacing) * snapSpacing;
+            const gridPt = { x: snap(p.x), y: snap(p.y) };
+            const gridD2 = dist2px(toScreenPt(gridPt), ps);
+            if (bestJ && bestJ.d2 <= tolPx2 && bestJ.d2 < gridD2 - 1e-6) return bestJ.p;
+            return gridPt;
+          }
+
+          // Screen-space: no grid, just snap to nearest junction within tolerance.
+          if (bestJ && bestJ.d2 <= tolPx2) return bestJ.p;
+          return p;
+        };
+
+        if (hnd === "p1") {
+          p1 = snapEndpoint(p1);
+        } else if (hnd === "p2") {
+          p2 = snapEndpoint(p2);
+        } else if (sp === "world") {
+          // Mid translate: preserve length+angle by applying a SINGLE translation snap offset (grid).
         const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
         const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
         const snap = (v: number) => Math.round(v / snapSpacing) * snapSpacing;
@@ -7867,16 +9546,6 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
           const dy = a.y - b.y;
           return dx * dx + dy * dy;
         };
-
-        if (hnd === "p1") {
-          // Endpoint drag: snap ONLY the moved endpoint.
-          p1 = snapPt(p1);
-        } else if (hnd === "p2") {
-          // Endpoint drag: snap ONLY the moved endpoint.
-          p2 = snapPt(p2);
-        } else {
-          // Mid translate: preserve length+angle by applying a SINGLE translation snap offset.
-          // We snap whichever endpoint is closer to a grid intersection, then apply that delta to both.
           const s1 = snapPt(p1);
           const s2 = snapPt(p2);
           const d1 = dist2(p1, s1);
@@ -7911,11 +9580,60 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const tx = (p2.x - minX) / w1;
       const ty = (p2.y - minY) / h1;
 
+      const worldOut = { x: minX, y: minY, w: w1, h: h1, anchor: "topLeft", rotationDeg: 0 } as any;
+      const localOut = parentWorldT ? _toLocalTransformFromWorld(worldOut, parentWorldT, "topLeft") : worldOut;
       engine.updateNode(onlyId, {
-        transform: { x: minX, y: minY, w: w1, h: h1, anchor: "topLeft", rotationDeg: 0 } as any,
+        transform: localOut as any,
         from: { x: fx, y: fy },
         to: { x: tx, y: ty }
       } as any);
+
+      // Graph behavior: update any linked line endpoints so shared junctions move together.
+      if (junctionDrag && junctionDrag.movedId === onlyId) {
+        const applyNode = (nodeId: string, a: { x: number; y: number }, b: { x: number; y: number }, parentWorld: any | null) => {
+          // Refit bbox + endpoints (same math as above)
+          let minX = Math.min(a.x, b.x);
+          let minY = Math.min(a.y, b.y);
+          let maxX = Math.max(a.x, b.x);
+          let maxY = Math.max(a.y, b.y);
+          const minSize = sp === "world" ? 10 : 0.005;
+          if (maxX - minX < minSize) {
+            const cx = (minX + maxX) / 2;
+            minX = cx - minSize / 2;
+            maxX = cx + minSize / 2;
+          }
+          if (maxY - minY < minSize) {
+            const cy = (minY + maxY) / 2;
+            minY = cy - minSize / 2;
+            maxY = cy + minSize / 2;
+          }
+          const w1 = maxX - minX;
+          const h1 = maxY - minY;
+          const fx = (a.x - minX) / w1;
+          const fy = (a.y - minY) / h1;
+          const tx = (b.x - minX) / w1;
+          const ty = (b.y - minY) / h1;
+          const worldOut = { x: minX, y: minY, w: w1, h: h1, anchor: "topLeft", rotationDeg: 0 } as any;
+          const localOut = parentWorld ? _toLocalTransformFromWorld(worldOut, parentWorld, "topLeft") : worldOut;
+          engine.updateNode(nodeId, { transform: localOut as any, from: { x: fx, y: fy }, to: { x: tx, y: ty } } as any);
+        };
+        const applyLinks = (links: Array<{ id: string; end: "p1" | "p2"; other: { x: number; y: number }; parentWorldT: any | null }>, movedNew: { x: number; y: number }) => {
+          for (const l of links) {
+            if (l.end === "p1") applyNode(l.id, movedNew, l.other, l.parentWorldT);
+            else applyNode(l.id, l.other, movedNew, l.parentWorldT);
+          }
+        };
+
+        if (hnd === "p1") {
+          applyLinks(junctionDrag.p1Links, p1);
+        } else if (hnd === "p2") {
+          applyLinks(junctionDrag.p2Links, p2);
+        } else {
+          // Midpoint drag: preserve connectivity at BOTH endpoints.
+          applyLinks(junctionDrag.p1Links, p1);
+          applyLinks(junctionDrag.p2Links, p2);
+        }
+      }
       applySelection();
       return;
     }
@@ -7925,21 +9643,29 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         const s = startNodesById[id];
         if (!s) continue;
         const sp = s.space ?? "world";
-        const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
-        const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
-        let nx = (s.transform?.x ?? 0) + ddx;
-        let ny = (s.transform?.y ?? 0) + ddy;
+        const ddxW = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
+        const ddyW = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
+        const ui0: any = (s as any).__ui ?? null;
+        const parentWorldT: any = ui0?.parentWorldT ?? null;
+        const t0: any = ui0?.worldT ?? s.transform ?? {};
+        let nxW = Number(t0.x ?? 0) + ddxW;
+        let nyW = Number(t0.y ?? 0) + ddyW;
 
         // Snap ONLY when Shift is held during dragging (requested).
         // Snap the anchor point (x,y) to active grid intersections for world-space nodes.
         if (ev.shiftKey && sp === "world") {
           const { spacing0, spacing1, t } = gridSpacingForZoom(cam.zoom);
           const snapSpacing = t >= 0.5 ? spacing1 : spacing0;
-          nx = Math.round(nx / snapSpacing) * snapSpacing;
-          ny = Math.round(ny / snapSpacing) * snapSpacing;
+          nxW = Math.round(nxW / snapSpacing) * snapSpacing;
+          nyW = Math.round(nyW / snapSpacing) * snapSpacing;
         }
 
-        engine.updateNode(id, { transform: { x: nx, y: ny } as any } as any);
+        if (parentWorldT && sp === "world") {
+          const lp = _worldPointToLocal(parentWorldT, nxW, nyW);
+          engine.updateNode(id, { transform: { x: lp.x, y: lp.y } as any } as any);
+        } else {
+          engine.updateNode(id, { transform: { x: nxW, y: nyW } as any } as any);
+        }
       }
       return;
     }
@@ -7948,7 +9674,9 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
     const onlyId = Array.from(selected)[0];
     const startNode = startNodesById[onlyId];
     if (!startNode) return;
-    const t0 = startNode.transform;
+    const ui0: any = (startNode as any).__ui ?? null;
+    const parentWorldT: any = ui0?.parentWorldT ?? null;
+    const t0 = (ui0?.worldT ?? startNode.transform) as any;
     const sp = startNode.space ?? "world";
 
     if (dragMode === "rotate") {
@@ -7964,7 +9692,12 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
       const d = (a1 - startAngleRad) * (180 / Math.PI);
       let rot = startRotationDeg + d;
       if (ev.shiftKey) rot = Math.round(rot / 15) * 15;
+      if (parentWorldT && sp === "world") {
+        const parentRot = Number(parentWorldT?.rotationDeg ?? 0) || 0;
+        engine.updateNode(onlyId, { transform: { rotationDeg: rot - parentRot } as any } as any);
+      } else {
       engine.updateNode(onlyId, { transform: { rotationDeg: rot } as any } as any);
+      }
       // Keep cursor angle in sync while snapping (otherwise it can look “stuck” until the next hover event).
       if (activeHandle) setBodyCursor(cursorForHandleWithRotation(activeHandle, rot));
       // Refresh selection chrome for composites without recreating node-level handles (which causes "double anchors").
@@ -8099,12 +9832,14 @@ function attachEditor(stage: HTMLElement, engine: Engine) {
         }
       }
       const anchored = topLeftToAnchorWorld(rect, t0.anchor);
-      engine.updateNode(
-        onlyId,
-        {
-          transform: { ...t0, x: anchored.x, y: anchored.y, w: rect.w, h: rect.h } as any
-        } as any
-      );
+      const worldOut = { ...t0, x: anchored.x, y: anchored.y, w: rect.w, h: rect.h } as any;
+      if (parentWorldT && sp === "world") {
+        const localAnchor = String((startNode as any)?.transform?.anchor ?? worldOut.anchor ?? "topLeft");
+        const localOut = _toLocalTransformFromWorld(worldOut, parentWorldT, localAnchor);
+        engine.updateNode(onlyId, { transform: { ...((startNode as any)?.transform ?? {}), ...localOut } as any } as any);
+      } else {
+        engine.updateNode(onlyId, { transform: worldOut as any } as any);
+      }
     }
   });
 
@@ -8249,6 +9984,7 @@ async function main() {
   ensureTimerPolling(engine, model, stage);
   ensureChoicesPolling(engine, model, stage);
   ensureSoundStreaming(engine, model, stage);
+  ensureGraphRendering(engine);
   attachPlotPanZoom(stage);
 
   // Mode toggle: Edit vs Live
@@ -8268,6 +10004,9 @@ async function main() {
     // Always leave any edit sub-modes before toggling.
     try {
       (window as any).__ip_exitCompositeEdit?.();
+    } catch {}
+    try {
+      (window as any).__ip_exitGroupEdit?.();
     } catch {}
     exitScreenEdit();
     localStorage.setItem("ip_mode", mode);
@@ -8302,6 +10041,7 @@ async function main() {
       ensureTimerPolling(engine, model, stage);
       ensureChoicesPolling(engine, model, stage);
       ensureSoundStreaming(engine, model, stage);
+      ensureGraphRendering(engine);
       attachEditor(stage, engine);
       return;
     }
@@ -8566,6 +10306,13 @@ async function main() {
     if ((window as any).__ip_exitCompositeEdit) {
       try {
         (window as any).__ip_exitCompositeEdit();
+      } catch {}
+      return;
+    }
+    // Regular group edit should also use this button as "Exit group edit".
+    if ((window as any).__ip_exitGroupEdit) {
+      try {
+        (window as any).__ip_exitGroupEdit();
       } catch {}
       return;
     }

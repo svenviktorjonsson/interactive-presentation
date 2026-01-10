@@ -939,6 +939,29 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 screen_nodes.add(name)
             continue
 
+        if kw == "video":
+            # Video node: can be an actual video file (/media/foo.mp4) or a YouTube URL (renderer will embed).
+            src = params.get("src") or params.get("url") or params.get("file")
+            if not src:
+                raise ValueError(f"video requires src= (or url=/file=) in: {raw}")
+            node = {"id": name, "type": "video", "space": "screen" if screen_mode else "world", "src": src}
+            # Thumbnail spec:
+            # - thumbnail= supports either a time string (MM:SS / HH:MM:SS) OR a URL/path to an image
+            # - poster=/thumb= are back-compat aliases (image URL/path)
+            thumbnail = (params.get("thumbnail") or "").strip()
+            if thumbnail:
+                node["thumbnail"] = thumbnail
+            poster = (params.get("poster") or params.get("thumb") or "").strip()
+            if poster and "thumbnail" not in node:
+                node["poster"] = poster
+            nodes_by_id[name] = node
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
+            continue
+
         if kw == "table":
             # CSV-like table rendered by the frontend.
             # Syntax:
@@ -993,6 +1016,44 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 screen_nodes.add(name)
             continue
 
+        if kw == "graph":
+            # Simple scatter plot, backed by generic sources.
+            # Syntax:
+            # graph[name=...,xSource=t_table[0],ySource=t_table[1],xLabel=x,yLabel=y,grid=on,color=white]
+            x_src = str(params.get("xSource") or params.get("xsource") or "").strip()
+            y_src = str(params.get("ySource") or params.get("ysource") or "").strip()
+            # Back-compat (older syntax):
+            table_id = str(params.get("table") or params.get("tableId") or "").strip()
+            x_header = str(params.get("xHeader") or params.get("xheader") or "").strip()
+            y_header = str(params.get("yHeader") or params.get("yheader") or "").strip()
+            if (not x_src or not y_src) and table_id and x_header and y_header:
+                # Convert legacy to source syntax (assumes 0/1 columns when headers are unknown).
+                x_src = x_src or f"{table_id}[0]"
+                y_src = y_src or f"{table_id}[1]"
+
+            x_label = str(params.get("xLabel") or params.get("xlabel") or "x").strip() or "x"
+            y_label = str(params.get("yLabel") or params.get("ylabel") or "y").strip() or "y"
+            grid = str(params.get("grid") or "on").strip().lower()
+            color = str(params.get("color") or params.get("stroke") or "white").strip() or "white"
+
+            nodes_by_id[name] = {
+                "id": name,
+                "type": "graph",
+                "space": "screen" if screen_mode else "world",
+                "xSource": x_src or None,
+                "ySource": y_src or None,
+                "xLabel": x_label,
+                "yLabel": y_label,
+                "grid": grid,
+                "color": color,
+            }
+            _apply_style_params(nodes_by_id[name], params)
+            if current_view:
+                current_view["show"].append(name)
+            else:
+                screen_nodes.add(name)
+            continue
+
         if kw == "arrow":
             # Simple arrow node (rendered by the frontend as SVG).
             # Syntax: arrow[name=...,from=(0,0),to=(1,0),color=white,width=0.01]
@@ -1032,9 +1093,9 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 screen_nodes.add(name)
             continue
 
-        if kw == "line":
+        if kw == "line" or kw == "lines":
             # Simple line node (rendered by the frontend as SVG, no arrowhead).
-            # Syntax: line[name=...,from=(0,0),to=(1,0),color=white,width=2]
+            # Syntax: lines[name=...,from=(0,0),to=(1,0),color=white,width=2,p1Join=...,p2Join=...]
             def parse_vec(raw_v: str | None, default: tuple[float, float]) -> tuple[float, float]:
                 s = str(raw_v or "").strip()
                 m2 = re.match(r"^\(\s*([\-0-9.]+)\s*,\s*([\-0-9.]+)\s*\)\s*$", s)
@@ -1055,6 +1116,8 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                     width = float(w_raw)
                 except ValueError:
                     width = None
+            p1_join = str(params.get("p1Join") or "").strip() or None
+            p2_join = str(params.get("p2Join") or "").strip() or None
             nodes_by_id[name] = {
                 "id": name,
                 "type": "line",
@@ -1064,6 +1127,10 @@ def _parse_presentation_txt(path: Path, *, design_w: float, design_h: float) -> 
                 "color": col,
                 "width": width,
             }
+            if p1_join:
+                nodes_by_id[name]["p1Join"] = p1_join
+            if p2_join:
+                nodes_by_id[name]["p2Join"] = p2_join
             _apply_style_params(nodes_by_id[name], params)
             if current_view:
                 current_view["show"].append(name)

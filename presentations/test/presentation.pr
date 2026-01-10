@@ -8,8 +8,22 @@ bullets[name=t_bullets,type=A]:
 This is a bullets node.
 Scaling should scale text, not shrink wrapping width.
 
-arrow[name=t_arrow,from=(0,0.5),to=(1,1),color=white,width=4]
-line[name=t_line,from=(0,0.5),to=(1,1),color=white,width=4]
+arrow[name=t_arrow,from=(0,0.842755),to=(1,0.157245),color=white,width=4]
+lines[name=t_line,from=(0,0.5),to=(1,1),color=white,width=4]
 timer[name=t_timer,barColor=orange,binSize=1,grid=off,lineColor=green,lineWidth=2,max=40,min=20,showTime=0,stat=gaussian]
 text[name=text2]:
 New text
+
+
+view[name=video,refView=home,loc=right]:
+video[name=t_video,src=https://www.youtube.com/watch?v=JgJABtXhUiY,thumbnail=00:04.50]
+
+view[name=view3,refView=video,loc=right]:
+table[name=t_table,delim=";",hstyle=||c|c||,vstyle=|b||c|...|,bgColor=rgba(255,255,255,0.06),bgAlpha=1,borderRadius=12]:
+x;y
+1;1
+2;4
+3;9
+4;16
+
+graph[name=t_graph,xSource=t_table[0],ySource=t_table[1],xLabel=x,yLabel=y,grid=on,color=white]

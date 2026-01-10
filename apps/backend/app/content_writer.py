@@ -32,9 +32,17 @@ def _fmt_param_value(v: Any) -> str:
         except Exception:
             return _safe_str(str(v))
     s = str(v)
-    if re.match(r"^[a-zA-Z0-9_.\-]+$", s):
-        return _safe_str(s)
-    return f'"{_safe_str(s)}"'
+    # The DSL param splitter only uses commas at top-level inside `[...]`.
+    # So we can keep values unquoted even with spaces, colons, slashes, etc.
+    # We only MUST quote when the value could break the bracketed param list.
+    #
+    # Rules:
+    # - quote if value contains a comma (param separator)
+    # - quote if value contains ']' (would terminate the param list)
+    # - quote if value contains newlines (keeps the DSL one-line header safe)
+    if "," in s or "]" in s or "\n" in s or "\r" in s:
+        return f'"{_safe_str(s)}"'
+    return _safe_str(s)
 
 
 def write_geometries_csv(path: Path, model: dict[str, Any]) -> None:
@@ -222,6 +230,16 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                 params.append(f'src="{_safe_str(str(src))}"')
             lines.append(f"iframe[{','.join(params)}]")
             return
+        if t == "video":
+            src = n.get("src")
+            params = [f"name={node_id}"] + style_params(n)
+            if src:
+                params.append(f"src={_fmt_param_value(src)}")
+            thumb = n.get("thumbnail") or n.get("poster")
+            if thumb:
+                params.append(f"thumbnail={_fmt_param_value(thumb)}")
+            lines.append(f"video[{','.join(params)}]")
+            return
         if t == "image":
             src = n.get("src")
             params = [f"name={node_id}"] + style_params(n)
@@ -252,6 +270,28 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             for row in n.get("rows", []) or []:
                 lines.append(_safe_str(delim.join([str(c) for c in row])))
             lines.append("")
+            return
+        if t == "graph":
+            params = [f"name={node_id}"] + style_params(n)
+            xs = n.get("xSource")
+            ys = n.get("ySource")
+            if isinstance(xs, str) and xs.strip():
+                params.append(f"xSource={_fmt_param_value(xs.strip())}")
+            if isinstance(ys, str) and ys.strip():
+                params.append(f"ySource={_fmt_param_value(ys.strip())}")
+            xl = n.get("xLabel")
+            yl = n.get("yLabel")
+            if isinstance(xl, str) and xl.strip():
+                params.append(f"xLabel={_fmt_param_value(xl.strip())}")
+            if isinstance(yl, str) and yl.strip():
+                params.append(f"yLabel={_fmt_param_value(yl.strip())}")
+            grid = n.get("grid")
+            if isinstance(grid, str) and grid.strip():
+                params.append(f"grid={_safe_str(grid.strip())}")
+            col = n.get("color") or n.get("stroke")
+            if isinstance(col, str) and col.strip():
+                params.append(f"color={_fmt_param_value(col.strip())}")
+            lines.append(f"graph[{','.join(params)}]")
             return
         if t == "arrow":
             params = [f"name={node_id}"] + style_params(n)
@@ -285,7 +325,13 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                 params.append(f"color={_fmt_param_value(col.strip())}")
             if isinstance(n.get("width"), (int, float)):
                 params.append(f"width={_fmt_param_value(n.get('width'))}")
-            lines.append(f"line[{','.join(params)}]")
+            p1j = n.get("p1Join")
+            p2j = n.get("p2Join")
+            if isinstance(p1j, str) and p1j.strip():
+                params.append(f"p1Join={_fmt_param_value(p1j.strip())}")
+            if isinstance(p2j, str) and p2j.strip():
+                params.append(f"p2Join={_fmt_param_value(p2j.strip())}")
+            lines.append(f"lines[{','.join(params)}]")
             return
         if t == "sound":
             params = [f"name={node_id}"] + style_params(n)

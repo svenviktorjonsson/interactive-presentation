@@ -626,6 +626,484 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     return { id: node.id, el, update, destroy: () => el.remove() };
   }
 
+  if (node.type === "video") {
+    const el = document.createElement("div");
+    el.classList.add("node-video");
+    el.style.boxSizing = "border-box";
+    el.style.position = "absolute";
+    // Allow handles (rotate dot) to render outside the frame bounds.
+    el.style.overflow = "visible";
+
+    const frame = document.createElement("div");
+    frame.className = "video-frame";
+
+    const borderPx = 10;
+    const posterImg = document.createElement("img");
+    posterImg.className = "video-poster";
+    posterImg.alt = "Video poster";
+    posterImg.style.position = "absolute";
+    posterImg.style.left = `${borderPx}px`;
+    posterImg.style.top = `${borderPx}px`;
+    posterImg.style.right = `${borderPx}px`;
+    posterImg.style.bottom = `${borderPx}px`;
+    posterImg.style.width = `calc(100% - ${borderPx * 2}px)`;
+    posterImg.style.height = `calc(100% - ${borderPx * 2}px)`;
+    posterImg.style.objectFit = "cover";
+    posterImg.style.display = "none";
+    posterImg.style.pointerEvents = "none";
+    (posterImg.style as any).zIndex = "2";
+    const controls = document.createElement("div");
+    controls.className = "video-controls";
+    controls.style.position = "absolute";
+    controls.style.left = `${borderPx}px`;
+    controls.style.right = `${borderPx}px`;
+    controls.style.bottom = `${borderPx}px`;
+    controls.style.display = "flex";
+    controls.style.alignItems = "center";
+    controls.style.gap = "10px";
+    controls.style.padding = "10px 12px";
+    controls.style.borderRadius = "10px";
+    controls.style.background = "rgba(0,0,0,0.55)";
+    controls.style.backdropFilter = "blur(6px)";
+    // Control availability:
+    // - Edit mode: controls are disabled via CSS so selection/drag is easy.
+    // - Live mode: controls should be clickable.
+    controls.style.pointerEvents = "auto";
+    (controls.style as any).zIndex = "2";
+
+    const btnPlay = document.createElement("button");
+    btnPlay.type = "button";
+    btnPlay.className = "video-btn";
+    btnPlay.textContent = "Play";
+
+    const timeTxt = document.createElement("div");
+    timeTxt.className = "video-time";
+    timeTxt.textContent = "0:00 / 0:00";
+    timeTxt.style.whiteSpace = "nowrap";
+
+    const slider = document.createElement("input");
+    slider.type = "range";
+    slider.className = "video-slider";
+    slider.min = "0";
+    slider.max = "1";
+    slider.step = "0.001";
+    slider.value = "0";
+    slider.style.flex = "1";
+
+    controls.append(btnPlay, timeTxt, slider);
+
+    const iframe = document.createElement("iframe");
+    iframe.className = "video-embed";
+    iframe.style.position = "absolute";
+    iframe.style.left = `${borderPx}px`;
+    iframe.style.top = `${borderPx}px`;
+    iframe.style.right = `${borderPx}px`;
+    iframe.style.bottom = `${borderPx}px`;
+    iframe.style.width = `calc(100% - ${borderPx * 2}px)`;
+    iframe.style.height = `calc(100% - ${borderPx * 2}px)`;
+    iframe.style.border = "0";
+    iframe.style.background = "transparent";
+    iframe.loading = "lazy";
+    iframe.allow = "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share";
+    iframe.referrerPolicy = "strict-origin-when-cross-origin";
+    (iframe as any).allowFullscreen = true;
+
+    const vid = document.createElement("video");
+    vid.className = "video";
+    vid.style.position = "absolute";
+    vid.style.left = `${borderPx}px`;
+    vid.style.top = `${borderPx}px`;
+    vid.style.right = `${borderPx}px`;
+    vid.style.bottom = `${borderPx}px`;
+    vid.style.width = `calc(100% - ${borderPx * 2}px)`;
+    vid.style.height = `calc(100% - ${borderPx * 2}px)`;
+    vid.style.border = "0";
+    vid.style.background = "transparent";
+    vid.style.display = "none";
+    vid.controls = false;
+    vid.preload = "metadata";
+    (vid.style as any).zIndex = "1";
+    (iframe.style as any).zIndex = "1";
+
+    const fmtTime = (sec: number) => {
+      if (!Number.isFinite(sec) || sec < 0) sec = 0;
+      const s = Math.floor(sec);
+      const m = Math.floor(s / 60);
+      const r = s % 60;
+      return `${m}:${String(r).padStart(2, "0")}`;
+    };
+
+    // --- YouTube API bootstrap (loaded lazily, only when needed) ---
+    type YTPlayer = {
+      playVideo: () => void;
+      pauseVideo: () => void;
+      seekTo: (t: number, allowSeekAhead: boolean) => void;
+      getCurrentTime: () => number;
+      getDuration: () => number;
+      getPlayerState: () => number;
+      destroy: () => void;
+      loadVideoById?: (videoId: string) => void;
+      cueVideoById?: (videoId: string) => void;
+    };
+    const ensureYouTubeApi = () => {
+      const w = window as any;
+      if (w.YT && w.YT.Player) return Promise.resolve(w.YT);
+      if (w.__ip_ytApiPromise) return w.__ip_ytApiPromise as Promise<any>;
+      w.__ip_ytApiPromise = new Promise((resolve, reject) => {
+        const tag = document.createElement("script");
+        tag.src = "https://www.youtube.com/iframe_api";
+        tag.async = true;
+        tag.onerror = () => reject(new Error("Failed to load YouTube iframe API"));
+        (w as any).onYouTubeIframeAPIReady = () => resolve((w as any).YT);
+        document.head.appendChild(tag);
+      });
+      return w.__ip_ytApiPromise as Promise<any>;
+    };
+
+    const toAbsoluteMediaSrc = (src: string) => {
+      const s = String(src ?? "").trim();
+      if (!s) return "";
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return s;
+      if (s.startsWith("/")) return s;
+      if (s.startsWith("media/")) return `/${s}`;
+      return `/media/${s}`;
+    };
+
+    const toAbsoluteImageSrc = (src: string) => {
+      const s = String(src ?? "").trim();
+      if (!s) return "";
+      if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(s)) return s;
+      if (s.startsWith("/")) return s;
+      if (s.startsWith("media/")) return `/${s}`;
+      return `/media/${s}`;
+    };
+
+    const parseTimeToSeconds = (raw: string): number | null => {
+      const s = String(raw ?? "").trim();
+      if (!s) return null;
+      // Accept HH:MM:SS(.sss) or MM:SS(.sss) or SS(.sss)
+      if (!/^\d+(:\d+){0,2}(\.\d+)?$/.test(s)) return null;
+      const parts = s.split(":").map((p) => p.trim());
+      if (parts.some((p) => p === "")) return null;
+      const nums = parts.map((p) => Number(p));
+      if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null;
+      let sec = 0;
+      if (nums.length === 1) sec = nums[0]!;
+      else if (nums.length === 2) sec = nums[0]! * 60 + nums[1]!;
+      else sec = nums[0]! * 3600 + nums[1]! * 60 + nums[2]!;
+      return sec;
+    };
+    const toYouTubeEmbed = (src: string) => {
+      const s = String(src ?? "").trim();
+      if (!s) return null;
+      try {
+        const u = new URL(s);
+        const host = u.hostname.replace(/^www\./, "");
+        let id: string | null = null;
+        if (host === "youtube.com" || host === "m.youtube.com") {
+          if (u.pathname === "/watch") id = u.searchParams.get("v");
+          else if (u.pathname.startsWith("/embed/")) id = u.pathname.split("/").pop() || null;
+          else if (u.pathname.startsWith("/shorts/")) id = u.pathname.split("/").pop() || null;
+        } else if (host === "youtu.be") {
+          id = u.pathname.replace("/", "") || null;
+        }
+        if (!id) return null;
+        // Use JS API so we can provide consistent controls.
+        // Privacy-friendly embed domain.
+        const origin = encodeURIComponent(window.location.origin);
+        return `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?rel=0&enablejsapi=1&origin=${origin}`;
+      } catch {
+        return null;
+      }
+    };
+
+    frame.appendChild(iframe);
+    frame.appendChild(vid);
+    frame.appendChild(posterImg);
+    frame.appendChild(controls);
+    el.appendChild(frame);
+    setCommonStyles(el, node);
+
+    let ytPlayer: YTPlayer | null = null;
+    let ytPoll: number | null = null;
+    let activeMode: "youtube" | "file" | null = null;
+    let activeSrc = "";
+    let isScrubbing = false;
+    let showPoster = true;
+
+    const setTimeUi = (cur: number, dur: number) => {
+      const d = Number.isFinite(dur) && dur > 0 ? dur : 0;
+      const c = Number.isFinite(cur) && cur >= 0 ? Math.min(cur, d || cur) : 0;
+      timeTxt.textContent = `${fmtTime(c)} / ${fmtTime(d)}`;
+      slider.max = d > 0 ? String(d) : "1";
+      slider.disabled = !(d > 0);
+      if (!isScrubbing) slider.value = String(c || 0);
+    };
+
+    const setPosterVisible = (on: boolean) => {
+      showPoster = on;
+      posterImg.style.display = on ? "block" : "none";
+    };
+
+    const stopYouTube = () => {
+      if (ytPoll != null) {
+        window.clearInterval(ytPoll);
+        ytPoll = null;
+      }
+      if (ytPlayer) {
+        try {
+          ytPlayer.destroy();
+        } catch {
+          // ignore
+        }
+        ytPlayer = null;
+      }
+      iframe.removeAttribute("src");
+    };
+
+    const stopFile = () => {
+      try {
+        vid.pause();
+      } catch {
+        // ignore
+      }
+      vid.removeAttribute("src");
+      // Force unload (best-effort)
+      try {
+        vid.load();
+      } catch {
+        // ignore
+      }
+    };
+
+    btnPlay.addEventListener("click", () => {
+      if (activeMode === "file") {
+        if (vid.paused) {
+          void vid.play().catch(() => {});
+        } else {
+          vid.pause();
+        }
+        return;
+      }
+      if (activeMode === "youtube" && ytPlayer) {
+        try {
+          const st = ytPlayer.getPlayerState?.() ?? 0;
+          // 1: playing, 2: paused
+          if (st === 1) ytPlayer.pauseVideo();
+          else ytPlayer.playVideo();
+        } catch {
+          // ignore
+        }
+      }
+    });
+
+    slider.addEventListener("pointerdown", () => (isScrubbing = true));
+    slider.addEventListener("pointerup", () => (isScrubbing = false));
+    slider.addEventListener("change", () => {
+      const t = Number(slider.value);
+      if (!Number.isFinite(t)) return;
+      if (activeMode === "file") {
+        try {
+          vid.currentTime = t;
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      if (activeMode === "youtube" && ytPlayer) {
+        try {
+          ytPlayer.seekTo(t, true);
+        } catch {
+          // ignore
+        }
+      }
+    });
+
+    // Keep UI in sync for local files.
+    const syncFileUi = () => {
+      const dur = Number(vid.duration);
+      const cur = Number(vid.currentTime);
+      setTimeUi(cur, dur);
+      btnPlay.textContent = vid.paused ? "Play" : "Pause";
+    };
+    vid.addEventListener("loadedmetadata", syncFileUi);
+    vid.addEventListener("timeupdate", syncFileUi);
+    vid.addEventListener("play", syncFileUi);
+    vid.addEventListener("pause", syncFileUi);
+    vid.addEventListener("ended", syncFileUi);
+
+    // Poster visibility rules:
+    // - show before first play (time ~0)
+    // - show after ended
+    // - hide once playback is underway (time > 0 and not ended)
+    const syncFilePoster = () => {
+      const t = Number(vid.currentTime);
+      const dur = Number(vid.duration);
+      const ended = !!vid.ended || (Number.isFinite(dur) && dur > 0 && Math.abs(t - dur) < 0.02);
+      const beforeStart = !(t > 0.02);
+      setPosterVisible(ended || beforeStart);
+    };
+    vid.addEventListener("loadedmetadata", syncFilePoster);
+    vid.addEventListener("timeupdate", syncFilePoster);
+    vid.addEventListener("play", syncFilePoster);
+    vid.addEventListener("pause", syncFilePoster);
+    vid.addEventListener("ended", syncFilePoster);
+
+    const update = (n: NodeModel) => {
+      setCommonStyles(el, n);
+      if (n.type !== "video") return;
+      const raw = String((n as any).src ?? "");
+      const thumbSpec = String((n as any).thumbnail ?? (n as any).poster ?? "").trim();
+      const thumbTimeS = parseTimeToSeconds(thumbSpec);
+      const yt = toYouTubeEmbed(raw);
+      if (yt) {
+        // Poster: explicit poster= wins; otherwise use ytimg thumbnail.
+        // We derive the videoId from the embed url.
+        const m = yt.match(/\/embed\/([^?]+)/);
+        const vidId = m ? decodeURIComponent(m[1] || "") : "";
+        const ytThumb = vidId ? `https://i.ytimg.com/vi/${encodeURIComponent(vidId)}/hqdefault.jpg` : "";
+        const poster = thumbTimeS != null ? ytThumb : (thumbSpec ? toAbsoluteImageSrc(thumbSpec) : ytThumb);
+        if (poster && posterImg.getAttribute("src") !== poster) posterImg.src = poster;
+        if (activeMode !== "youtube" || activeSrc !== yt) {
+          stopFile();
+          stopYouTube();
+          activeMode = "youtube";
+          activeSrc = yt;
+          vid.style.display = "none";
+          iframe.style.display = "block";
+          setPosterVisible(true);
+          iframe.id = `yt-${String(n.id)}`;
+          iframe.src = yt;
+          // Create a controllable player instance on top of the iframe.
+          void ensureYouTubeApi()
+            .then((YT) => {
+              // If we switched away meanwhile, bail.
+              if (activeMode !== "youtube" || activeSrc !== yt) return;
+              try {
+                ytPlayer = new YT.Player(iframe, {
+                  events: {
+                    onReady: () => {
+                      // Poll state/time for UI (simple + robust).
+                      if (ytPoll != null) window.clearInterval(ytPoll);
+                      ytPoll = window.setInterval(() => {
+                        if (!ytPlayer) return;
+                        try {
+                          const cur = ytPlayer.getCurrentTime();
+                          const dur = ytPlayer.getDuration();
+                          setTimeUi(cur, dur);
+                          const st = ytPlayer.getPlayerState?.() ?? 0;
+                          btnPlay.textContent = st === 1 ? "Pause" : "Play";
+                          // Poster: show before start and after ended.
+                          // States: 1 playing, 2 paused, 0 ended
+                          const beforeStart = !(cur > 0.02);
+                          const ended = st === 0;
+                          setPosterVisible(beforeStart || ended);
+                        } catch {
+                          // ignore
+                        }
+                      }, 200);
+                    },
+                  },
+                }) as YTPlayer;
+              } catch {
+                // If YT creation fails, leave the iframe with its own controls (best-effort fallback).
+                // Force YouTube native controls on.
+                iframe.src = yt.replace("controls=0", "controls=1");
+              }
+            })
+            .catch(() => {
+              // ignore
+            });
+        }
+        return;
+      }
+      const abs = toAbsoluteMediaSrc(raw);
+      if (thumbTimeS == null) {
+        const poster = thumbSpec ? toAbsoluteImageSrc(thumbSpec) : "";
+        if (poster && posterImg.getAttribute("src") !== poster) posterImg.src = poster;
+      }
+      if (activeMode !== "file" || activeSrc !== abs) {
+        stopYouTube();
+        activeMode = "file";
+        activeSrc = abs;
+        iframe.style.display = "none";
+        vid.style.display = "block";
+        // If no explicit image thumbnail was provided, keep it hidden for now.
+        // If thumbnail is a time spec, we'll generate an image snapshot asynchronously.
+        posterImg.style.display = thumbTimeS == null && thumbSpec ? "block" : "none";
+        vid.src = abs;
+        syncFileUi();
+        syncFilePoster();
+      }
+
+      // Local video thumbnail by time: capture a frame into an image.
+      if (activeMode === "file" && thumbTimeS != null) {
+        // Show poster until first play/after ended.
+        setPosterVisible(true);
+        // Generate thumbnail once per src+time.
+        const key = `${activeSrc}@@t=${thumbTimeS}`;
+        const w = window as any;
+        const cache = (w.__ip_videoThumbCache ??= new Map()) as Map<string, string>;
+        const cached = cache.get(key);
+        if (cached) {
+          if (posterImg.getAttribute("src") !== cached) posterImg.src = cached;
+        } else {
+          // Offscreen capture. This will work for same-origin media; cross-origin requires CORS headers.
+          const off = document.createElement("video");
+          off.preload = "metadata";
+          off.muted = true;
+          off.playsInline = true;
+          try {
+            (off as any).crossOrigin = "anonymous";
+          } catch {}
+          off.src = activeSrc;
+          const cleanup = () => {
+            try {
+              off.removeAttribute("src");
+              off.load();
+            } catch {}
+          };
+          const capture = async () => {
+            await new Promise<void>((resolve, reject) => {
+              off.addEventListener("loadedmetadata", () => resolve(), { once: true });
+              off.addEventListener("error", () => reject(new Error("video metadata load failed")), { once: true });
+            });
+            const dur = Number(off.duration);
+            const t = Math.max(0, Math.min(thumbTimeS, Number.isFinite(dur) ? Math.max(0, dur - 0.05) : thumbTimeS));
+            off.currentTime = t;
+            await new Promise<void>((resolve, reject) => {
+              off.addEventListener("seeked", () => resolve(), { once: true });
+              off.addEventListener("error", () => reject(new Error("video seek failed")), { once: true });
+            });
+            const c = document.createElement("canvas");
+            const w0 = Math.max(1, off.videoWidth || 1);
+            const h0 = Math.max(1, off.videoHeight || 1);
+            c.width = w0;
+            c.height = h0;
+            const ctx = c.getContext("2d");
+            if (!ctx) throw new Error("canvas 2d context missing");
+            ctx.drawImage(off, 0, 0, w0, h0);
+            const dataUrl = c.toDataURL("image/jpeg", 0.85);
+            cache.set(key, dataUrl);
+            if (posterImg.getAttribute("src") !== dataUrl) posterImg.src = dataUrl;
+          };
+          void capture().catch(() => {}).finally(cleanup);
+        }
+      }
+    };
+    update(node);
+    return {
+      id: node.id,
+      el,
+      update,
+      destroy: () => {
+        stopYouTube();
+        stopFile();
+        el.remove();
+      },
+    };
+  }
+
   if (node.type === "image") {
     const el = document.createElement("div");
     el.classList.add("node-image");
@@ -1045,7 +1523,8 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       else delete (el.dataset as any).maxS;
       if (typeof (n as any).binSizeS === "number") el.dataset.binSizeS = String((n as any).binSizeS);
       else delete (el.dataset as any).binSizeS;
-      el.dataset.compositeEditing = "0";
+      // IMPORTANT: composite edit state is owned by the app layer (`bootstrap.ts`).
+      // Do not clobber it here on every render tick, or composite sub-elements will become non-interactive.
     };
     update(node);
     return { id: node.id, el, update, destroy: () => el.remove() };
