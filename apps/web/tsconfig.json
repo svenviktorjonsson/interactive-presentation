@@ -9,7 +9,9 @@
     "baseUrl": ".",
     "paths": {
       "@interactive/content": ["../../packages/content/src"],
-      "@interactive/engine": ["../../packages/engine/src"]
+      "@interactive/engine": ["../../packages/engine/src"],
+      "@interactive/runtime": ["../../packages/runtime/src/index.ts"],
+      "@interactive/runtime/*": ["../../packages/runtime/src/*"]
     },
     "resolveJsonModule": true,
     "isolatedModules": true,

@@ -1,0 +1,14 @@
+{
+  "name": "@interactive/runtime",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@cellmax/katex-renderer": "github:cellmaxtechnologies/packages.katex-renderer",
+    "@interactive/content": "file:../content",
+    "@interactive/engine": "file:../engine",
+    "katex": "^0.16.11"
+  }
+}
+

@@ -176,21 +176,28 @@ def _start_localhostrun_tunnel(local_port: int) -> tuple[subprocess.Popen, str]:
 
 
 def _ensure_node_deps(root: Path) -> None:
-    # Keep it simple: if apps/web/node_modules is missing, run npm install in apps/web.
+    def ensure_install(where: Path, required_files: list[Path]) -> None:
+        if all(p.exists() for p in required_files):
+            return
+        print(f"[run_presentation] Installing Node dependencies (npm install) in {where} ...")
+        res = subprocess.run([_npm_cmd(), "install"], cwd=str(where), shell=False)
+        if res.returncode != 0:
+            raise SystemExit(res.returncode)
+
+    # apps/web deps (vite + katex)
     web_dir = root / "apps" / "web"
-    node_modules = web_dir / "node_modules"
-    # Also ensure the local vite binary exists (common failure after package.json changes).
-    vite_bin = node_modules / ".bin" / ("vite.cmd" if sys.platform.startswith("win") else "vite")
-    # Also ensure key runtime deps exist (e.g., katex) since we rely on local installs only.
-    katex_pkg = node_modules / "katex" / "package.json"
+    web_nm = web_dir / "node_modules"
+    vite_bin = web_nm / ".bin" / ("vite.cmd" if sys.platform.startswith("win") else "vite")
+    web_katex_pkg = web_nm / "katex" / "package.json"
+    ensure_install(web_dir, [vite_bin, web_katex_pkg])
 
-    if node_modules.exists() and vite_bin.exists() and katex_pkg.exists():
-        return
-
-    print("[run_presentation] Installing Node dependencies (npm install)...")
-    res = subprocess.run([_npm_cmd(), "install"], cwd=str(web_dir), shell=False)
-    if res.returncode != 0:
-        raise SystemExit(res.returncode)
+    # packages/runtime deps (katex-renderer + katex) are needed for Vite build resolution
+    # because Vite builds against runtime source files under ./packages/runtime/src/**.
+    rt_dir = root / "packages" / "runtime"
+    rt_nm = rt_dir / "node_modules"
+    rt_renderer_pkg = rt_nm / "@cellmax" / "katex-renderer" / "package.json"
+    rt_katex_pkg = rt_nm / "katex" / "package.json"
+    ensure_install(rt_dir, [rt_renderer_pkg, rt_katex_pkg])
 
 
 def _parse_args() -> argparse.Namespace:
@@ -275,9 +282,11 @@ def main() -> int:
                     print("[run_presentation] then set PUBLIC_BASE_URL and re-run:")
                     print("[run_presentation]   $env:PUBLIC_BASE_URL=\"https://<id>.lhr.life\"")
                     print("[run_presentation]   poetry run python run_presentation.py")
-                    return 1
+                    print("[run_presentation] Continuing without public URL (join QR generation will be skipped).")
+                    public_base_url = ""
             except Exception as e:
                 print(f"[run_presentation] Tunnel disabled (could not start ssh tunnel): {e}")
+                print("[run_presentation] Continuing without public URL (join QR generation will be skipped).")
 
         # Generate / update join QR png into presentations/<id>/media/join_qr.png
         try:
@@ -286,14 +295,19 @@ def main() -> int:
 
             join_origin = public_base_url.strip()
             if not join_origin:
-                print("[run_presentation] Cannot generate join QR without a public URL.")
-                print("[run_presentation] Set PUBLIC_BASE_URL to the assigned localhost.run domain and re-run.")
-                return 1
-            join_url = join_origin.rstrip("/") + "/join"
+                print("[run_presentation] Skipping join QR generation (no public URL).")
+                join_origin = ""
+            if not join_origin:
+                join_url = ""
+            else:
+                join_url = join_origin.rstrip("/") + "/join"
 
             media_dir = root / "presentations" / pres_id / "media"
             media_dir.mkdir(parents=True, exist_ok=True)
             out_path = media_dir / "join_qr.png"
+
+            if not join_url:
+                raise RuntimeError("no public join_url available")
 
             # IMPORTANT: generate QR with TRANSPARENT background so pixelate can fade in over the
             # presentation background without any white "flash".
@@ -313,6 +327,9 @@ def main() -> int:
             print(f"[run_presentation] Join QR generation failed: {e}")
             print("[run_presentation] Run `poetry install` to install Python deps (qrcode + pillow), then re-run.")
             return 1
+        except RuntimeError as e:
+            # Optional; OK to skip.
+            print(f"[run_presentation] Join QR generation skipped: {e}")
         except Exception as e:
             print(f"[run_presentation] Join QR generation failed: {e}")
             return 1

@@ -12,6 +12,7 @@
     "@cellmax/katex-renderer": "github:cellmaxtechnologies/packages.katex-renderer",
     "@interactive/content": "file:../../packages/content",
     "@interactive/engine": "file:../../packages/engine",
+    "@interactive/runtime": "file:../../packages/runtime",
     "katex": "^0.16.11",
     "qrcode": "^1.5.4"
   },
