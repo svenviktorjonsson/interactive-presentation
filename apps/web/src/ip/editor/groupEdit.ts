@@ -51,21 +51,45 @@ export function createGroupEditController(opts: {
     }
   };
 
+  const cleanupAll = () => {
+    // Hard guarantee: restore interactivity for the whole stage.
+    // This MUST be safe to call even if group edit isn't currently active
+    // (e.g. stale `window.__ip_exitGroupEdit` reference).
+    try {
+      for (const el of Array.from(opts.stage.querySelectorAll<HTMLElement>(".node.ip-dim-node"))) {
+        el.classList.remove("ip-dim-node");
+      }
+      for (const el of Array.from(opts.stage.querySelectorAll<HTMLElement>(".node.ip-group-ref"))) {
+        el.classList.remove("ip-group-ref");
+      }
+      // Clear any stale inline pointer-event disabling.
+      for (const el of Array.from(opts.stage.querySelectorAll<HTMLElement>(".node"))) {
+        if (el.style.pointerEvents === "none") el.style.pointerEvents = "";
+      }
+    } catch {
+      // ignore
+    }
+
+    for (const e of groupHiddenEls) e.classList.remove("ip-dim-node");
+    groupHiddenEls = [];
+    if (groupRefEl) groupRefEl.classList.remove("ip-group-ref");
+    groupRefEl = null;
+
+    const wrap = document.querySelector<HTMLElement>(".mode-toggle");
+    const mode = (wrap?.dataset.mode ?? "edit").toLowerCase();
+    const btn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
+    if (btn) btn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
+    delete (window as any).__ip_exitGroupEdit;
+  };
+
   const exitOneLevel = () => {
-    if (groupEditStack.length === 0) return;
-    groupEditStack.pop();
+    // IMPORTANT: this must be idempotent. A stale window hook should not permanently
+    // block the mode toggle button.
+    if (groupEditStack.length > 0) groupEditStack.pop();
     opts.clearSelection();
     applyDimming();
     if (groupEditStack.length === 0) {
-      for (const e of groupHiddenEls) e.classList.remove("ip-dim-node");
-      groupHiddenEls = [];
-      if (groupRefEl) groupRefEl.classList.remove("ip-group-ref");
-      groupRefEl = null;
-      const wrap = document.querySelector<HTMLElement>(".mode-toggle");
-      const mode = (wrap?.dataset.mode ?? "edit").toLowerCase();
-      const btn = document.querySelector<HTMLButtonElement>(".mode-toggle button");
-      if (btn) btn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
-      delete (window as any).__ip_exitGroupEdit;
+      cleanupAll();
     }
     refreshHoverCursor();
   };

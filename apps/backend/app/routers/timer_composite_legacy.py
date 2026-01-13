@@ -10,7 +10,9 @@ from ..config import PRESENTATION_DIR
 router = APIRouter()
 
 def _format_pr_list_commas(text: str) -> str:
-    # Keep behavior aligned with /api/composite/save: `[a,b]` -> `[a, b]`.
+    # Keep behavior aligned with /api/composite/save:
+    # - `[a,b]` -> `[a, b]`
+    # - `delim=";"` -> `delim=;` (only keep quotes if string contains ',' or ']' or is empty)
     s = str(text or "")
     out: list[str] = []
     in_quotes = False
@@ -20,6 +22,20 @@ def _format_pr_list_commas(text: str) -> str:
     i = 0
     while i < len(s):
         ch = s[i]
+        if ch == '"' and bracket > 0 and (not in_quotes) and brace == 0 and paren == 0:
+            j = i + 1
+            while j < len(s) and s[j] != '"':
+                j += 1
+            if j < len(s) and s[j] == '"':
+                inner = s[i + 1 : j]
+                if inner == "" or ("," in inner) or ("]" in inner) or ("\n" in inner) or ("\r" in inner):
+                    out.append('"')
+                    out.append(inner)
+                    out.append('"')
+                else:
+                    out.append(inner)
+                i = j + 1
+                continue
         if ch == '"':
             in_quotes = not in_quotes
             out.append(ch)

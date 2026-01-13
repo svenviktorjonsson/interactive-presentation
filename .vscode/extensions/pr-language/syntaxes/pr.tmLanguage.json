@@ -10,6 +10,7 @@
     { "include": "#element-lines" },
     { "include": "#element-bullets" },
     { "include": "#element-choices" },
+    { "include": "#element-wheel" },
     { "include": "#element-timer" },
     { "include": "#element-sound" },
     { "include": "#element-table" },
@@ -89,6 +90,18 @@
         "1": { "name": "entity.name.function.element.pr" },
         "2": { "name": "punctuation.definition.attributes.begin.pr" },
         "3": { "patterns": [{ "include": "#attributes-choices" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "meta.content.pr" }
+      }
+    },
+    "element-wheel": {
+      "name": "meta.element.wheel.pr",
+      "match": "^(wheel)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-wheel" }] },
         "4": { "name": "punctuation.definition.attributes.end.pr" },
         "5": { "name": "punctuation.separator.colon.pr" },
         "6": { "name": "meta.content.pr" }
@@ -228,6 +241,30 @@
       ]
     },
 
+    "attributes-wheel": {
+      "patterns": [
+        {
+          "comment": "type for wheel (bullet style) - valid: A, a, 1, i, I",
+          "match": "(type)(=)(A|a|1|i|I)(?=[,\\]]|$)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "support.constant.known.pr" }
+          }
+        },
+        {
+          "comment": "type for wheel - invalid",
+          "match": "(type)(=)([^,\\]]+)",
+          "captures": {
+            "1": { "name": "entity.other.attribute-name.pr" },
+            "2": { "name": "keyword.operator.assignment.pr" },
+            "3": { "name": "invalid.illegal.type.pr" }
+          }
+        },
+        { "include": "#attributes-common" }
+      ]
+    },
+
     "attributes-timer": {
       "patterns": [
         {
@@ -277,7 +314,7 @@
         },
         {
           "comment": "color attributes - valid colors",
-          "match": "(bgColor|barColor|lineColor|fgColor|color|fillColor|strokeColor)(=)(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey|transparent)(?=[,\\]]|$)",
+          "match": "(bgColor|barColor|lineColor|fgColor|color|fillColor|strokeColor)(=)(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey|transparent|#[0-9a-fA-F]{3,4}|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{8})(?=[,\\]]|$)",
           "captures": {
             "1": { "name": "entity.other.attribute-name.pr" },
             "2": { "name": "keyword.operator.assignment.pr" },
@@ -394,7 +431,7 @@
               "patterns": [
                 {
                   "name": "support.constant.known.pr",
-                  "match": "\\b(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey)\\b"
+                  "match": "\\b(white|black|red|green|blue|yellow|cyan|magenta|orange|purple|pink|gray|grey)\\b|#[0-9a-fA-F]{3,4}|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{8}"
                 },
                 {
                   "name": "invalid.illegal.color.pr",
@@ -409,7 +446,7 @@
 
     "content": {
       "name": "meta.content.pr",
-      "match": "^(?!#|screen|view|arrow|text|image|bullets|timer|sound|choices|poll|button|input|video|audio|shape|group|table).+$"
+      "match": "^(?!#|screen|view|arrow|text|image|bullets|timer|sound|choices|poll|wheel|button|buttons|input|video|audio|shape|group|table|graph|lines|line).+$"
     }
   }
 }

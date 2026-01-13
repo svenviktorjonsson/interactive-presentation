@@ -6,7 +6,8 @@ import { uploadImageToMedia, loadImageSize } from "./api/media";
 import { hydrateQrImages } from "./features/qr";
 import { Runtime, createGraphPlugin, createTimerPlugin, createChoicesPlugin, createSoundPlugin, createTablePlugin, ensureGraphCompositeLayer, renderGraphCompositeArrows, renderGraphCompositeTexts, layoutGraphCompositeTexts, ensureTimerCompositeLayer, renderTimerCompositeArrows, renderTimerCompositeButtons, renderTimerCompositeTexts, layoutTimerCompositeTexts, ensureSoundCompositeLayer, renderSoundCompositeArrows, renderSoundCompositeTexts, renderSoundCompositeButtons, layoutSoundCompositeTexts, hydrateTextMath, renderTextToElement, renderTextWithKatexToHtml, drawGrid, drawTicksAndLabels, fixedTicks, mergeTickAnchors, niceTicks, prepareCanvas } from "@interactive/runtime";
 import { buildShell } from "./ui/shell";
-import { attachSegmentPlacementTool } from "./editor/tools/segmentPlacement";
+import { createSegmentPlacementController } from "./editor/tools/segmentPlacement";
+import { createInteractionStateMachine } from "./editor/interactions/interactionStateMachine";
 import { createLineGraphDrag } from "./editor/interactions/lineGraphDrag";
 import { createGroupEditController } from "./editor/groupEdit";
 import { createSelectionController } from "./editor/selection";
@@ -1252,16 +1253,9 @@ function getAppMode(): "edit" | "live" {
   return raw.toLowerCase() === "live" ? "live" : "edit";
 }
 
-function ipDebugEnabled(flag: string) {
-  try {
-    return (
-      (localStorage.getItem(flag) === "1" ||
-        (window as any)[flag] === true ||
-        String((window as any)[flag] ?? "") === "1") ?? false
-    );
-  } catch {
-    return false;
-  }
+function ipDebugEnabled(_flag: string) {
+  // Logging is intentionally disabled in this workspace.
+  return false;
 }
 
 async function _debugCompositeSaveFetch(url: string, payload: any, ctx: Record<string, any>) {
@@ -1274,33 +1268,54 @@ async function _debugCompositeSaveFetch(url: string, payload: any, ctx: Record<s
     });
     if (!res.ok) {
       const txt = await res.text().catch(() => "");
-      // Always log failures (otherwise 400s are impossible to debug from the UI).
-      // eslint-disable-next-line no-console
-      console.warn("[ip][composite][save] failed", { status: res.status, statusText: res.statusText, ctx, body: txt });
-      if (dbg) {
-        // eslint-disable-next-line no-console
-        console.warn("[ip][composite][save] payload", payload);
-      }
+      // Intentionally quiet (no console logging; keeps app responsive).
+      void txt;
+      void dbg;
+      void payload;
+      void ctx;
     } else if (dbg) {
-      // eslint-disable-next-line no-console
-      console.log("[ip][composite][save] ok", { ctx, payload });
+      // no-op (logging removed)
     }
   } catch (err) {
-    // Always log network errors too.
-    // eslint-disable-next-line no-console
-    console.warn("[ip][composite][save] error", { ctx, err });
-    if (dbg) {
-      // eslint-disable-next-line no-console
-      console.warn("[ip][composite][save] payload", payload);
-    }
+    // Intentionally quiet (no console logging; keeps app responsive).
+    void err;
+    void dbg;
+    void payload;
+    void ctx;
   }
 }
 
 function ensureHandles(el: HTMLElement) {
+  const dbgAnchorsEnabled = () => false;
+  const dbgAnchorsStack = () => false;
+  // Throttle anchor logging: selection overlays refresh in a RAF loop, otherwise logs spam.
+  const __ip_anchorLogState: WeakMap<HTMLElement, { ts: number; sig: string }> =
+    ((window as any).__ip_anchorLogState ??= new WeakMap());
+
+  const logAnchors = (_event: string, _extra: any = {}) => {};
+
   // Safety: never show transform UI in Live mode.
   if (getAppMode() !== "edit") {
     el.querySelector(":scope > .handles")?.remove();
+    logAnchors("ensureHandles:skip-live");
     return null;
+  }
+
+  // Composite roots (timer/sound/graph) should NOT render node-level handles.
+  // Their selection/transform UI is rendered via the viewport-fixed composite selection overlay box instead.
+  // If we allow node-level handles too, you get "double anchors" (overlay + node).
+  //
+  // NOTE: `ensureHandles` is defined at module scope (no access to `engine` here), so detect composites by DOM.
+  if (!el.classList.contains("ip-composite-selection")) {
+    const isCompositeRoot =
+      !!el.querySelector(":scope > .timer-sub-layer, :scope > .sound-sub-layer, :scope > .graph-sub-layer") ||
+      // Some composites mount their sub-layer under an inner frame element.
+      !!el.querySelector(":scope > .timer-frame > .timer-sub-layer, :scope > .sound-frame > .sound-sub-layer, :scope > .timer-frame > .graph-sub-layer");
+    if (isCompositeRoot) {
+      el.querySelector(":scope > .handles")?.remove();
+      logAnchors("ensureHandles:skip-composite-root-node", { reason: "dom-detected" });
+      return null;
+    }
   }
   let handles = el.querySelector<HTMLDivElement>(":scope > .handles");
 
@@ -1310,6 +1325,7 @@ function ensureHandles(el: HTMLElement) {
     // Simplest UX: no visible handle points ("rings").
     // Endpoints are draggable by proximity (see stage pointerdown handler).
     el.querySelector(":scope > .handles")?.remove();
+    logAnchors("ensureHandles:skip-segment");
     return null;
   }
 
@@ -1321,6 +1337,39 @@ function ensureHandles(el: HTMLElement) {
     if (a === "right") return "centerRight";
     if (a === "center") return "centerCenter";
     return a;
+  };
+
+  const anchorFrac = (a0: string | undefined) => {
+    const a = normalizeAnchor(a0);
+    const ax = a.endsWith("Left") ? 0 : a.endsWith("Right") ? 1 : 0.5;
+    const ay = a.startsWith("Top") ? 0 : a.startsWith("Bottom") ? 1 : 0.5;
+    return { ax, ay, a };
+  };
+
+  // Hide resize/scale handles that lie on the anchored edge/corner.
+  // Scaling "from" the anchored edge is meaningless because the anchor is the pivot/fixed point.
+  // Rotation handles remain visible.
+  const updateHandleVisibility = (root: HTMLElement) => {
+    const { ax, ay } = anchorFrac(el.dataset.anchor);
+    const hide = new Set<string>();
+    if (ay === 0) hide.add("n");
+    if (ay === 1) hide.add("s");
+    if (ax === 0) hide.add("w");
+    if (ax === 1) hide.add("e");
+    if (ax === 0 && ay === 1) hide.add("sw");
+    if (ax === 1 && ay === 1) hide.add("se");
+    for (const h of Array.from(root.querySelectorAll<HTMLElement>(".handle"))) {
+      const name = String(h.dataset.handle ?? "");
+      const isRotate = name === "rot" || name.startsWith("rot-");
+      if (isRotate) {
+        h.style.display = "";
+        h.style.pointerEvents = "";
+        continue;
+      }
+      const shouldHide = hide.has(name);
+      h.style.display = shouldHide ? "none" : "";
+      h.style.pointerEvents = shouldHide ? "none" : "";
+    }
   };
 
   const updateAnchorDots = (root: HTMLElement) => {
@@ -1395,6 +1444,11 @@ function ensureHandles(el: HTMLElement) {
     if (!isSegment) {
       updateAnchorDots(handles);
       updateHandleCursors(handles);
+      updateHandleVisibility(handles);
+      logAnchors("ensureHandles:update-existing", {
+        nAnchorDots: handles.querySelectorAll(".anchor-dot").length,
+        nHandles: handles.querySelectorAll(".handle").length,
+      });
       return handles;
     }
     // Update segment control point positions from dataset (set by renderer update).
@@ -1534,6 +1588,11 @@ function ensureHandles(el: HTMLElement) {
   el.appendChild(handles);
   updateAnchorDots(handles);
   updateHandleCursors(handles);
+  updateHandleVisibility(handles);
+  logAnchors("ensureHandles:create", {
+    nAnchorDots: handles.querySelectorAll(".anchor-dot").length,
+    nHandles: handles.querySelectorAll(".handle").length,
+  });
   return handles;
 }
 
@@ -1604,6 +1663,15 @@ function attachEditor(
   setApplySelection: (fn: () => void) => void
 ) {
   const selected = new Set<string>();
+  const debugSelectionEnabled = () => {
+    try {
+      return localStorage.getItem("ip_debug_selection") === "1";
+    } catch {
+      return false;
+    }
+  };
+  // Intentionally no debug event logging (keeps editor responsive).
+  const ensureStopPropagationDebug = () => {};
   // Selection controller is created later (after `effectiveNodeRectClient` is defined).
   let selection: ReturnType<typeof createSelectionController> | null = null;
   let lastContextWorld: { x: number; y: number } | null = null;
@@ -1621,6 +1689,9 @@ function attachEditor(
     },
     { passive: true }
   );
+
+  ensureStopPropagationDebug();
+  // (pointer debug listeners removed)
 
   // Simple top toolbox (edit mode): pick what to place.
   let tool: "select" | "text" | "bullets" | "arrow" | "line" = "select";
@@ -1643,6 +1714,23 @@ function attachEditor(
   // Keep toolbox clicks local (but don't block the button itself).
   toolbox.addEventListener("pointerdown", (e) => e.stopPropagation());
   toolbox.addEventListener("click", (e) => e.stopPropagation());
+
+  const clearSelectionImmediate = () => {
+    // Tool switching happens before the selection controller is created.
+    // Still clear any visible selection chrome so draw mode is "pure".
+    try {
+      selected.clear();
+      // Remove node-level handles (if any already exist).
+      for (const h of Array.from(stage.querySelectorAll<HTMLElement>(".handles"))) h.remove();
+      // Remove any overlay boxes created by selection controller (mounted on body).
+      document.querySelector<HTMLElement>(".ip-composite-selection")?.remove();
+      document.querySelector<HTMLElement>(".ip-linegraph-selection")?.remove();
+      // Clear CSS selection class.
+      for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".node.is-selected"))) el.classList.remove("is-selected");
+    } catch {
+      // ignore
+    }
+  };
 
   const mkToolBtn = (id: typeof tool, label: string, iconHtml: string) => {
     const b = document.createElement("button");
@@ -1667,6 +1755,8 @@ function attachEditor(
         x.style.background = x === b ? "rgba(110,168,255,0.22)" : "rgba(255,255,255,0.06)";
         x.style.borderColor = x === b ? "rgba(110,168,255,0.36)" : "rgba(255,255,255,0.16)";
       }
+      // Draw-mode isolation: never keep a selection active while placing.
+      if (tool !== "select") clearSelectionImmediate();
     });
     return b;
   };
@@ -1735,8 +1825,7 @@ function attachEditor(
             const layer =
               el.querySelector<HTMLElement>(".timer-sub-layer") ?? el.querySelector<HTMLElement>(".sound-sub-layer") ?? null;
             if (layer) layer.style.pointerEvents = "auto";
-            // eslint-disable-next-line no-console
-            console.log("[ip][dbg] restored compositeEditing after setModel", { id, prev });
+            void prev;
           }
         }
       } catch {
@@ -2445,6 +2534,9 @@ function attachEditor(
   let start = { x: 0, y: 0 };
   let startSnapshot: PresentationModel | null = null;
   let startNodesById: Record<string, any> | null = null;
+  // Only push to undo history when the model actually changed due to a drag/resize/rotate.
+  // Otherwise, selection clicks would spam history (bad ctrl+z/ctrl+y UX).
+  let dragDirty = false;
   let startAngleRad = 0;
   let startRotationDeg = 0;
   const lineGraphDrag = createLineGraphDrag({
@@ -2468,6 +2560,24 @@ function attachEditor(
         startClientY: number;
         hnd: string | null;
       } = null;
+
+  // Line-graph (polyline) rigid transform box drag state.
+  // (The selection overlay is mounted on document.body, so events are handled on window capture.)
+  let lineGraphBoxDrag:
+    | null
+    | {
+        pointerId: number;
+        seedId: string;
+        handle: string; // "move" | resize handle ("n/s/e/w/se/sw/...") | "rot-*"
+        startClientX: number;
+        startClientY: number;
+        centerClientX: number;
+        centerClientY: number;
+        before: PresentationModel | null;
+        startNodesById: Record<string, any>;
+        dirty: boolean;
+      } = null;
+  const isLineGraphBoxTarget = (t: EventTarget | null) => (t as HTMLElement | null)?.closest?.(".ip-linegraph-selection") as HTMLElement | null;
   let lastCompositeClick:
     | null
     | {
@@ -2479,11 +2589,11 @@ function attachEditor(
 
   const cursorForHandle = (h: string | null) => {
     if (!h) return "";
-    if (h === "rot" || h.startsWith("rot-")) return "grab";
-    if (h === "n" || h === "s") return "ns-resize";
-    if (h === "e" || h === "w") return "ew-resize";
-    if (h === "nw" || h === "se") return "nwse-resize";
-    if (h === "ne" || h === "sw") return "nesw-resize";
+    if (h === "rot" || h.startsWith("rot-")) return rotationCursorCss(0);
+    if (h === "n" || h === "s") return resizeCursorCss(90);
+    if (h === "e" || h === "w") return resizeCursorCss(0);
+    if (h === "nw" || h === "se") return resizeCursorCss(45);
+    if (h === "ne" || h === "sw") return resizeCursorCss(135);
     return "";
   };
   const cursorForHandleWithRotation = (h: string | null, rotDeg: number) => {
@@ -2513,10 +2623,20 @@ function attachEditor(
     return cursorForHandle(h);
   };
   const setBodyCursor = (c: string) => {
-    // IMPORTANT: element-level cursor (e.g. stage) overrides document cursor.
-    // Keep them in sync so "closed hand" shows while dragging even when the pointer is over the stage.
+    // IMPORTANT: cursor is resolved from the *element under the pointer*.
+    // During drags, many elements set `cursor: grab`, which can override the closed-hand cursor.
+    // To guarantee the cursor stays "closed hand" until pointerup, we apply a global force-cursor class.
     const cur = c || "";
-    document.documentElement.style.cursor = cur;
+    const root = document.documentElement;
+    if (cur) {
+      root.classList.add("ip-force-cursor");
+      root.style.setProperty("--ip-force-cursor", cur);
+    } else {
+      root.classList.remove("ip-force-cursor");
+      root.style.removeProperty("--ip-force-cursor");
+    }
+    root.style.cursor = cur;
+    document.body.style.cursor = cur;
     stage.style.cursor = cur;
   };
 
@@ -2579,16 +2699,81 @@ function attachEditor(
     return Math.abs(lx) <= hw - R && Math.abs(ly) <= hh - R;
   };
 
+  const normalizeAnchor = (a: string | undefined) => {
+    if (!a) return "topLeft";
+    if (a === "top") return "topCenter";
+    if (a === "bottom") return "bottomCenter";
+    if (a === "left") return "centerLeft";
+    if (a === "right") return "centerRight";
+    if (a === "center") return "centerCenter";
+    return a;
+  };
+
+  const hiddenResizeHandlesForAnchor = (a0: string | undefined) => {
+    const a = normalizeAnchor(a0);
+    const ax = a.endsWith("Left") ? 0 : a.endsWith("Right") ? 1 : 0.5;
+    const ay = a.startsWith("Top") ? 0 : a.startsWith("Bottom") ? 1 : 0.5;
+    const hide = new Set<string>();
+    // Hide resize edges that coincide with the anchor edge.
+    if (ay === 0) hide.add("n");
+    if (ay === 1) hide.add("s");
+    if (ax === 0) hide.add("w");
+    if (ax === 1) hide.add("e");
+    // Hide scale corners that coincide with the anchor corner.
+    // (We only have bottom scale corners in the UI: sw/se.)
+    if (ax === 0 && ay === 1) hide.add("sw");
+    if (ax === 1 && ay === 1) hide.add("se");
+    return hide;
+  };
+
+  const isInForbiddenResizeBand = (rect: { left: number; top: number; width: number; height: number }, rotDeg: number, anchor: string | undefined, clientX: number, clientY: number) => {
+    const hidden = hiddenResizeHandlesForAnchor(anchor);
+    if (hidden.size === 0) return false;
+    const R = 20;
+    const { lx, ly, hw, hh } = localPtForRect(rect as any, rotDeg, clientX, clientY);
+    const xMin = -hw + R;
+    const xMax = hw - R;
+    const yMin = -hh + R;
+    const yMax = hh - R;
+    // Corners (only scale corners exist: sw/se)
+    if (hidden.has("sw")) {
+      const d = Math.hypot(lx - (-hw), ly - hh);
+      if (d <= R) return true;
+    }
+    if (hidden.has("se")) {
+      const d = Math.hypot(lx - hw, ly - hh);
+      if (d <= R) return true;
+    }
+    // Edges (exclude corners like the normal hit test)
+    if (xMax >= xMin) {
+      const dt = Math.abs(ly - (-hh));
+      if (hidden.has("n") && dt <= R && lx >= xMin && lx <= xMax) return true;
+      const db = Math.abs(ly - hh);
+      if (hidden.has("s") && db <= R && lx >= xMin && lx <= xMax) return true;
+    }
+    if (yMax >= yMin) {
+      const dl = Math.abs(lx - (-hw));
+      if (hidden.has("w") && dl <= R && ly >= yMin && ly <= yMax) return true;
+      const dr = Math.abs(lx - hw);
+      if (hidden.has("e") && dr <= R && ly >= yMin && ly <= yMax) return true;
+    }
+    return false;
+  };
+
   const hitTestTransformHandleForNode = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
     const eff = effectiveNodeRectClient(nodeEl, node);
     if (!eff) return hitTestTransformHandle(nodeEl, node, clientX, clientY);
     // Re-run the same math as hitTestTransformHandle but against the effective rect size/center.
     const R = 20;
     const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    // IMPORTANT: if the pointer is in a forbidden resize band (anchor side), do NOT fall back to the opposite edge.
+    if (isInForbiddenResizeBand(eff as any, rotDeg, node?.transform?.anchor, clientX, clientY)) return null;
     const { lx, ly, hw, hh } = localPtForRect(eff, rotDeg, clientX, clientY);
     type Cand = { handle: string; d: number };
     const cands: Cand[] = [];
+    const hidden = hiddenResizeHandlesForAnchor(node?.transform?.anchor);
     const addCorner = (handle: string, x: number, y: number) => {
+      if (hidden.has(handle)) return;
       const d = Math.hypot(lx - x, ly - y);
       if (d <= R) cands.push({ handle, d });
     };
@@ -2602,15 +2787,15 @@ function attachEditor(
     const yMax = hh - R;
     if (xMax >= xMin) {
       const dt = Math.abs(ly - (-hh));
-      if (dt <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "n", d: dt });
+      if (dt <= R && lx >= xMin && lx <= xMax && !hidden.has("n")) cands.push({ handle: "n", d: dt });
       const db = Math.abs(ly - hh);
-      if (db <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "s", d: db });
+      if (db <= R && lx >= xMin && lx <= xMax && !hidden.has("s")) cands.push({ handle: "s", d: db });
     }
     if (yMax >= yMin) {
       const dl = Math.abs(lx - (-hw));
-      if (dl <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "w", d: dl });
+      if (dl <= R && ly >= yMin && ly <= yMax && !hidden.has("w")) cands.push({ handle: "w", d: dl });
       const dr = Math.abs(lx - hw);
-      if (dr <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "e", d: dr });
+      if (dr <= R && ly >= yMin && ly <= yMax && !hidden.has("e")) cands.push({ handle: "e", d: dr });
     }
     if (cands.length === 0) return null;
     cands.sort((a, b) => a.d - b.d);
@@ -2665,7 +2850,11 @@ function attachEditor(
     selected,
     getAppMode,
     getTool: () => tool,
-    getDragMode: () => dragMode,
+    // IMPORTANT:
+    // Cursor controller must not fight composite/group edit dragging.
+    // Composite edit drag state lives in the composite controller (separate from `dragMode`),
+    // so we mirror it via a window flag.
+    getDragMode: () => (dragMode !== "none" ? dragMode : (window as any).__ip_compositeDragging ? "composite" : "none"),
     getCompositeEditId: () => (compositeState.id ? String(compositeState.id) : null),
     isScreenEditMode: () => !!screenEditMode,
     activeGroupEditId,
@@ -2713,12 +2902,18 @@ function attachEditor(
   // - If multiple regions overlap, the closest one wins.
   const hitTestTransformHandle = (nodeEl: HTMLElement, node: any, clientX: number, clientY: number) => {
     const R = 20; // px
-    const { lx, ly, hw, hh } = localPtForNode(nodeEl, node, clientX, clientY);
+    const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+    const rect = nodeEl.getBoundingClientRect();
+    // IMPORTANT: if the pointer is in a forbidden resize band (anchor side), do NOT fall back to the opposite edge.
+    if (isInForbiddenResizeBand(rect as any, rotDeg, node?.transform?.anchor, clientX, clientY)) return null;
+    const { lx, ly, hw, hh } = localPtForRect(rect as any, rotDeg, clientX, clientY);
 
     type Cand = { handle: string; d: number };
     const cands: Cand[] = [];
+    const hidden = hiddenResizeHandlesForAnchor(node?.transform?.anchor);
 
     const addCorner = (handle: string, x: number, y: number) => {
+      if (hidden.has(handle)) return;
       const d = Math.hypot(lx - x, ly - y);
       if (d <= R) cands.push({ handle, d });
     };
@@ -2735,15 +2930,15 @@ function attachEditor(
     const yMax = hh - R;
     if (xMax >= xMin) {
       const dt = Math.abs(ly - (-hh));
-      if (dt <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "n", d: dt });
+      if (dt <= R && lx >= xMin && lx <= xMax && !hidden.has("n")) cands.push({ handle: "n", d: dt });
       const db = Math.abs(ly - hh);
-      if (db <= R && lx >= xMin && lx <= xMax) cands.push({ handle: "s", d: db });
+      if (db <= R && lx >= xMin && lx <= xMax && !hidden.has("s")) cands.push({ handle: "s", d: db });
     }
     if (yMax >= yMin) {
       const dl = Math.abs(lx - (-hw));
-      if (dl <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "w", d: dl });
+      if (dl <= R && ly >= yMin && ly <= yMax && !hidden.has("w")) cands.push({ handle: "w", d: dl });
       const dr = Math.abs(lx - hw);
-      if (dr <= R && ly >= yMin && ly <= yMax) cands.push({ handle: "e", d: dr });
+      if (dr <= R && ly >= yMin && ly <= yMax && !hidden.has("e")) cands.push({ handle: "e", d: dr });
     }
 
     if (cands.length === 0) return null;
@@ -2753,10 +2948,9 @@ function attachEditor(
 
   // Capture-phase intent handler: if the pointer is over a selected node's interaction region,
   // force that action and prevent background pan handlers from starting.
-  stage.addEventListener(
-    "pointerdown",
-    (ev) => {
+  function onStagePointerDownCaptureSelect(ev: PointerEvent) {
       if (getAppMode() !== "edit") return;
+      ensureNoStaleIsolateModes("stage:pointerdown:capture");
       if (tool !== "select") return;
       if (ev.button !== 0) return;
       if (dragMode !== "none") return;
@@ -2779,6 +2973,14 @@ function attachEditor(
       let hoveredRawId = hoveredNodeEl?.dataset.nodeId ?? "";
       let hoveredId = hoveredRawId ? resolveSelectableId(hoveredRawId) : "";
       let hasHovered = !!hoveredId;
+      // If selection was bubbled to an ancestor (e.g. a group root), ensure we also use the
+      // ancestor element for hit-testing. Otherwise we end up applying group interactions using
+      // a child bbox, which makes inner elements appear interactive in root mode.
+      if (hasHovered && hoveredRawId && hoveredId && hoveredId !== hoveredRawId) {
+        const bubbledEl = engine.getNodeElement(hoveredId);
+        if (bubbledEl) hoveredNodeEl = bubbledEl;
+        hoveredRawId = hoveredId;
+      }
 
       // If we didn't hit a `.node` element, try composite hit-testing against their effective outer rects.
       if (!hasHovered) {
@@ -2821,12 +3023,6 @@ function attachEditor(
         const isDouble = dt <= 350 && d <= 6;
         lastCompositeClick = { id: activeId, tMs: now, x: ev.clientX, y: ev.clientY };
 
-        const dbg = ipDebugEnabled("ip_debug_dblclick");
-        if (dbg) {
-          // eslint-disable-next-line no-console
-          console.log("[ip][dblclick] pointerdown composite", { id: activeId, type: node.type, dt, d, isDouble });
-        }
-
         if (isDouble) {
           lastCompositeClick = null;
           if (node.type === "timer" || node.type === "sound" || node.type === "graph" || node.type === "choices") {
@@ -2838,17 +3034,64 @@ function attachEditor(
         }
       }
 
-      // Arrow/line: only act if we're in the segment hit region.
+      // Arrow/line: handle line-graph semantics in capture phase too (so bubble phase is not required).
       if (node.type === "arrow" || node.type === "line") {
         const seg = hitTestSegmentHandle(nodeEl, ev.clientX, ev.clientY);
-        if (!seg) return;
-        // Start drag immediately (blocks pan).
+
+        // For arrows we only act inside the segment hit region.
+        if (node.type === "arrow") {
+          if (!seg) return;
+          startSnapshot = cloneModel(model);
+          dragDirty = false;
+          startNodesById = { [activeId]: JSON.parse(JSON.stringify(node)) };
+          start = { x: ev.clientX, y: ev.clientY };
+          activeHandle = seg;
+          dragMode = "line";
+          setBodyCursor("grabbing");
+          stage.setPointerCapture?.(ev.pointerId);
+          ev.preventDefault();
+          (ev as any).stopImmediatePropagation?.();
+          return;
+        }
+
+        // Lines: ALWAYS behave like a connected graph.
+        // - dragging segment body moves whole component rigidly
+        // - dragging an endpoint moves that junction and keeps all connected endpoints attached
+        // - dragging anywhere else inside the line's bbox also moves the whole component
         startSnapshot = cloneModel(model);
+        dragDirty = false;
         startNodesById = { [activeId]: JSON.parse(JSON.stringify(node)) };
         start = { x: ev.clientX, y: ev.clientY };
+
+        if (seg === "mid" || !seg) {
+          const r = nodeEl.getBoundingClientRect();
+          const inside = ev.clientX >= r.left && ev.clientX <= r.right && ev.clientY >= r.top && ev.clientY <= r.bottom;
+          if (!seg && !inside) return;
+          const g = lineGraphDrag.startGraphDrag({ id: activeId, model, startNodesById });
+          if (g) {
+            dragMode = "graph";
+            activeHandle = null;
+            setBodyCursor("grabbing");
+            stage.setPointerCapture?.(ev.pointerId);
+            ev.preventDefault();
+            (ev as any).stopImmediatePropagation?.();
+            return;
+          }
+          // Fallback: if graph drag can't initialize for some reason, treat as simple line drag.
+          activeHandle = seg ?? "mid";
+          dragMode = "line";
+          setBodyCursor("grabbing");
+          stage.setPointerCapture?.(ev.pointerId);
+          ev.preventDefault();
+          (ev as any).stopImmediatePropagation?.();
+          return;
+        }
+
+        // Endpoint drag: start junction linkage.
         activeHandle = seg;
         dragMode = "line";
         setBodyCursor("grabbing");
+        lineGraphDrag.startJunctionDrag({ id: activeId, model, startNodesById });
         stage.setPointerCapture?.(ev.pointerId);
         ev.preventDefault();
         (ev as any).stopImmediatePropagation?.();
@@ -2865,6 +3108,18 @@ function attachEditor(
         return Math.abs(lx) <= hw && Math.abs(ly) <= hh;
       })();
       if (!hnd && !inside) return;
+
+      // Text + bullets: if the anchor is on the hovered edge/corner, dragging that side should be a no-op.
+      // (Avoid "resizing from the opposite side" for very thin boxes when the forbidden edge is disabled.)
+      if (!hnd && inside && (node.type === "text" || node.type === "bullets")) {
+        const eff = effectiveNodeRectClient(nodeEl, node);
+        const r = (eff as any) ?? nodeEl.getBoundingClientRect();
+        const rotDeg = Number(node?.transform?.rotationDeg ?? 0) || 0;
+        if (isInForbiddenResizeBand(r as any, rotDeg, node?.transform?.anchor, ev.clientX, ev.clientY)) {
+          // Do not start move from a disabled resize band; user can drag interior to move instead.
+          return;
+        }
+      }
 
       // Composite roots: block pan, but DO NOT start drag immediately (lets native dblclick fire).
       if ((node.type === "timer" || node.type === "sound") && !compositeState.id) {
@@ -2889,6 +3144,7 @@ function attachEditor(
       }
 
       startSnapshot = cloneModel(model);
+      dragDirty = false;
       startNodesById = { [activeId]: JSON.parse(JSON.stringify(node)) };
       start = { x: ev.clientX, y: ev.clientY };
 
@@ -2897,11 +3153,23 @@ function attachEditor(
         dragMode = activeHandle.startsWith("rot-") ? "rotate" : "resize";
         setBodyCursor(cursorForHandleWithRotation(activeHandle, Number(node?.transform?.rotationDeg ?? 0)));
         if (dragMode === "rotate") {
-          const eff = effectiveNodeRectClient(nodeEl, node);
-          const r = (eff as any) ?? nodeEl.getBoundingClientRect();
-          const cx = r.left + r.width / 2;
-          const cy = r.top + r.height / 2;
-          startAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+          // Rotate around anchor point (x,y) which is the node's transform reference.
+          const tUse: any = (() => {
+            // For grouped nodes, rotate about their world anchor.
+            const { ui } = _uiNodeForId(String(node.id), model);
+            return (ui as any)?.transform ?? node.transform ?? {};
+          })();
+          const cam = engine.getCamera();
+          const scr = engine.getScreen();
+          const stageRect = stage.getBoundingClientRect();
+          const anchorClient =
+            String(node.space ?? "world") === "screen"
+              ? { x: stageRect.left + Number(tUse.x ?? 0) * Math.max(1, scr.w), y: stageRect.top + Number(tUse.y ?? 0) * Math.max(1, scr.h) }
+              : (() => {
+                  const p = worldToScreen({ x: Number(tUse.x ?? 0), y: Number(tUse.y ?? 0) }, cam as any, scr as any);
+                  return { x: stageRect.left + p.x, y: stageRect.top + p.y };
+                })();
+          startAngleRad = Math.atan2(ev.clientY - anchorClient.y, ev.clientX - anchorClient.x);
           startRotationDeg = Number(node?.transform?.rotationDeg ?? 0);
         }
       } else {
@@ -2913,14 +3181,41 @@ function attachEditor(
       stage.setPointerCapture?.(ev.pointerId);
       ev.preventDefault();
       (ev as any).stopImmediatePropagation?.();
-    },
-    { capture: true }
-  );
+  }
 
   // If a composite root is pending drag, wait until the user actually moves before starting drag.
-  window.addEventListener(
-    "pointermove",
-    (ev) => {
+  function onWindowPointerMoveCaptureSelect(ev: PointerEvent) {
+    // Line-graph selection box drag (move/scale/rotate whole component).
+    if (lineGraphBoxDrag) {
+      if (getAppMode() !== "edit") return;
+      if (tool !== "select") return;
+      if (ev.pointerId !== lineGraphBoxDrag.pointerId) return;
+      if (!(ev.buttons & 1)) return;
+      const dx = ev.clientX - lineGraphBoxDrag.startClientX;
+      const dy = ev.clientY - lineGraphBoxDrag.startClientY;
+      const DRAG_START_PX = 3.0;
+      if (!lineGraphBoxDrag.dirty) {
+        if (Math.hypot(dx, dy) < DRAG_START_PX) return;
+        lineGraphBoxDrag.dirty = true;
+      }
+      lineGraphDrag.applyGraphBoxDrag({
+        activeHandle: lineGraphBoxDrag.handle,
+        dxClient: dx,
+        dyClient: dy,
+        startClientX: lineGraphBoxDrag.startClientX,
+        startClientY: lineGraphBoxDrag.startClientY,
+        clientX: ev.clientX,
+        clientY: ev.clientY,
+        centerClientX: lineGraphBoxDrag.centerClientX,
+        centerClientY: lineGraphBoxDrag.centerClientY,
+        startNodesById: lineGraphBoxDrag.startNodesById,
+      });
+      applySelection();
+      ev.preventDefault();
+      (ev as any).stopImmediatePropagation?.();
+      return;
+    }
+
       if (!pendingCompositeDrag) return;
       if (getAppMode() !== "edit") return;
       if (tool !== "select") return;
@@ -2952,11 +3247,22 @@ function attachEditor(
         dragMode = activeHandle.startsWith("rot-") ? "rotate" : "resize";
         setBodyCursor(cursorForHandleWithRotation(activeHandle, Number(node?.transform?.rotationDeg ?? 0)));
         if (dragMode === "rotate") {
-          const eff = effectiveNodeRectClient(nodeEl, node);
-          const r = (eff as any) ?? nodeEl.getBoundingClientRect();
-          const cx = r.left + r.width / 2;
-          const cy = r.top + r.height / 2;
-          startAngleRad = Math.atan2(start.y - cy, start.x - cx);
+          // Rotate around anchor point (x,y) which is the node's transform reference.
+          const tUse: any = (() => {
+            const { ui } = _uiNodeForId(String(node.id), model);
+            return (ui as any)?.transform ?? node.transform ?? {};
+          })();
+          const cam = engine.getCamera();
+          const scr = engine.getScreen();
+          const stageRect = stage.getBoundingClientRect();
+          const anchorClient =
+            String(node.space ?? "world") === "screen"
+              ? { x: stageRect.left + Number(tUse.x ?? 0) * Math.max(1, scr.w), y: stageRect.top + Number(tUse.y ?? 0) * Math.max(1, scr.h) }
+              : (() => {
+                  const p = worldToScreen({ x: Number(tUse.x ?? 0), y: Number(tUse.y ?? 0) }, cam as any, scr as any);
+                  return { x: stageRect.left + p.x, y: stageRect.top + p.y };
+                })();
+          startAngleRad = Math.atan2(start.y - anchorClient.y, start.x - anchorClient.x);
           startRotationDeg = Number(node?.transform?.rotationDeg ?? 0);
         }
       } else {
@@ -2968,9 +3274,7 @@ function attachEditor(
       pendingCompositeDrag = null;
       ev.preventDefault();
       (ev as any).stopImmediatePropagation?.();
-    },
-    { capture: true }
-  );
+  }
 
   const finishDrag = async () => {
     // Always clear pending composite drag.
@@ -2983,7 +3287,8 @@ function attachEditor(
     startNodesById = null;
     const before = startSnapshot;
     startSnapshot = null;
-    await commit(before);
+    if (dragDirty) await commit(before);
+    dragDirty = false;
     // If the mouse hasn't moved since a snapped rotation, refresh hover cursor immediately.
     const mx = (window as any).__ip_lastMouseX;
     const my = (window as any).__ip_lastMouseY;
@@ -2994,22 +3299,104 @@ function attachEditor(
       const el = engine.getNodeElement(id);
       const model = engine.getModel();
       const n: any = model?.nodes.find((nn) => nn.id === id);
-      if (n?.type === "timer" || n?.type === "sound") applySelection();
+      if (n?.type === "timer" || n?.type === "sound" || n?.type === "graph") applySelection();
       else if (el) ensureHandles(el);
     }
   };
 
+  const cancelInteractions = () => {
+    // Cancel "in-flight" pointer interactions without committing anything.
+    // This is intentionally conservative and only touches transient interaction state.
+    const hadAny =
+      dragMode !== "none" ||
+      activeHandle != null ||
+      pendingCompositeDrag != null ||
+      startSnapshot != null ||
+      startNodesById != null;
+
+    if (!hadAny) return false;
+
+    pendingCompositeDrag = null;
+    lineGraphDrag.reset();
+    dragMode = "none";
+    activeHandle = null;
+    startNodesById = null;
+    startSnapshot = null;
+    // Clear body cursor override (stage + document cursor)
+    setBodyCursor("");
+    // Refresh hover cursor immediately if we have a last mouse point.
+    try {
+      const mx = (window as any).__ip_lastMouseX;
+      const my = (window as any).__ip_lastMouseY;
+      if (typeof mx === "number" && typeof my === "number") updateStageCursorFromClientPoint(mx, my);
+    } catch {}
+    return true;
+  };
+
   // Hover cursor based on hit-test (so we don't depend on DOM overlap ordering).
-  stage.addEventListener(
-    "pointermove",
-    (ev) => {
-      if (getAppMode() !== "edit") return;
-      if (dragMode !== "none") return;
-      if (tool !== "select") return;
-      updateStageCursorFromClientPoint(ev.clientX, ev.clientY);
-    },
-    { passive: true }
-  );
+  function onStagePointerMoveHoverSelect(ev: PointerEvent) {
+    if (getAppMode() !== "edit") return;
+    if (dragMode !== "none") return;
+    if (tool !== "select") return;
+    updateStageCursorFromClientPoint(ev.clientX, ev.clientY);
+  }
+
+  function onWindowPointerDownCaptureSelect(ev: PointerEvent) {
+    if (getAppMode() !== "edit") return;
+    if (tool !== "select") return;
+    if (ev.button !== 0) return;
+    if (dragMode !== "none") return;
+    if (compositeState.id) return;
+
+    const box = isLineGraphBoxTarget(ev.target);
+    if (!box) return;
+    const seedId = String(box.dataset.seedId ?? "");
+    if (!seedId) return;
+    const model = engine.getModel();
+    if (!model) return;
+    const seed: any = model.nodes.find((n: any) => String(n.id) === String(seedId));
+    if (!seed || seed.type !== "line") return;
+
+    const hEl = (ev.target as HTMLElement).closest<HTMLElement>(".handle");
+    const handle = String(hEl?.dataset.handle ?? "move") || "move";
+    const r = box.getBoundingClientRect();
+    const centerClientX = r.left + r.width / 2;
+    const centerClientY = r.top + r.height / 2;
+
+    const before = cloneModel(model);
+    const startNodesById2: Record<string, any> = {};
+    // Seed only; startGraphBoxDrag will expand it.
+    const snap = JSON.parse(JSON.stringify(seed));
+    const pid = String((seed as any)?.parentId ?? "").trim();
+    if (pid && (seed as any)?.space === "world") {
+      const { ui, parentWorld } = _uiNodeForId(String(seedId), model);
+      (snap as any).__ui = { worldT: (ui as any)?.transform ?? null, parentWorldT: parentWorld ?? null };
+    }
+    startNodesById2[seedId] = snap;
+
+    const g = lineGraphDrag.startGraphBoxDrag({ id: seedId, model, startNodesById: startNodesById2 });
+    if (!g) return;
+
+    lineGraphBoxDrag = {
+      pointerId: ev.pointerId,
+      seedId,
+      handle,
+      startClientX: ev.clientX,
+      startClientY: ev.clientY,
+      centerClientX,
+      centerClientY,
+      before,
+      startNodesById: startNodesById2,
+      dirty: false,
+    };
+
+    try {
+      box.setPointerCapture?.(ev.pointerId);
+    } catch {}
+    setBodyCursor("grabbing");
+    ev.preventDefault();
+    (ev as any).stopImmediatePropagation?.();
+  }
 
   const applySelection = () => selection?.applySelection?.();
   const clearSelection = () => selection?.clearSelection?.();
@@ -3029,8 +3416,8 @@ function attachEditor(
   // Used by the engine setModel wrapper to restore dimming after model replacement.
   (engine as any).__ip_applyGroupEditDimming = () => groupEdit?.applyDimming?.();
 
-  // Segment placement (text/bullets/arrow/line) extracted into a dedicated module.
-  attachSegmentPlacementTool({
+  // Segment placement controller (handlers only; state machine owns DOM events).
+  const placement = createSegmentPlacementController({
     stage,
     engine,
     getAppMode,
@@ -3048,6 +3435,42 @@ function attachEditor(
     uiNodeForId: _uiNodeForId,
   });
 
+  // Central interaction router (single coherent pipeline for placement/composite/select).
+  createInteractionStateMachine({
+    stage,
+    engine,
+    getAppMode,
+    getTool: () => tool,
+    getCompositeState: () => (compositeState?.id ? compositeState : null) as any,
+    placement: {
+      onPointerDown: (ev) => placement.onPointerDown(ev),
+      onPointerMove: (ev) => placement.onPointerMove(ev),
+      onContextMenu: (ev) => placement.onContextMenu(ev),
+      onKeyDown: (ev) => placement.onKeyDown(ev),
+    },
+    composite: {
+      onPointerDownCapture: (ev) => compositeCtrl.handlers?.onPointerDownCapture?.(ev) ?? false,
+      onPointerMoveCapture: (ev) => compositeCtrl.handlers?.onPointerMoveCapture?.(ev) ?? false,
+      onPointerUpCapture: (ev) => compositeCtrl.handlers?.onPointerUpCapture?.(ev) ?? false,
+      onPointerCancelCapture: (ev) => compositeCtrl.handlers?.onPointerCancelCapture?.(ev) ?? false,
+    },
+    select: {
+      onStagePointerDownCapture: onStagePointerDownCaptureSelect,
+      onStagePointerDownBubble: onStagePointerDownBubbleSelect,
+      onStagePointerMoveBubble: (ev) => {
+        // Merge hover + drag into one bubble handler.
+        onStagePointerMoveHoverSelect(ev);
+        onStagePointerMoveBubbleSelect(ev);
+      },
+      onWindowPointerDownCapture: onWindowPointerDownCaptureSelect,
+      onWindowPointerMoveCapture: onWindowPointerMoveCaptureSelect,
+      onWindowPointerUpCapture: onWindowPointerUpCaptureSelect,
+      onWindowPointerCancelCapture: onWindowPointerCancelCaptureSelect,
+    },
+  }).attach();
+
+  // Line-graph (polyline) rigid transform box is handled via the central state machine:
+  // see onWindowPointerDownCaptureSelect / onWindowPointerMoveCaptureSelect / onWindowPointerUpCaptureSelect.
   // Group edit behavior is handled by `groupEdit` (see `createGroupEditController`).
 
   const selectOne = (id: string) => {
@@ -3096,6 +3519,8 @@ function attachEditor(
     getAppMode,
     isScreenEditMode: () => !!screenEditMode,
     selected,
+    clearSelection,
+    cancelInteractions,
     cloneModel,
     commit,
     hydrateQrImages,
@@ -3108,6 +3533,7 @@ function attachEditor(
     rectCornersWorld,
     getActiveViewId,
     nextId,
+    updateStageCursorFromClientPoint,
   });
 
   // Composite edit manager (timer/choices/sound/graph) + screen edit manager extracted into a controller.
@@ -3118,18 +3544,111 @@ function attachEditor(
     path: "",
   };
 
+  const dbgFlow = (_event: string, _data: any) => {};
+
+  const hardRestoreInteractivity = (reason: string) => {
+    // Emergency cleanup for "stuck in pan-only" states.
+    // Safe to call repeatedly.
+    try {
+      for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".node.ip-dim-node"))) el.classList.remove("ip-dim-node");
+      for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".node.ip-group-ref"))) el.classList.remove("ip-group-ref");
+      for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".node"))) {
+        if (el.style.pointerEvents === "none") el.style.pointerEvents = "";
+      }
+    } catch {}
+    try {
+      delete (window as any).__ip_exitCompositeEdit;
+      delete (window as any).__ip_compositeEditing;
+      delete (window as any).__ip_cancelCompositePan;
+      delete (window as any).__ip_exitGroupEdit;
+      delete (window as any).__ip_exitScreenEdit;
+      delete (window as any).__ip_compositeEditId;
+      delete (window as any).__ip_compositeEditKind;
+    } catch {}
+    compositeState = { id: null, kind: "timer", path: "" };
+    dbgFlow("hardRestoreInteractivity", {
+      reason,
+      tool,
+      dragMode,
+      activeHandle,
+      compositeState,
+      screenEditMode,
+    });
+    // Ensure cursor isn't stuck in grabbing.
+    try {
+      setBodyCursor("");
+    } catch {}
+  };
+
+  const ensureNoStaleIsolateModes = (where: string) => {
+    const w: any = window as any;
+    const gid = activeGroupEditId();
+    const compositeId = compositeState?.id ? String(compositeState.id) : "";
+    const compositeEl = compositeId ? engine.getNodeElement(compositeId) : null;
+    const compositeMarked = compositeEl?.dataset?.compositeEditing === "1";
+    const hasCompositeSignals = !!w.__ip_exitCompositeEdit || !!w.__ip_compositeEditing || !!w.__ip_cancelCompositePan || !!w.__ip_compositeEditId || !!w.__ip_compositeEditKind || !!compositeId;
+    const staleComposite = hasCompositeSignals && (!compositeId || !compositeEl || !compositeMarked);
+    const staleGroup = !!w.__ip_exitGroupEdit && !gid;
+    const staleScreen = !!w.__ip_exitScreenEdit && !screenEditMode;
+
+    if (!staleComposite && !staleGroup && !staleScreen) return;
+
+    dbgFlow("staleIsolateDetected", {
+      where,
+      gid,
+      compositeId,
+      compositeMarked,
+      staleComposite,
+      staleGroup,
+      staleScreen,
+      hooks: {
+        exitComposite: !!w.__ip_exitCompositeEdit,
+        compositeEditing: !!w.__ip_compositeEditing,
+        cancelCompositePan: !!w.__ip_cancelCompositePan,
+        exitGroup: !!w.__ip_exitGroupEdit,
+        exitScreen: !!w.__ip_exitScreenEdit,
+        compositeEditId: String(w.__ip_compositeEditId ?? ""),
+        compositeEditKind: String(w.__ip_compositeEditKind ?? ""),
+      },
+    });
+
+    // Try graceful exits first (idempotent).
+    try {
+      if (w.__ip_exitCompositeEdit) w.__ip_exitCompositeEdit();
+    } catch {}
+    try {
+      if (w.__ip_exitGroupEdit) w.__ip_exitGroupEdit();
+    } catch {}
+    try {
+      if (w.__ip_exitScreenEdit) w.__ip_exitScreenEdit();
+    } catch {}
+
+    // If still inconsistent, hard restore.
+    const compositeId2 = compositeState?.id ? String(compositeState.id) : "";
+    const compositeEl2 = compositeId2 ? engine.getNodeElement(compositeId2) : null;
+    const compositeMarked2 = compositeEl2?.dataset?.compositeEditing === "1";
+    const stillStaleComposite = (!!w.__ip_exitCompositeEdit || !!w.__ip_compositeEditing || !!w.__ip_cancelCompositePan || !!compositeId2) && (!compositeId2 || !compositeEl2 || !compositeMarked2);
+    const stillStaleGroup = !!w.__ip_exitGroupEdit && !activeGroupEditId();
+    const stillStaleScreen = !!w.__ip_exitScreenEdit && !screenEditMode;
+    if (stillStaleComposite || stillStaleGroup || stillStaleScreen) {
+      hardRestoreInteractivity(`stale isolate after graceful exit @ ${where}`);
+    }
+  };
+
   const compositeCtrl = attachCompositeEditController({
     engine,
     stage,
     BACKEND,
     getAppMode,
+    cloneModel,
+    commit,
     // editor state/ops
     selected,
     clearSelection,
     applySelection,
     openEditorModal,
     ensureHandles: (el: HTMLElement) => ensureHandles(el),
-    cursorForHandle,
+    cursorForHandle: (h: string | null, rotDeg?: number) => cursorForHandleWithRotation(h, Number(rotDeg ?? 0)),
     setBodyCursor,
     screenToWorld,
     gridSpacingForZoom,
@@ -3173,9 +3692,13 @@ function attachEditor(
 
   // Excel-like table editing moved to the runtime `table` plugin.
 
-  stage.addEventListener("pointerdown", (ev) => {
+  function onStagePointerDownBubbleSelect(ev: PointerEvent) {
     // Hard block: Live mode must be resistant to any editing gestures.
     if (getAppMode() !== "edit") return;
+    ensureNoStaleIsolateModes("stage:pointerdown:bubble");
+    // When a placement tool is active, NEVER run selection/drag logic here.
+    // The placement tool owns the interaction in capture phase.
+    if (tool !== "select") return;
     const target = ev.target as HTMLElement;
     const anchorEl = target.closest<HTMLElement>(".anchor-dot");
     const nodeEl = target.closest<HTMLElement>(".node");
@@ -3246,7 +3769,8 @@ function attachEditor(
       // (so a click on "empty space" clears selection instead of re-selecting the group).
       const gid = activeGroupEditId();
       if (gid && id === gid && !ev.shiftKey && !ev.ctrlKey && !target.closest(".handle") && !target.closest(".anchor-dot")) {
-        clearSelection();
+        // Only right-click should clear selection. Left-click should keep current selection.
+        if (ev.button === 2) clearSelection();
         ev.preventDefault();
         return;
       }
@@ -3341,6 +3865,21 @@ function attachEditor(
         // - closest wins
         const hnd = pickedEl ? hitTestSegmentHandle(pickedEl, ev.clientX, ev.clientY) : null;
         if (hnd) {
+          // For line graphs:
+          // - dragging an endpoint moves that junction (and all connected endpoints)
+          // - dragging the segment body moves the whole connected component rigidly
+          if ((node as any)?.type === "line" && hnd === "mid" && model && startNodesById) {
+            const g = lineGraphDrag.startGraphDrag({ id, model, startNodesById });
+            if (g) {
+              dragMode = "graph";
+              activeHandle = null;
+              setBodyCursor("grabbing");
+              (ev.target as HTMLElement).setPointerCapture?.(ev.pointerId);
+              ev.preventDefault();
+              return;
+            }
+          }
+
           activeHandle = hnd;
           dragMode = "line";
           setBodyCursor("grabbing");
@@ -3393,13 +3932,24 @@ function attachEditor(
       return;
     }
 
-    if (!ev.shiftKey && !ev.ctrlKey) clearSelection();
-  });
+    // Only right-click should clear selection. Left-click on background keeps selection.
+    if (ev.button === 2 && !ev.shiftKey && !ev.ctrlKey) clearSelection();
+  }
 
-  stage.addEventListener("pointermove", (ev) => {
+  function onStagePointerMoveBubbleSelect(ev: PointerEvent) {
+    // Placement tools own pointer interactions.
+    if (tool !== "select") return;
     if (selected.size === 0 || dragMode === "none" || !startNodesById) return;
     const dx = ev.clientX - start.x;
     const dy = ev.clientY - start.y;
+    // Dead-zone: prevent tiny accidental nudges.
+    // Only start applying changes once the pointer has moved meaningfully.
+    const DRAG_START_PX = 3.0;
+    if (!dragDirty) {
+      const movedPx = Math.hypot(dx, dy);
+      if (movedPx < DRAG_START_PX) return;
+      dragDirty = true;
+    }
     const cam = engine.getCamera();
     const scr = engine.getScreen();
 
@@ -3460,17 +4010,41 @@ function attachEditor(
     const parentWorldT: any = ui0?.parentWorldT ?? null;
     const t0 = (ui0?.worldT ?? startNode.transform) as any;
     const sp = startNode.space ?? "world";
+    const anchorClientFromWorldOrScreen = (t: any) => {
+      const stageRect = stage.getBoundingClientRect();
+      if (sp === "screen") {
+        // Screen-space x/y are normalized fractions (anchor point).
+        return {
+          x: stageRect.left + Number(t?.x ?? 0) * Math.max(1, scr.w),
+          y: stageRect.top + Number(t?.y ?? 0) * Math.max(1, scr.h),
+        };
+      }
+      // World-space x/y are in world coordinates (anchor point). Convert via camera.
+      const p = worldToScreen({ x: Number(t?.x ?? 0), y: Number(t?.y ?? 0) }, cam as any, scr as any);
+      return { x: stageRect.left + p.x, y: stageRect.top + p.y };
+    };
+    const normalizeAnchor = (a: string | undefined) => {
+      if (!a) return "topLeft";
+      if (a === "top") return "topCenter";
+      if (a === "bottom") return "bottomCenter";
+      if (a === "left") return "centerLeft";
+      if (a === "right") return "centerRight";
+      if (a === "center") return "centerCenter";
+      return a;
+    };
+    const anchorFrac = (a0: string | undefined) => {
+      const a = normalizeAnchor(a0);
+      const ax = a.endsWith("Left") ? 0 : a.endsWith("Right") ? 1 : 0.5;
+      const ay = a.startsWith("Top") ? 0 : a.startsWith("Bottom") ? 1 : 0.5;
+      return { ax, ay };
+    };
 
     if (dragMode === "rotate") {
       const el = engine.getNodeElement(onlyId);
       const curModel = engine.getModel();
       const curNode: any = curModel?.nodes.find((n) => n.id === onlyId);
-      const eff = el && (curNode?.type === "timer" || curNode?.type === "sound") ? effectiveNodeRectClient(el, curNode) : null;
-      const r = (eff as any) ?? el?.getBoundingClientRect();
-      if (!r) return;
-      const cx = r.left + r.width / 2;
-      const cy = r.top + r.height / 2;
-      const a1 = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+      const ac = anchorClientFromWorldOrScreen(t0);
+      const a1 = Math.atan2(ev.clientY - ac.y, ev.clientX - ac.x);
       const d = (a1 - startAngleRad) * (180 / Math.PI);
       let rot = startRotationDeg + d;
       if (ev.shiftKey) rot = Math.round(rot / 15) * 15;
@@ -3483,17 +4057,29 @@ function attachEditor(
       // Keep cursor angle in sync while snapping (otherwise it can look “stuck” until the next hover event).
       if (activeHandle) setBodyCursor(cursorForHandleWithRotation(activeHandle, rot));
       // Refresh selection chrome for composites without recreating node-level handles (which causes "double anchors").
-      if (curNode?.type === "timer" || curNode?.type === "sound") applySelection();
+      if (curNode?.type === "timer" || curNode?.type === "sound" || curNode?.type === "graph") applySelection();
       else if (el) ensureHandles(el);
       return;
     }
 
     if (dragMode === "resize" && activeHandle) {
-      const tl0 = anchorToTopLeftWorld(t0);
-      let rect = { x: tl0.x, y: tl0.y, w: t0.w, h: t0.h };
       const ddx = sp === "world" ? dx / cam.zoom : dx / Math.max(1, scr.w);
       const ddy = sp === "world" ? dy / cam.zoom : dy / Math.max(1, scr.h);
-      const min = sp === "world" ? 5 : 0.01;
+      const minW = sp === "world" ? 5 : 0.01;
+      const minH = sp === "world" ? 5 : 0.01;
+
+      // IMPORTANT: resizing should follow the VISUAL direction for rotated nodes.
+      // Project mouse delta into the node's local (unrotated) coordinate system.
+      const rotDeg = Number(t0?.rotationDeg ?? 0) || 0;
+      const aInv = (-rotDeg * Math.PI) / 180; // world -> local (same convention as localPtForNode)
+      const cInv = Math.cos(aInv);
+      const sInv = Math.sin(aInv);
+      const ddxL = ddx * cInv - ddy * sInv;
+      const ddyL = ddx * sInv + ddy * cInv;
+      const aFwd = (rotDeg * Math.PI) / 180; // local -> world
+      const cF = Math.cos(aFwd);
+      const sF = Math.sin(aFwd);
+      const localToWorldDelta = (lx: number, ly: number) => ({ x: lx * cF - ly * sF, y: lx * sF + ly * cF });
 
       const curModel = engine.getModel();
       const curNode: any = curModel?.nodes.find((n) => n.id === onlyId);
@@ -3535,86 +4121,57 @@ function attachEditor(
         return Math.round(v / s) * s;
       };
 
+      // Resize/scale is anchored: anchor point stays fixed (x,y are anchor coords).
+      const { ax, ay } = anchorFrac(t0.anchor);
+      const w0 = Number(t0.w ?? 0);
+      const h0 = Number(t0.h ?? 0);
+      let w1 = w0;
+      let h1 = h0;
+
+      const canW = (v: number) => Math.max(minW, Number.isFinite(v) ? v : w0);
+      const canH = (v: number) => Math.max(minH, Number.isFinite(v) ? v : h0);
+
+      const denomE = Math.max(0, 1 - ax);
+      const denomW = Math.max(0, ax);
+      const denomS = Math.max(0, 1 - ay);
+      const denomN = Math.max(0, ay);
+
+      const wFromE = denomE > 1e-9 ? ((denomE * w0 + ddxL) / denomE) : w0;
+      const wFromW = denomW > 1e-9 ? ((denomW * w0 - ddxL) / denomW) : w0;
+      const hFromS = denomS > 1e-9 ? ((denomS * h0 + ddyL) / denomS) : h0;
+      const hFromN = denomN > 1e-9 ? ((denomN * h0 - ddyL) / denomN) : h0;
+
       if (isScaleCorner) {
-        const sx = activeHandle.includes("w") ? -ddx : ddx;
-        const sy = activeHandle.includes("n") ? -ddy : ddy;
-        const w1 = Math.max(min, t0.w + sx);
-        const h1 = Math.max(min, t0.h + sy);
-        const sRaw = Math.max(w1 / Math.max(1e-9, t0.w), h1 / Math.max(1e-9, t0.h));
-
-        // Corner scaling changes box size (including bullets).
-        rect.w = Math.max(min, t0.w * sRaw);
-        rect.h = Math.max(min, t0.h * sRaw);
-
-        // Shift: snap uniform scale so the resulting box width/height lands on grid units.
-        // Rule: snap when either dimension is close to a whole number of grid units; pick the closer snap.
+        // Uniform scaling about the anchor point.
+        const wc = activeHandle.includes("e") ? wFromE : activeHandle.includes("w") ? wFromW : w0;
+        const hc = activeHandle.includes("s") ? hFromS : activeHandle.includes("n") ? hFromN : h0;
+        const sRaw = Math.max(wc / Math.max(1e-9, w0), hc / Math.max(1e-9, h0));
+        let sUse = sRaw;
         if (snapSpacingWorld) {
-          const snappedW = Math.max(min, snapWorld(rect.w));
-          const snappedH = Math.max(min, snapWorld(rect.h));
-          const sFromW = snappedW / Math.max(1e-9, t0.w);
-          const sFromH = snappedH / Math.max(1e-9, t0.h);
-          const sUse = Math.abs(sFromW - sRaw) <= Math.abs(sFromH - sRaw) ? sFromW : sFromH;
-          rect.w = Math.max(min, t0.w * sUse);
-          rect.h = Math.max(min, t0.h * sUse);
+          const wSn = Math.max(minW, snapWorld(w0 * sRaw));
+          const hSn = Math.max(minH, snapWorld(h0 * sRaw));
+          const sFromW = wSn / Math.max(1e-9, w0);
+          const sFromH = hSn / Math.max(1e-9, h0);
+          sUse = Math.abs(sFromW - sRaw) <= Math.abs(sFromH - sRaw) ? sFromW : sFromH;
         }
-
-        // Corner scaling changes box size (including bullets).
-        if (activeHandle.includes("w")) rect.x = tl0.x + (t0.w - rect.w);
-        if (activeHandle.includes("n")) rect.y = tl0.y + (t0.h - rect.h);
-
-        // Corner scaling should scale text-like font size along with the box.
+        w1 = canW(w0 * sUse);
+        h1 = canH(h0 * sUse);
         if (isTextLike) {
-          const sUsed = rect.w / Math.max(1e-9, t0.w);
-          engine.updateNode(onlyId, { fontPx: Math.max(1, (startFontPx ?? 28) * sUsed) } as any);
+          engine.updateNode(onlyId, { fontPx: Math.max(1, (startFontPx ?? 28) * (w1 / Math.max(1e-9, w0))) } as any);
         }
       } else {
-        // Edge handles: free resize
-        if (activeHandle.includes("e")) rect.w = Math.max(min, t0.w + ddx);
-        if (activeHandle.includes("s")) rect.h = Math.max(min, t0.h + ddy);
-        if (activeHandle.includes("w")) {
-          rect.x = tl0.x + ddx;
-          rect.w = Math.max(min, t0.w - ddx);
-        }
-        if (activeHandle.includes("n")) {
-          rect.y = tl0.y + ddy;
-          rect.h = Math.max(min, t0.h - ddy);
-        }
-
-        // Shift: snap ONLY the moved edge to grid lines (world-space only).
-        if (snapSpacingWorld) {
-          // Snap x edges
-          if (activeHandle.includes("e") && !activeHandle.includes("w")) {
-            const right = rect.x + rect.w;
-            const rightSn = snapWorld(right);
-            rect.w = Math.max(min, rightSn - rect.x);
-          }
-          if (activeHandle.includes("w")) {
-            const rightFixed = tl0.x + t0.w;
-            const leftSn = snapWorld(rect.x);
-            rect.x = leftSn;
-            rect.w = Math.max(min, rightFixed - rect.x);
-          }
-          // Snap y edges
-          if (activeHandle.includes("s") && !activeHandle.includes("n")) {
-            const bottom = rect.y + rect.h;
-            const bottomSn = snapWorld(bottom);
-            rect.h = Math.max(min, bottomSn - rect.y);
-          }
-          if (activeHandle.includes("n")) {
-            const bottomFixed = tl0.y + t0.h;
-            const topSn = snapWorld(rect.y);
-            rect.y = topSn;
-            rect.h = Math.max(min, bottomFixed - rect.y);
-          }
-        }
-
+        // Edge resize about the anchor point.
+        if (activeHandle.includes("e")) w1 = canW(wFromE);
+        if (activeHandle.includes("w")) w1 = canW(wFromW);
+        if (activeHandle.includes("s")) h1 = canH(hFromS);
+        if (activeHandle.includes("n")) h1 = canH(hFromN);
         // Edge resizing should NOT scale text font; initialize fontPx if missing so it stays stable.
         if (isTextLike && curNode?.fontPx == null) {
           engine.updateNode(onlyId, { fontPx: Math.max(1, startFontPx ?? 28) } as any);
         }
       }
-      const anchored = topLeftToAnchorWorld(rect, t0.anchor);
-      const worldOut = { ...t0, x: anchored.x, y: anchored.y, w: rect.w, h: rect.h } as any;
+
+      const worldOut = { ...t0, x: Number(t0.x ?? 0), y: Number(t0.y ?? 0), w: w1, h: h1 } as any;
       if (parentWorldT && sp === "world") {
         const localAnchor = String((startNode as any)?.transform?.anchor ?? worldOut.anchor ?? "topLeft");
         const localOut = _toLocalTransformFromWorld(worldOut, parentWorldT, localAnchor);
@@ -3623,24 +4180,35 @@ function attachEditor(
         engine.updateNode(onlyId, { transform: worldOut as any } as any);
       }
     }
-  });
+  }
 
   // Finish drag reliably even if pointerup happens outside the stage.
-  window.addEventListener("pointerup", () => {
+  function onWindowPointerUpCaptureSelect(_ev: PointerEvent) {
+    if (lineGraphBoxDrag) {
+      const before = lineGraphBoxDrag.before;
+      const dirty = lineGraphBoxDrag.dirty;
+      lineGraphBoxDrag = null;
+      setBodyCursor("");
+      try {
+        if (dirty) void commit(before);
+      } catch {}
+    }
     void finishDrag();
-  });
-  window.addEventListener("pointercancel", () => {
+  }
+  function onWindowPointerCancelCaptureSelect(_ev: PointerEvent) {
     // Cancel should not commit.
+    lineGraphBoxDrag = null;
     pendingCompositeDrag = null;
     dragMode = "none";
     activeHandle = null;
     setBodyCursor("");
     startNodesById = null;
     startSnapshot = null;
+    dragDirty = false;
     const mx = (window as any).__ip_lastMouseX;
     const my = (window as any).__ip_lastMouseY;
     if (typeof mx === "number" && typeof my === "number") updateStageCursorFromClientPoint(mx, my);
-  });
+  }
 }
 
 async function main() {
@@ -3884,22 +4452,7 @@ async function main() {
     };
     rebuildForCurrentView();
 
-    // Debug-only: diagnose missing join QR.
-    if (DEBUG_ANIM) {
-      try {
-        const vcur = viewsInOrder[viewIdx];
-        const hasJoin = showSet.has("join_qr");
-        const hasCue = cues.some((c) => c.id === "join_qr" && c.when === "enter");
-        if (hasJoin && !hasCue) {
-          // eslint-disable-next-line no-console
-          console.warn("[ip] join_qr is in view but has no enter cue; it will not animate in", { view: vcur?.id });
-        }
-        if (!hasJoin) {
-          // eslint-disable-next-line no-console
-          console.warn("[ip] join_qr is not part of the current view; it will not appear here", { view: vcur?.id });
-        }
-      } catch {}
-    }
+    // (debug logging removed)
     let cueIdx = 0;
     const pendingHide = new Map<string, number>();
 
@@ -4104,26 +4657,32 @@ async function main() {
   });
 
   modeBtn.addEventListener("click", () => {
-    // If we're editing a composite group, this button acts as "Exit group edit".
-    if ((window as any).__ip_exitCompositeEdit) {
+    // IMPORTANT: stale `__ip_exit*` hooks can remain if their internal state was reset.
+    // If the button label indicates "Switch to ...", we should not be blocked by stale hooks.
+    const label = (modeBtn.textContent ?? "").toLowerCase();
+    const intendsToggle = label.includes("switch to");
+
+    const tryExit = (k: "__ip_exitCompositeEdit" | "__ip_exitGroupEdit" | "__ip_exitScreenEdit") => {
+      const fn = (window as any)[k];
+      if (!fn) return false;
       try {
-        (window as any).__ip_exitCompositeEdit();
+        fn();
       } catch {}
-      return;
+      // If the hook still exists after calling it, the exit is still active.
+      return !!(window as any)[k];
+    };
+
+    if (!intendsToggle) {
+      if (tryExit("__ip_exitCompositeEdit")) return;
+      if (tryExit("__ip_exitGroupEdit")) return;
+      if (tryExit("__ip_exitScreenEdit")) return;
+    } else {
+      // Clean up any stale hooks, but don't return unless they remain active.
+      if (tryExit("__ip_exitCompositeEdit")) return;
+      if (tryExit("__ip_exitGroupEdit")) return;
+      if (tryExit("__ip_exitScreenEdit")) return;
     }
-    // Regular group edit should also use this button as "Exit group edit".
-    if ((window as any).__ip_exitGroupEdit) {
-      try {
-        (window as any).__ip_exitGroupEdit();
-      } catch {}
-      return;
-    }
-    if ((window as any).__ip_exitScreenEdit) {
-      try {
-        (window as any).__ip_exitScreenEdit();
-      } catch {}
-      return;
-    }
+
     mode = mode === "edit" ? "live" : "edit";
     applyMode();
   });
@@ -4135,8 +4694,6 @@ export async function bootstrap() {
   try {
     await main();
   } catch (err) {
-    // eslint-disable-next-line no-console
-    console.error(err);
     const app = document.querySelector<HTMLDivElement>("#app");
     if (app) app.textContent = String(err);
   }

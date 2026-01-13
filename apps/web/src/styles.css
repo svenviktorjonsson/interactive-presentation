@@ -237,6 +237,13 @@ html[data-ip-mode="edit"] .node-video .video-controls {
   pointer-events: none;
 }
 
+/* Force cursor while dragging/panning/resizing/rotating.
+   We use this to keep the "closed hand" cursor until pointerup, even if hovered elements set `cursor: grab`. */
+html.ip-force-cursor,
+html.ip-force-cursor * {
+  cursor: var(--ip-force-cursor, auto) !important;
+}
+
 .node-video .video-btn {
   border: 1px solid rgba(255, 255, 255, 0.18);
   background: rgba(255, 255, 255, 0.10);
@@ -589,6 +596,16 @@ html[data-ip-mode="edit"] .node-sound[data-composite-editing="1"] canvas.sound-c
   outline-offset: 0px;
 }
 
+/* Buttons sub-elements: add a subtle fill so selection is obvious even over empty/transparent areas. */
+html[data-ip-mode="edit"] .timer-sub-buttons.is-selected,
+html[data-ip-mode="edit"] .sound-sub-buttons.is-selected,
+html[data-ip-mode="edit"] .choices-buttons.is-selected {
+  box-shadow:
+    0 0 0 2px rgba(110, 168, 255, 0.85),
+    inset 0 0 0 1px rgba(110, 168, 255, 0.25);
+  background: rgba(110, 168, 255, 0.035);
+}
+
 /* Plot-arrow hitboxes (timer/sound axes) should NEVER show a selection rectangle.
    Selection feedback for these is rendered as a glow on the SVG line itself. */
 .comp-sub[data-kind="plot-arrow"].is-selected {
@@ -619,26 +636,7 @@ html[data-ip-mode="edit"] .node-sound[data-composite-editing="1"] canvas.sound-c
   cursor: default;
 }
 
-/* Cursor-only UX (no visible glyphs). Hitboxes + cursor changes only on hover. */
-.handle.edge-n,
-.handle.edge-s {
-  cursor: ns-resize !important;
-}
-.handle.edge-e,
-.handle.edge-w {
-  cursor: ew-resize !important;
-}
-.handle.corner.scale-se {
-  cursor: nwse-resize !important;
-}
-.handle.corner.scale-sw {
-  cursor: nesw-resize !important;
-}
-.handle.corner.rot {
-  cursor: grab !important;
-}
-
-/* Rotation uses the standard hand cursor */
+/* Cursor-only UX: cursors are controlled by JS (custom assets), not CSS defaults. */
 
 /* Keep old classnames harmless (we no longer show symbols) */
 .handle.rotate-corner,

@@ -11,6 +11,14 @@ def _safe_str(s: str) -> str:
     return s.replace('"', "'")
 
 
+def _join_params(params: list[str]) -> str:
+    """
+    Join keyword[...] argument lists in a canonical style.
+    We always put a space after ',' at the top-level inside [...].
+    """
+    return ", ".join(params)
+
+
 def _fmt_param_value(v: Any) -> str:
     """
     Format a DSL parameter value.
@@ -209,7 +217,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
         t = n.get("type")
         if t == "text":
             params = [f"name={node_id}"] + style_params(n)
-            lines.append(f"text[{','.join(params)}]:")
+            lines.append(f"text[{_join_params(params)}]:")
             content = (n.get("text") or "").rstrip("\n")
             if content:
                 for ln in content.splitlines():
@@ -220,15 +228,15 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             url = (n.get("url") or "/join").strip() or "/join"
             params = [f"name={node_id}"] + style_params(n)
             if url != "/join":
-                params.append(f'url="{_safe_str(str(url))}"')
-            lines.append(f"qr[{','.join(params)}]")
+                params.append(f"url={_fmt_param_value(url)}")
+            lines.append(f"qr[{_join_params(params)}]")
             return
         if t == "htmlFrame":
             src = n.get("src")
             params = [f"name={node_id}"] + style_params(n)
             if src:
-                params.append(f'src="{_safe_str(str(src))}"')
-            lines.append(f"iframe[{','.join(params)}]")
+                params.append(f"src={_fmt_param_value(src)}")
+            lines.append(f"iframe[{_join_params(params)}]")
             return
         if t == "video":
             src = n.get("src")
@@ -238,35 +246,35 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             thumb = n.get("thumbnail") or n.get("poster")
             if thumb:
                 params.append(f"thumbnail={_fmt_param_value(thumb)}")
-            lines.append(f"video[{','.join(params)}]")
+            lines.append(f"video[{_join_params(params)}]")
             return
         if t == "image":
             src = n.get("src")
             params = [f"name={node_id}"] + style_params(n)
             if src and str(src) != f"/media/{node_id}.png":
-                params.append(f'file="{_safe_str(str(src))}"')
-            lines.append(f"image[{','.join(params)}]")
+                params.append(f"file={_fmt_param_value(src)}")
+            lines.append(f"image[{_join_params(params)}]")
             return
         if t == "bullets":
             bullet_style = (n.get("bullets") or "").strip()
             params = [f"name={node_id}"] + style_params(n)
             if bullet_style:
                 params.append(f"type={_safe_str(str(bullet_style))}")
-            lines.append(f"bullets[{','.join(params)}]:")
+            lines.append(f"bullets[{_join_params(params)}]:")
             for item in n.get("items", []) or []:
                 lines.append(_safe_str(str(item)))
             lines.append("")
             return
         if t == "table":
-            delim = n.get("delimiter") or ";"
-            params = [f"name={node_id}", f'delim="{_safe_str(str(delim))}"'] + style_params(n)
+            delim = str(n.get("delimiter") or ";")
+            params = [f"name={node_id}", f"delim={_fmt_param_value(delim)}"] + style_params(n)
             hs = n.get("hstyle")
             vs = n.get("vstyle")
             if isinstance(hs, str) and hs.strip():
                 params.append(f"hstyle={_fmt_param_value(hs.strip())}")
             if isinstance(vs, str) and vs.strip():
                 params.append(f"vstyle={_fmt_param_value(vs.strip())}")
-            lines.append(f"table[{','.join(params)}]:")
+            lines.append(f"table[{_join_params(params)}]:")
             for row in n.get("rows", []) or []:
                 lines.append(_safe_str(delim.join([str(c) for c in row])))
             lines.append("")
@@ -291,7 +299,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             col = n.get("color") or n.get("stroke")
             if isinstance(col, str) and col.strip():
                 params.append(f"color={_fmt_param_value(col.strip())}")
-            lines.append(f"graph[{','.join(params)}]")
+            lines.append(f"graph[{_join_params(params)}]")
             return
         if t == "arrow":
             params = [f"name={node_id}"] + style_params(n)
@@ -301,14 +309,14 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             fy = float(fr.get("y", 0.5) or 0.5)
             tx = float(to.get("x", 1.0) or 1.0)
             ty = float(to.get("y", 0.5) or 0.5)
-            params.append(f"from=({_fmt_param_value(fx)},{_fmt_param_value(fy)})")
-            params.append(f"to=({_fmt_param_value(tx)},{_fmt_param_value(ty)})")
+            params.append(f"from=({_fmt_param_value(fx)}, {_fmt_param_value(fy)})")
+            params.append(f"to=({_fmt_param_value(tx)}, {_fmt_param_value(ty)})")
             col = n.get("color") or n.get("stroke")
             if isinstance(col, str) and col.strip():
                 params.append(f"color={_fmt_param_value(col.strip())}")
             if isinstance(n.get("width"), (int, float)):
                 params.append(f"width={_fmt_param_value(n.get('width'))}")
-            lines.append(f"arrow[{','.join(params)}]")
+            lines.append(f"arrow[{_join_params(params)}]")
             return
         if t == "line":
             params = [f"name={node_id}"] + style_params(n)
@@ -318,8 +326,8 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             fy = float(fr.get("y", 0.5) or 0.5)
             tx = float(to.get("x", 1.0) or 1.0)
             ty = float(to.get("y", 0.5) or 0.5)
-            params.append(f"from=({_fmt_param_value(fx)},{_fmt_param_value(fy)})")
-            params.append(f"to=({_fmt_param_value(tx)},{_fmt_param_value(ty)})")
+            params.append(f"from=({_fmt_param_value(fx)}, {_fmt_param_value(fy)})")
+            params.append(f"to=({_fmt_param_value(tx)}, {_fmt_param_value(ty)})")
             col = n.get("color") or n.get("stroke")
             if isinstance(col, str) and col.strip():
                 params.append(f"color={_fmt_param_value(col.strip())}")
@@ -331,7 +339,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                 params.append(f"p1Join={_fmt_param_value(p1j.strip())}")
             if isinstance(p2j, str) and p2j.strip():
                 params.append(f"p2Join={_fmt_param_value(p2j.strip())}")
-            lines.append(f"lines[{','.join(params)}]")
+            lines.append(f"lines[{_join_params(params)}]")
             return
         if t == "sound":
             params = [f"name={node_id}"] + style_params(n)
@@ -345,7 +353,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             col = n.get("color")
             if isinstance(col, str) and col.strip():
                 params.append(f"color={_fmt_param_value(col.strip())}")
-            lines.append(f"sound[{','.join(params)}]")
+            lines.append(f"sound[{_join_params(params)}]")
             return
         if t == "choices":
             params = [f"name={node_id}"] + style_params(n)
@@ -378,8 +386,8 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                     else:
                         opt_parts.append(_safe_str(label))
             if opt_parts:
-                params.append("choices={" + ",".join(opt_parts) + "}")
-            lines.append(f"choices[{','.join(params)}]:")
+                params.append("choices={" + ", ".join(opt_parts) + "}")
+            lines.append(f"choices[{_join_params(params)}]:")
             question = (n.get("question") or "").rstrip("\n")
             if question:
                 for ln in question.splitlines():
@@ -388,7 +396,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             return
         if t == "group":
             params = [f"name={node_id}"] + style_params(n)
-            lines.append(f"group[{','.join(params)}]")
+            lines.append(f"group[{_join_params(params)}]")
             return
         if t == "timer":
             params = [f"name={node_id}"]
@@ -413,7 +421,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
                 args["binSize"] = n.get("binSizeS")
             for k in sorted([k for k in args.keys() if k != "name"]):
                 params.append(f"{_safe_str(str(k))}={_fmt_param_value(args.get(k))}")
-            lines.append(f"timer[{','.join(params)}]")
+            lines.append(f"timer[{_join_params(params)}]")
             return
         raise ValueError(f"write_presentation_txt: unsupported node type {t!r} (id={node_id!r})")
 
@@ -450,7 +458,7 @@ def write_presentation_txt(path: Path, model: dict[str, Any]) -> None:
             if dur:
                 view_params.append(f"durationMs={_safe_str(dur)}")
 
-        lines.append(f"view[{','.join(view_params)}]:")
+        lines.append(f"view[{_join_params(view_params)}]:")
 
         show = v.get("show", [])
         for node_id in show:

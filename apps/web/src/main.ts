@@ -7,4 +7,14 @@ import katex from "katex";
 
 import { bootstrap } from "./ip/bootstrap";
 
-void bootstrap();
+const hidePreload = () => {
+  const el = document.getElementById("ip-preload");
+  if (!el) return;
+  el.style.opacity = "0";
+  el.style.transition = "opacity 180ms ease";
+  window.setTimeout(() => el.remove(), 220);
+};
+
+void bootstrap().finally(() => {
+  hidePreload();
+});

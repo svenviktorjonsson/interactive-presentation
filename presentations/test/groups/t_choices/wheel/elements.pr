@@ -1,0 +1,11 @@
+# wheel elements.pr (v2)
+# Generated from ../elements.pr (top-down).
+# Each option is rendered as its bullet marker (A/1/...) + percent.
+# You can still override positioning via wheel/geometries.csv (per text[name=<id>]).
+# Available bindings: {{label}} {{percent}} {{votes}} {{totalVotes}}
+text[name=Alpha]: A ({{percent}}%)
+text[name=Beta]: B ({{percent}}%)
+text[name=Gamma]: C ({{percent}}%)
+text[name=Delta]: D ({{percent}}%)
+text[name=Epsilon]: E ({{percent}}%)
+text[name=other]: Other ({{percent}}%)

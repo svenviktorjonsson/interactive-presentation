@@ -13,8 +13,14 @@ logger = logging.getLogger("ip.composite_service")
 
 def _format_pr_list_commas(text: str) -> str:
     """
-    Ensure a space after commas inside bracket-lists: `[a,b]` -> `[a, b]`.
-    Only affects commas at top-level inside `[...]` (not inside quotes or nested {}()/[]).
+    Normalize bracket-list syntax in `.pr` files:
+    - Ensure a space after commas inside `[...]`: `[a,b]` -> `[a, b]`
+    - Remove unnecessary quotes inside `[...]`:
+        `delim=";"` -> `delim=;`
+      Quotes are only kept when the string contains ',' or ']' (or newlines), or is empty.
+
+    Only affects content at the top-level inside the current `[...]` scope
+    (not inside quotes or nested {}()/[]).
     """
     s = str(text or "")
     out: list[str] = []
@@ -26,6 +32,23 @@ def _format_pr_list_commas(text: str) -> str:
     i = 0
     while i < len(s):
         ch = s[i]
+        # If we're inside a bracket list (and not nested in {} or ()),
+        # strip quotes around "simple" strings.
+        if ch == '"' and bracket > 0 and (not in_quotes) and brace == 0 and paren == 0:
+            j = i + 1
+            while j < len(s) and s[j] != '"':
+                j += 1
+            if j < len(s) and s[j] == '"':
+                inner = s[i + 1 : j]
+                if inner == "" or ("," in inner) or ("]" in inner) or ("\n" in inner) or ("\r" in inner):
+                    out.append('"')
+                    out.append(inner)
+                    out.append('"')
+                else:
+                    out.append(inner)
+                i = j + 1
+                continue
+
         if ch == '"':
             in_quotes = not in_quotes
             out.append(ch)

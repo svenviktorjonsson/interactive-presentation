@@ -7,6 +7,8 @@ export function attachKeyboardShortcuts(opts: {
   getAppMode: () => "edit" | "live";
   isScreenEditMode: () => boolean;
   selected: Set<string>;
+  clearSelection: () => void;
+  cancelInteractions: () => boolean;
   cloneModel: (m: PresentationModel) => PresentationModel;
   commit: (before: PresentationModel | null) => Promise<void>;
   hydrateQrImages: (engine: Engine, model: PresentationModel) => Promise<void>;
@@ -19,6 +21,7 @@ export function attachKeyboardShortcuts(opts: {
   rectCornersWorld: (t: any) => { x: number; y: number }[];
   getActiveViewId: () => string;
   nextId: (prefix: string) => string;
+  updateStageCursorFromClientPoint: (clientX: number, clientY: number) => void;
 }) {
   const deleteSelection = async () => {
     const model = opts.engine.getModel();
@@ -43,11 +46,65 @@ export function attachKeyboardShortcuts(opts: {
     if (inInput) return;
 
     if (ev.key === "Escape") {
+      // Priority: exit the deepest "edit mode" first, otherwise clear selection.
+      // (Composite edit and group edit also dim/disable pointer events; Escape must restore interactivity.)
+      const refreshHoverCursor = () => {
+        const mx = (window as any).__ip_lastMouseX;
+        const my = (window as any).__ip_lastMouseY;
+        if (typeof mx === "number" && typeof my === "number") opts.updateStageCursorFromClientPoint(mx, my);
+      };
+
+      // Always stop composite background pan if it was started.
+      try {
+        (window as any).__ip_cancelCompositePan?.();
+      } catch {
+        // ignore
+      }
+
+      // First: cancel any in-progress interaction (drag/resize/rotate/etc).
+      // This avoids getting stuck in a state where hover cursors stop updating and clicks feel "disabled".
+      let cancelled = false;
+      try {
+        cancelled = !!opts.cancelInteractions();
+      } catch {}
+
+      if ((window as any).__ip_exitCompositeEdit) {
+        try {
+          (window as any).__ip_exitCompositeEdit();
+        } catch {}
+        ev.preventDefault();
+        refreshHoverCursor();
+        return;
+      }
+
+      if ((window as any).__ip_exitGroupEdit) {
+        try {
+          (window as any).__ip_exitGroupEdit();
+        } catch {}
+        ev.preventDefault();
+        refreshHoverCursor();
+        return;
+      }
+
       if ((window as any).__ip_exitScreenEdit) {
         try {
           (window as any).__ip_exitScreenEdit();
         } catch {}
         ev.preventDefault();
+        refreshHoverCursor();
+        return;
+      }
+
+      if (opts.selected.size > 0) {
+        opts.clearSelection();
+        ev.preventDefault();
+        refreshHoverCursor();
+        return;
+      }
+
+      if (cancelled) {
+        ev.preventDefault();
+        refreshHoverCursor();
         return;
       }
     }

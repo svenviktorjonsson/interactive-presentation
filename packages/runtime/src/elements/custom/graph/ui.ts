@@ -6,6 +6,78 @@ import { renderTextWithKatexToHtml } from "../../../utils/textMath";
 
 const PLOT_FRACS = { leftF: 0.08, rightF: 0.92, topF: 0.10, bottomF: 0.90 };
 
+const normalizeAnchor = (a: string) => {
+  const s = String(a || "centerCenter");
+  if (s === "top") return "topCenter";
+  if (s === "bottom") return "bottomCenter";
+  if (s === "left") return "centerLeft";
+  if (s === "right") return "centerRight";
+  if (s === "center") return "centerCenter";
+  return s;
+};
+
+const cssTranslateForAnchor = (anchor: string) => {
+  switch (String(anchor || "centerCenter")) {
+    case "topLeft":
+      return "translate(0%, 0%)";
+    case "topCenter":
+      return "translate(-50%, 0%)";
+    case "topRight":
+      return "translate(-100%, 0%)";
+    case "centerLeft":
+      return "translate(0%, -50%)";
+    case "center":
+    case "centerCenter":
+      return "translate(-50%, -50%)";
+    case "centerRight":
+      return "translate(-100%, -50%)";
+    case "bottomLeft":
+      return "translate(0%, -100%)";
+    case "bottomCenter":
+      return "translate(-50%, -100%)";
+    case "bottomRight":
+      return "translate(-100%, -100%)";
+    default:
+      return "translate(-50%, -50%)";
+  }
+};
+
+const cssTransformOriginForAnchor = (anchor: string) => {
+  switch (String(anchor || "centerCenter")) {
+    case "topLeft":
+      return "0% 0%";
+    case "topCenter":
+      return "50% 0%";
+    case "topRight":
+      return "100% 0%";
+    case "centerLeft":
+      return "0% 50%";
+    case "center":
+    case "centerCenter":
+      return "50% 50%";
+    case "centerRight":
+      return "100% 50%";
+    case "bottomLeft":
+      return "0% 100%";
+    case "bottomCenter":
+      return "50% 100%";
+    case "bottomRight":
+      return "100% 100%";
+    default:
+      return "50% 50%";
+  }
+};
+
+const applyGeomTransformCss = (el: HTMLElement, g: any) => {
+  const anchor = normalizeAnchor(String(g?.anchor ?? el.dataset.anchor ?? "centerCenter"));
+  const rot = Number(g?.rotationDeg ?? el.dataset.rotationDeg ?? 0) || 0;
+  el.dataset.anchor = anchor;
+  el.dataset.rotationDeg = String(rot);
+  el.style.transformOrigin = cssTransformOriginForAnchor(anchor);
+  // Single transform to avoid translate being rotated.
+  el.style.transform = `${cssTranslateForAnchor(anchor)} rotate(${rot}deg)`;
+};
+
 function plotFracsForEl(el: HTMLElement) {
   const l = Number(el.dataset.plotLeftF ?? "");
   const r = Number(el.dataset.plotRightF ?? "");
@@ -22,6 +94,8 @@ export function ensureGraphCompositeLayer(engine: Engine, graphId: string) {
   if (!node || !el) return null;
 
   const frame = el.querySelector<HTMLElement>(":scope > .timer-frame") ?? el;
+  // Axis arrows extend slightly outside the plot region; ensure they are not clipped.
+  frame.style.overflow = "visible";
   let layer = frame.querySelector<HTMLElement>(":scope > .graph-sub-layer");
   if (!layer) {
     layer = document.createElement("div");
@@ -51,6 +125,7 @@ export function ensureGraphCompositeLayer(engine: Engine, graphId: string) {
     plotGroup.dataset.groupPath = `${graphId}/plot`;
     plotGroup.style.position = "absolute";
     plotGroup.style.pointerEvents = "none";
+    plotGroup.style.overflow = "visible";
     plotGroup.style.zIndex = "10";
     plotGroup.style.background = "transparent";
     layer.append(plotGroup);
@@ -94,6 +169,7 @@ export function ensureGraphCompositeLayer(engine: Engine, graphId: string) {
         d.dataset.subId = sid;
         d.dataset.compPath = graphId;
         d.dataset.template = content;
+        d.dataset.anchor = String(g.anchor ?? "centerCenter");
         const contentEl = document.createElement("div");
         contentEl.className = "graph-sub-content";
         contentEl.style.width = "100%";
@@ -106,7 +182,7 @@ export function ensureGraphCompositeLayer(engine: Engine, graphId: string) {
         d.style.top = `${(g.y ?? 0.5) * 100}%`;
         d.style.width = `${(g.w ?? 0.4) * 100}%`;
         d.style.height = `${(g.h ?? 0.1) * 100}%`;
-        d.style.transform = "translate(-50%, -50%)";
+        applyGeomTransformCss(d, g);
         d.style.padding = "0";
         d.style.borderRadius = "0";
         d.style.border = "none";
@@ -119,8 +195,6 @@ export function ensureGraphCompositeLayer(engine: Engine, graphId: string) {
         d.style.fontFamily = "KaTeX_Main, Times New Roman, serif";
         d.style.fontWeight = "400";
         d.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
-        const rot = Number(g.rotationDeg ?? 0);
-        if (rot) d.style.rotate = `${rot}deg`;
         layer.append(d);
         continue;
       }
@@ -206,12 +280,15 @@ export function renderGraphCompositeTexts(graphEl: HTMLElement, layer: HTMLEleme
     const y = Number(g.y ?? 0.5);
     const w = Number(g.w ?? 0.4);
     const h = Number(g.h ?? 0.1);
-    t.style.left = `${x * 100}%`;
-    t.style.top = `${y * 100}%`;
-    t.style.width = `${w * 100}%`;
-    t.style.height = `${h * 100}%`;
-    t.style.rotate = `${Number(g.rotationDeg ?? 0)}deg`;
-    t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+    if (!interactive) {
+      // In composite edit, geometry is controlled by the editor; don't overwrite it here.
+      t.style.left = `${x * 100}%`;
+      t.style.top = `${y * 100}%`;
+      t.style.width = `${w * 100}%`;
+      t.style.height = `${h * 100}%`;
+      applyGeomTransformCss(t, g);
+      t.style.textAlign = g.align === "right" ? "right" : g.align === "center" ? "center" : "left";
+    }
 
     const fontPx = Math.max(1, box.height * h * 0.85);
     t.style.fontSize = `${fontPx}px`;

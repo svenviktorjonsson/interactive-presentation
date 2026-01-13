@@ -29,16 +29,22 @@ function isPointInRotatedRectClient(
 
 function collectCompositeRectsClient(type: "timer" | "sound" | "graph", nodeEl: HTMLElement, layer: HTMLElement): DOMRect[] {
   const rects: DOMRect[] = [];
-  rects.push(nodeEl.getBoundingClientRect());
+  // For graphs, the visible "content" is primarily the composite sub-elements (plot + labels).
+  // The node element itself can be a larger invisible container, which creates a confusing "ghost" selection box.
+  if (type !== "graph") rects.push(nodeEl.getBoundingClientRect());
 
   for (const sub of Array.from(layer.querySelectorAll<HTMLElement>(".comp-sub"))) {
     const subId = String(sub.dataset.subId ?? "");
     const kind = String(sub.dataset.kind ?? "");
     if (
       kind === "plot-region" ||
-      subId === "plot" ||
-      sub.classList.contains("timer-sub-plot") ||
-      sub.classList.contains("sound-sub-plot")
+      // In timer/sound, the plot region is an internal helper; don't let it define the outer bbox.
+      // In graph, the plot group *is* the main visible content and SHOULD be included.
+      (type !== "graph" && subId === "plot") ||
+      (type === "timer" && sub.classList.contains("timer-sub-plot")) ||
+      (type === "sound" && sub.classList.contains("sound-sub-plot")) ||
+      // Graph axis arrow hitboxes are invisible and should not affect the visible outer selection box.
+      (type === "graph" && kind === "plot-arrow")
     ) {
       continue;
     }

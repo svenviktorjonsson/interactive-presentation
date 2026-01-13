@@ -102,7 +102,42 @@ function setCommonStyles(el: HTMLElement, node: NodeModel) {
   el.style.pointerEvents = "auto";
   el.style.opacity = String(node.opacity ?? 1);
   el.style.display = node.visible === false ? "none" : "block";
-  el.style.transformOrigin = "50% 50%";
+  const normalizeAnchor = (a: string | undefined) => {
+    if (!a) return "topLeft";
+    if (a === "top") return "topCenter";
+    if (a === "bottom") return "bottomCenter";
+    if (a === "left") return "centerLeft";
+    if (a === "right") return "centerRight";
+    if (a === "center") return "centerCenter";
+    return a;
+  };
+  const transformOriginForAnchor = (anchor: string | undefined) => {
+    const a = normalizeAnchor(anchor);
+    switch (a) {
+      case "topLeft":
+        return "0% 0%";
+      case "topCenter":
+        return "50% 0%";
+      case "topRight":
+        return "100% 0%";
+      case "centerLeft":
+        return "0% 50%";
+      case "center":
+      case "centerCenter":
+        return "50% 50%";
+      case "centerRight":
+        return "100% 50%";
+      case "bottomLeft":
+        return "0% 100%";
+      case "bottomCenter":
+        return "50% 100%";
+      case "bottomRight":
+        return "100% 100%";
+      default:
+        return "50% 50%";
+    }
+  };
+  el.style.transformOrigin = transformOriginForAnchor(String((node as any)?.transform?.anchor ?? "centerCenter"));
   el.dataset.nodeId = node.id;
   el.dataset.nodeType = node.type;
   el.dataset.anchor = node.transform.anchor ?? "";
@@ -124,7 +159,7 @@ function setCommonStyles(el: HTMLElement, node: NodeModel) {
 
 function normalizeBg(bg: string, alpha?: number | null) {
   const a = typeof alpha === "number" && Number.isFinite(alpha) ? Math.min(1, Math.max(0, alpha)) : null;
-  const hex = bg.trim();
+  let hex = bg.trim();
   if (hex.startsWith("#")) {
     // Support #RRGGBB or #RRGGBBAA
     if (hex.length === 7) {
@@ -145,14 +180,25 @@ function normalizeBg(bg: string, alpha?: number | null) {
     return hex;
   }
   // Support tuple "r,g,b" or "r,g,b,a"
-  const tuple = hex.split(",").map((t) => t.trim());
+  // Accept optional parentheses: "(r,g,b)" (common in .pr syntax)
+  if (hex.startsWith("(") && hex.endsWith(")")) hex = hex.slice(1, -1).trim();
+  const tupleRaw = hex.split(",").map((t) => t.trim());
+  // If any channel contains a decimal point, interpret rgb channels as 0..1 floats and scale to 0..255.
+  // This avoids ambiguity with integer 0/1 values (authors can write 1.0 explicitly for normalized white).
+  const hasDecimal = tupleRaw.slice(0, 3).some((t) => t.includes("."));
+  const tuple = tupleRaw;
   if (tuple.length === 3 || tuple.length === 4) {
     const [r, g, b, a0] = tuple;
-    const r1 = Number(r);
-    const g1 = Number(g);
-    const b1 = Number(b);
+    let r1 = Number(r);
+    let g1 = Number(g);
+    let b1 = Number(b);
     const a1 = tuple.length === 4 ? Number(a0) : null;
     if ([r1, g1, b1].every((v) => Number.isFinite(v))) {
+      if (hasDecimal && [r1, g1, b1].every((v) => v >= 0 && v <= 1)) {
+        r1 = Math.round(r1 * 255);
+        g1 = Math.round(g1 * 255);
+        b1 = Math.round(b1 * 255);
+      }
       const finalA = a ?? (Number.isFinite(a1) ? a1 : 1);
       return `rgba(${r1}, ${g1}, ${b1}, ${finalA})`;
     }
@@ -1195,8 +1241,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     // Avoid any browser heuristics delaying load.
     img.loading = "eager";
     img.addEventListener("error", () => {
-      // eslint-disable-next-line no-console
-      console.warn("[ip] image failed to load", { id: node.id, src: (node as any).src });
+      // Intentionally quiet (missing images shouldn't spam logs).
     });
     (img.style as any).imageRendering = "pixelated";
     frame.append(canvas, img);
@@ -1773,8 +1818,7 @@ export function layoutDomNodes(args: {
     new URLSearchParams(window.location.search).get("debugAnim") === "1" || localStorage.getItem("ip_debug_anim") === "1";
   const dlog = (...a: any[]) => {
     if (!debugAnim) return;
-    // eslint-disable-next-line no-console
-    console.log("[ip][anim]", ...a);
+    // Intentionally quiet (debug-only hook).
   };
   const dpr = window.devicePixelRatio || 1;
 

@@ -14,6 +14,12 @@ export type CompositeEditController = {
   exitScreenEdit: () => void;
   isScreenEditMode: () => boolean;
   getCompositeState: () => CompositeState;
+  handlers?: {
+    onPointerDownCapture: (ev: PointerEvent) => boolean;
+    onPointerMoveCapture: (ev: PointerEvent) => boolean;
+    onPointerUpCapture: (ev: PointerEvent) => boolean;
+    onPointerCancelCapture: (ev: PointerEvent) => boolean;
+  };
 };
 
 export type CompositeEditControllerDeps = {
@@ -21,13 +27,15 @@ export type CompositeEditControllerDeps = {
   stage: HTMLElement;
   BACKEND: string;
   getAppMode: () => "edit" | "live";
+  cloneModel: (m: any) => any;
+  commit: (before: any | null) => Promise<void>;
 
   selected: Set<string>;
   clearSelection: () => void;
   applySelection: () => void;
   openEditorModal: (nodeId: string) => Promise<void>;
   ensureHandles: (el: HTMLElement) => void;
-  cursorForHandle: (h: string | null) => string;
+  cursorForHandle: (h: string | null, rotDeg?: number) => string;
   setBodyCursor: (v: string) => void;
 
   screenToWorld: (...args: any[]) => any;
@@ -67,13 +75,15 @@ export function attachCompositeEditController(opts: CompositeEditControllerDeps)
   const stage: HTMLElement = o.stage;
   const BACKEND: string = o.BACKEND;
   const getAppMode: () => "edit" | "live" = o.getAppMode;
+  const cloneModel: (m: any) => any = o.cloneModel;
+  const commit: (before: any | null) => Promise<void> = o.commit;
 
   const selected: Set<string> = o.selected;
   const clearSelection: () => void = o.clearSelection;
   const applySelection: () => void = o.applySelection;
   const openEditorModal: (nodeId: string) => Promise<void> = o.openEditorModal;
   const ensureHandles: (el: HTMLElement) => void = o.ensureHandles;
-  const cursorForHandle: (h: string | null) => string = o.cursorForHandle;
+  const cursorForHandle: (h: string | null, rotDeg?: number) => string = o.cursorForHandle;
   const setBodyCursor: (v: string) => void = o.setBodyCursor;
 
   const screenToWorld: any = o.screenToWorld;
@@ -134,13 +144,19 @@ const compositeGeomsByPath: Record<string, any> = {};
 let compositeHiddenEls: HTMLElement[] = [];
 let compositeSelectedSubId: string | null = null;
 let compositeSelectedSubEl: HTMLElement | null = null;
-let compositeDragMode: "none" | "move" | "resize" | "rotate" | "arrow" = "none";
+let compositeDragMode: "none" | "move" | "resize" | "rotate" | "arrow" | "split" = "none";
 let compositeActiveHandle: string | null = null;
 let compositeStart = { x: 0, y: 0 };
 let compositeStartGeom: any = null;
 let compositeGrabOff = { x: 0, y: 0 };
 let compositeStartAngleRad = 0;
 let compositeStartRotationDeg = 0;
+
+// Undo/redo integration:
+// - Capture a snapshot at drag start
+// - Commit ONE history entry on pointerup if anything actually changed
+let compositeBeforeModel: any | null = null;
+let compositeDirty = false;
 let compositeArrowDrag:
   | null
   | {
@@ -166,6 +182,201 @@ let compositeDrag:
       box: DOMRect;
     } = null;
 
+let compositeSplitDrag:
+  | null
+  | {
+      subId: string;
+      dir: "v" | "h";
+      idx: number;
+      start: number[];
+      boxEl: HTMLElement;
+      rotDeg: number;
+    } = null;
+
+const _escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const _quoteIfNeeded = (s0: string) => {
+  const s = String(s0 ?? "");
+  const needs = s.length === 0 || /[,\]\r\n]/.test(s);
+  if (!needs) return s;
+  return `"${s.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+};
+
+const _fmtPrList = (items: string[]) => `[${items.map(_quoteIfNeeded).join(", ")}]`;
+
+const _fmtNumList = (items: number[]) => {
+  const fmt = (n: number) => String(Math.round(n * 1e6) / 1e6);
+  return `[${(items ?? []).map((n) => fmt(Number(n))).join(", ")}]`;
+};
+
+const _readJsonArr = (raw: any): any[] => {
+  if (Array.isArray(raw)) return raw;
+  try {
+    const v = JSON.parse(String(raw ?? "[]"));
+    return Array.isArray(v) ? v : [];
+  } catch {
+    return [];
+  }
+};
+
+const _updateButtonsElementsPr = (
+  layer: HTMLElement,
+  subId: string,
+  patch: Partial<{
+    labels: string[];
+    actions: string[];
+    vSplits: number[];
+    hSplits: number[];
+    fontScale: number;
+    orientation: string;
+  }>
+) => {
+  const src = String((layer as any).__elementsPr ?? "");
+  const lines = src.split(/\r?\n/);
+  const out: string[] = [];
+  const idEsc = _escapeRe(subId);
+  const isThisButtonsLine = (ln: string) => /^\s*buttons\[/.test(ln) && new RegExp(`\\bname=${idEsc}\\b`).test(ln);
+  let replaced = false;
+  for (const ln of lines) {
+    if (!replaced && isThisButtonsLine(ln)) {
+      const orientation = String(patch.orientation ?? (ln.match(/\borientation=([a-zA-Z]+)/)?.[1] ?? "h"));
+      const labels = patch.labels ?? _readJsonArr((layer.querySelector<HTMLElement>(`.comp-sub[data-sub-id="${subId}"]`) as any)?.dataset?.templates).map(String);
+      const actions = patch.actions ?? _readJsonArr((layer.querySelector<HTMLElement>(`.comp-sub[data-sub-id="${subId}"]`) as any)?.dataset?.actions).map(String);
+      const vSplits = patch.vSplits ?? _readJsonArr((layer.querySelector<HTMLElement>(`.comp-sub[data-sub-id="${subId}"]`) as any)?.dataset?.vSplits).map(Number);
+      const hSplits = patch.hSplits ?? _readJsonArr((layer.querySelector<HTMLElement>(`.comp-sub[data-sub-id="${subId}"]`) as any)?.dataset?.hSplits).map(Number);
+      const fontScale0 = patch.fontScale ?? Number((layer.querySelector<HTMLElement>(`.comp-sub[data-sub-id="${subId}"]`) as any)?.dataset?.fontScale ?? "1");
+      const fontScale = Number.isFinite(Number(fontScale0)) && Number(fontScale0) > 0 ? Number(fontScale0) : 1;
+
+      const parts: string[] = [
+        `name=${subId}`,
+        `orientation=${orientation}`,
+        `labels=${_fmtPrList(labels.map(String))}`,
+        `actions=${_fmtPrList(actions.map(String))}`,
+      ];
+      if (Array.isArray(vSplits) && vSplits.length) parts.push(`vSplits=${_fmtNumList(vSplits.map(Number))}`);
+      if (Array.isArray(hSplits) && hSplits.length) parts.push(`hSplits=${_fmtNumList(hSplits.map(Number))}`);
+      if (fontScale !== 1) parts.push(`fontScale=${String(Math.round(fontScale * 1e6) / 1e6)}`);
+      out.push(`buttons[${parts.join(", ")}]`);
+      replaced = true;
+    } else {
+      out.push(ln);
+    }
+  }
+  if (!replaced) {
+    const labels = patch.labels ?? [];
+    const actions = patch.actions ?? [];
+    const vSplits = patch.vSplits ?? [];
+    const hSplits = patch.hSplits ?? [];
+    const fontScale0 = patch.fontScale ?? 1;
+    const fontScale = Number.isFinite(Number(fontScale0)) && Number(fontScale0) > 0 ? Number(fontScale0) : 1;
+    const orientation = String(patch.orientation ?? "h");
+    const parts: string[] = [
+      `name=${subId}`,
+      `orientation=${orientation}`,
+      `labels=${_fmtPrList(labels.map(String))}`,
+      `actions=${_fmtPrList(actions.map(String))}`,
+    ];
+    if (vSplits.length) parts.push(`vSplits=${_fmtNumList(vSplits.map(Number))}`);
+    if (hSplits.length) parts.push(`hSplits=${_fmtNumList(hSplits.map(Number))}`);
+    if (fontScale !== 1) parts.push(`fontScale=${String(Math.round(fontScale * 1e6) / 1e6)}`);
+    out.push(`buttons[${parts.join(", ")}]`);
+  }
+  (layer as any).__elementsPr = out.join("\n");
+};
+
+const _syncCompositeRootToModel = (engine: Engine, rootId: string, patch: Partial<any>) => {
+  try {
+    const model = engine.getModel() as any;
+    if (!model) return;
+    const n = (model.nodes ?? []).find((x: any) => String(x?.id ?? "") === String(rootId));
+    if (!n) return;
+    Object.assign(n, patch);
+  } catch {
+    // ignore
+  }
+};
+
+const cssTranslateForAnchor = (anchor: string) => {
+  const a = String(anchor || "centerCenter");
+  switch (a) {
+    case "topLeft":
+      return "translate(0%, 0%)";
+    case "topCenter":
+      return "translate(-50%, 0%)";
+    case "topRight":
+      return "translate(-100%, 0%)";
+    case "centerLeft":
+      return "translate(0%, -50%)";
+    case "center":
+    case "centerCenter":
+      return "translate(-50%, -50%)";
+    case "centerRight":
+      return "translate(-100%, -50%)";
+    case "bottomLeft":
+      return "translate(0%, -100%)";
+    case "bottomCenter":
+      return "translate(-50%, -100%)";
+    case "bottomRight":
+      return "translate(-100%, -100%)";
+    default:
+      return "translate(-50%, -50%)";
+  }
+};
+
+const cssTransformOriginForAnchor = (anchor: string) => {
+  const a = String(anchor || "centerCenter");
+  switch (a) {
+    case "topLeft":
+      return "0% 0%";
+    case "topCenter":
+      return "50% 0%";
+    case "topRight":
+      return "100% 0%";
+    case "centerLeft":
+      return "0% 50%";
+    case "center":
+    case "centerCenter":
+      return "50% 50%";
+    case "centerRight":
+      return "100% 50%";
+    case "bottomLeft":
+      return "0% 100%";
+    case "bottomCenter":
+      return "50% 100%";
+    case "bottomRight":
+      return "100% 100%";
+    default:
+      return "50% 50%";
+  }
+};
+
+const parseRotateDegFromTransform = (cssTransform: string | null | undefined) => {
+  const s = String(cssTransform ?? "");
+  const m = s.match(/rotate\(\s*([\-0-9.]+)\s*deg\s*\)/i);
+  if (!m) return 0;
+  const v = Number(m[1]);
+  return Number.isFinite(v) ? v : 0;
+};
+
+const applyAnchorTransformCss = (el: HTMLElement) => {
+  const a = String(el.dataset.anchor ?? "centerCenter");
+  el.style.transformOrigin = cssTransformOriginForAnchor(a);
+  const rot = Number(el.dataset.rotationDeg ?? "") || parseRotateDegFromTransform(el.style.transform) || 0;
+  el.dataset.rotationDeg = String(rot);
+  // IMPORTANT: keep translate + rotate in a single transform so translate isn't rotated.
+  el.style.transform = `${cssTranslateForAnchor(a)} rotate(${rot}deg)`;
+};
+
+const _normalizeAnchor = (a: string | undefined) => {
+  const s = String(a || "centerCenter");
+  if (s === "top") return "topCenter";
+  if (s === "bottom") return "bottomCenter";
+  if (s === "left") return "centerLeft";
+  if (s === "right") return "centerRight";
+  if (s === "center") return "centerCenter";
+  return s;
+};
+
 const clearCompositeSubSelection = () => {
   if (!compositeEditTimerId) return;
   const rootEl = engine.getNodeElement(compositeEditTimerId);
@@ -181,6 +392,7 @@ const clearCompositeSubSelection = () => {
   compositeActiveHandle = null;
   compositeStartGeom = null;
   compositeArrowDrag = null;
+  compositeSplitDrag = null;
   // Clear plot-arrow glow (rendered on SVG), if any.
   const layer =
     compositeEditKind === "timer"
@@ -238,6 +450,18 @@ exitScreenEdit = () => {
   }
   screenDimmedEls = [];
   screenEditMode = false;
+  // Hard guarantee: restore interactivity even if engine.setModel recreated DOM nodes while editing.
+  // (If pointer-events stays disabled, clicks can reach capture listeners but never select nodes.)
+  try {
+    for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".node.ip-dim-node"))) {
+      el.classList.remove("ip-dim-node");
+    }
+    for (const el of Array.from(stage.querySelectorAll<HTMLElement>(".node"))) {
+      if (el.style.pointerEvents === "none") el.style.pointerEvents = "";
+    }
+  } catch {
+    // ignore
+  }
   try {
     onScreenEditModeChanged?.(false);
   } catch {}
@@ -398,8 +622,19 @@ const enterGraphCompositeEdit = (graphId: string) => {
   const graphSubs = Array.from(((layer as HTMLElement | null)?.querySelectorAll?.(".comp-sub") ?? []) as NodeListOf<HTMLElement>);
   for (const sub of graphSubs) {
     // Lock the plot/data reference region.
-    if (sub.dataset.subId === "plot" || sub.dataset.kind === "plot-region") {
+    //
+    // IMPORTANT:
+    // The axis arrows use separate `.comp-sub[data-kind="plot-arrow"]` hitboxes that are children of the plot group.
+    // If we disable pointer-events on the plot group, those arrow hitboxes become unselectable.
+    if (sub.dataset.kind === "plot-region") {
       sub.style.pointerEvents = "none";
+      sub.style.cursor = "default";
+      sub.style.background = "transparent";
+      sub.style.outline = "none";
+      sub.style.opacity = "1";
+    } else if (sub.dataset.subId === "plot") {
+      // Treat as background (panning logic already ignores selecting `plot`), but keep events enabled for children.
+      sub.style.pointerEvents = "auto";
       sub.style.cursor = "default";
       sub.style.background = "transparent";
       sub.style.outline = "none";
@@ -671,52 +906,70 @@ const enterSoundCompositeEdit = (soundId: string) => {
 };
 
 const exitTimerCompositeEdit = () => {
-  if (!compositeEditTimerId) return;
+  // Always stop any active composite pan/cursor override.
+  stopCompositePan();
   // Clear last composite id marker (avoids restoring after setModel when not editing).
   delete (engine as any).__ip_lastCompositeId;
   delete (window as any).__ip_compositeEditId;
   delete (window as any).__ip_compositeEditKind;
-  const el = engine.getNodeElement(compositeEditTimerId);
-  // Hard guarantee: strip any leftover sub-element selection chrome when exiting group edit.
-  if (el) {
-    for (const sub of Array.from(el.querySelectorAll<HTMLElement>(".comp-sub.is-selected, .timer-sub.is-selected"))) {
-      sub.classList.remove("is-selected");
-      sub.querySelector(".handles")?.remove();
+  // IMPORTANT: must be idempotent (a stale window hook must not block mode switching).
+  if (compositeEditTimerId) {
+    const el = engine.getNodeElement(compositeEditTimerId);
+    // Hard guarantee: strip any leftover sub-element selection chrome when exiting group edit.
+    if (el) {
+      for (const sub of Array.from(el.querySelectorAll<HTMLElement>(".comp-sub.is-selected, .timer-sub.is-selected"))) {
+        sub.classList.remove("is-selected");
+        sub.querySelector(".handles")?.remove();
+      }
     }
-  }
-  if (compositeEditKind === "timer") {
-    const ov = el?.querySelector<HTMLElement>(".timer-overlay");
-    if (ov) ov.style.display = "block";
-    const layer = el?.querySelector<HTMLElement>(".timer-sub-layer");
-    if (layer) {
-      layer.style.pointerEvents = "none";
-      delete (layer.dataset as any).selectedPlotArrowId;
+    if (compositeEditKind === "timer") {
+      const ov = el?.querySelector<HTMLElement>(".timer-overlay");
+      if (ov) ov.style.display = "block";
+      const layer = el?.querySelector<HTMLElement>(".timer-sub-layer");
+      if (layer) {
+        layer.style.pointerEvents = "none";
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
+      if (el) el.dataset.compositeEditing = "0";
+    } else if (compositeEditKind === "sound") {
+      const ov = el?.querySelector<HTMLElement>(".sound-overlay");
+      if (ov) ov.style.display = "block";
+      const layer = el?.querySelector<HTMLElement>(".sound-sub-layer");
+      if (layer) {
+        layer.style.pointerEvents = "none";
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
+      if (el) el.dataset.compositeEditing = "0";
+    } else if (compositeEditKind === "graph") {
+      const layer = el?.querySelector<HTMLElement>(".graph-sub-layer");
+      if (layer) {
+        layer.style.pointerEvents = "none";
+        delete (layer.dataset as any).selectedPlotArrowId;
+      }
+      if (el) el.dataset.compositeEditing = "0";
+    } else {
+      const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
+      // Keep interactive so dblclick on bullets enters group edit (no "screen edit" by accident).
+      if (layer) layer.style.pointerEvents = "auto";
+      if (el) el.dataset.compositeEditing = "0";
     }
-    if (el) el.dataset.compositeEditing = "0";
-  } else if (compositeEditKind === "sound") {
-    const ov = el?.querySelector<HTMLElement>(".sound-overlay");
-    if (ov) ov.style.display = "block";
-    const layer = el?.querySelector<HTMLElement>(".sound-sub-layer");
-    if (layer) {
-      layer.style.pointerEvents = "none";
-      delete (layer.dataset as any).selectedPlotArrowId;
-    }
-    if (el) el.dataset.compositeEditing = "0";
-  } else if (compositeEditKind === "graph") {
-    const layer = el?.querySelector<HTMLElement>(".graph-sub-layer");
-    if (layer) {
-      layer.style.pointerEvents = "none";
-      delete (layer.dataset as any).selectedPlotArrowId;
-    }
-    if (el) el.dataset.compositeEditing = "0";
-  } else {
-    const layer = el?.querySelector<HTMLElement>(".choices-sub-layer");
-    // Keep interactive so dblclick on bullets enters group edit (no "screen edit" by accident).
-    if (layer) layer.style.pointerEvents = "auto";
-    if (el) el.dataset.compositeEditing = "0";
   }
   for (const e2 of compositeHiddenEls) e2.classList.remove("ip-dim-node");
   compositeHiddenEls = [];
+
+  // Hard guarantee: restore interactivity even if engine.setModel recreated DOM nodes while editing.
+  // (If `.ip-dim-node` sticks around, pointer events are disabled and clicks won't reach selection.)
+  try {
+    for (const el2 of Array.from(stage.querySelectorAll<HTMLElement>(".node.ip-dim-node"))) {
+      el2.classList.remove("ip-dim-node");
+    }
+    for (const sub of Array.from(stage.querySelectorAll<HTMLElement>(".comp-sub.ip-composite-dim"))) {
+      sub.classList.remove("ip-composite-dim");
+      sub.style.pointerEvents = "";
+    }
+  } catch {
+    // ignore
+  }
   compositeEditTimerId = null;
   compositeEditPath = "";
   compositePathStack.length = 0;
@@ -732,6 +985,9 @@ const exitTimerCompositeEdit = () => {
   if (btn) btn.textContent = mode === "edit" ? "Switch to Live" : "Switch to Edit";
   delete (window as any).__ip_exitCompositeEdit;
   delete (window as any).__ip_compositeEditing;
+  delete (window as any).__ip_cancelCompositePan;
+  // IMPORTANT: host state must be notified, otherwise selection/cursor keep thinking we're in composite edit.
+  syncCompositeState();
 };
 
 const openCompositeTextEditor = (timerId: string, subEl: HTMLElement) => {
@@ -814,6 +1070,7 @@ const openCompositeTextEditor = (timerId: string, subEl: HTMLElement) => {
   });
 
   btnSave.addEventListener("click", () => {
+    const before = cloneModel(engine.getModel());
     const newText = ta.value.replaceAll("\r\n", "\n");
     subEl.dataset.template = newText;
 
@@ -833,6 +1090,7 @@ const openCompositeTextEditor = (timerId: string, subEl: HTMLElement) => {
     }
     const nextText = out.join("\n");
     (layer as any).__elementsPr = nextText;
+    _syncCompositeRootToModel(engine, timerId, { elementsText: nextText });
 
     // Persist elements.pr (and current geoms) to backend.
     const geoms: any = (layer as any).__textGeoms ?? {};
@@ -841,6 +1099,173 @@ const openCompositeTextEditor = (timerId: string, subEl: HTMLElement) => {
       { compositePath: timerId, geoms, elementsPr: nextText },
       { kind: "timer", where: "text-editor-save", compositePath: timerId }
     );
+    void commit(before);
+    close();
+  });
+};
+
+const openCompositeButtonsEditor = (kind: "timer" | "sound", compId: string, subEl: HTMLElement) => {
+  const layer =
+    kind === "timer"
+      ? engine.getNodeElement(compId)?.querySelector<HTMLElement>(".timer-sub-layer")
+      : engine.getNodeElement(compId)?.querySelector<HTMLElement>(".sound-sub-layer");
+  if (!layer) return;
+  const subId = subEl.dataset.subId ?? "";
+  if (!subId) return;
+
+  const labels0 = _readJsonArr(subEl.dataset.templates).map(String);
+  const actions0 = _readJsonArr(subEl.dataset.actions).map(String);
+  const vSplits0 = _readJsonArr(subEl.dataset.vSplits).map(Number);
+  const hSplits0 = _readJsonArr(subEl.dataset.hSplits).map(Number);
+  const fontScale0 = Number(subEl.dataset.fontScale ?? "1") || 1;
+
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.style.width = "min(920px, calc(100vw - 40px))";
+  modal.style.height = "min(680px, calc(100vh - 40px))";
+
+  const header = document.createElement("div");
+  header.className = "modal-header";
+  header.innerHTML = `<div class="modal-title">Edit buttons: <code>${subId}</code></div>`;
+
+  const body = document.createElement("div");
+  body.style.padding = "14px";
+  body.style.display = "grid";
+  body.style.gridTemplateRows = "auto auto 1fr";
+  body.style.gap = "12px";
+
+  const layout = document.createElement("div");
+  layout.className = "field";
+  layout.innerHTML = `<label>Layout</label>`;
+  const layoutRow = document.createElement("div");
+  layoutRow.style.display = "flex";
+  layoutRow.style.flexWrap = "wrap";
+  layoutRow.style.gap = "10px";
+  layoutRow.style.alignItems = "center";
+
+  const btn1xN = document.createElement("button");
+  btn1xN.className = "btn";
+  btn1xN.textContent = "Preset: 1×N";
+  const btn2x2 = document.createElement("button");
+  btn2x2.className = "btn";
+  btn2x2.textContent = "Preset: 2×2";
+
+  const vInp = document.createElement("input");
+  vInp.className = "input";
+  vInp.placeholder = "vSplits (0..1): e.g. 0.5";
+  vInp.value = vSplits0.join(", ");
+  vInp.style.flex = "1";
+  const hInp = document.createElement("input");
+  hInp.className = "input";
+  hInp.placeholder = "hSplits (0..1): e.g. 0.5";
+  hInp.value = hSplits0.join(", ");
+  hInp.style.flex = "1";
+
+  layoutRow.append(btn1xN, btn2x2);
+  layout.append(layoutRow, vInp, hInp);
+
+  const table = document.createElement("div");
+  table.className = "field";
+  table.innerHTML = `<label>Buttons (template + action)</label>`;
+  const rows = document.createElement("div");
+  rows.style.display = "grid";
+  rows.style.gridTemplateColumns = "1fr 1fr";
+  rows.style.gap = "8px 10px";
+
+  const labelInputs: HTMLInputElement[] = [];
+  const actionInputs: HTMLInputElement[] = [];
+  const n = Math.max(labels0.length, actions0.length, 1);
+  for (let i = 0; i < n; i++) {
+    const li = document.createElement("input");
+    li.className = "input";
+    li.placeholder = `Button ${i + 1} template`;
+    li.value = String(labels0[i] ?? "");
+    const ai = document.createElement("input");
+    ai.className = "input";
+    ai.placeholder = `Button ${i + 1} action`;
+    ai.value = String(actions0[i] ?? "");
+    labelInputs.push(li);
+    actionInputs.push(ai);
+    rows.append(li, ai);
+  }
+  table.append(rows);
+
+  const footer = document.createElement("div");
+  footer.style.display = "flex";
+  footer.style.justifyContent = "flex-end";
+  footer.style.gap = "10px";
+  footer.style.padding = "12px 14px";
+  footer.style.borderTop = "1px solid rgba(255,255,255,0.12)";
+  const btnCancel = document.createElement("button");
+  btnCancel.className = "btn";
+  btnCancel.textContent = "Cancel";
+  const btnSave = document.createElement("button");
+  btnSave.className = "btn primary";
+  btnSave.textContent = "Save";
+  footer.append(btnCancel, btnSave);
+
+  modal.append(header, body, footer);
+  body.append(layout, table);
+  backdrop.append(modal);
+  document.body.append(backdrop);
+
+  const close = () => backdrop.remove();
+  btnCancel.addEventListener("click", close);
+  modal.addEventListener("pointerdown", (ev) => ev.stopPropagation());
+  backdrop.addEventListener("pointerdown", (ev) => {
+    if (ev.target === backdrop) close();
+  });
+
+  const parseSplits = (s: string) => {
+    const nums = s
+      .split(",")
+      .map((t) => Number(t.trim()))
+      .filter((x) => Number.isFinite(x))
+      .map((x) => Math.max(0.05, Math.min(0.95, x)));
+    nums.sort((a, b) => a - b);
+    const out: number[] = [];
+    for (const n of nums) {
+      if (out.length === 0 || Math.abs(out[out.length - 1]! - n) > 1e-6) out.push(n);
+    }
+    return out;
+  };
+
+  btn1xN.addEventListener("click", () => {
+    vInp.value = "";
+    hInp.value = "";
+  });
+  btn2x2.addEventListener("click", () => {
+    vInp.value = "0.5";
+    hInp.value = "0.5";
+  });
+
+  btnSave.addEventListener("click", () => {
+    const before = cloneModel(engine.getModel());
+    const labels = labelInputs.map((x) => x.value).filter((s) => String(s ?? "").trim().length > 0);
+    const actions = actionInputs.map((x) => x.value).slice(0, labels.length);
+    const vSplits = parseSplits(vInp.value);
+    const hSplits = parseSplits(hInp.value);
+
+    const fontScaleNow = Number(subEl.dataset.fontScale ?? String(fontScale0)) || 1;
+    subEl.dataset.templates = JSON.stringify(labels);
+    subEl.dataset.actions = JSON.stringify(actions);
+    subEl.dataset.vSplits = JSON.stringify(vSplits);
+    subEl.dataset.hSplits = JSON.stringify(hSplits);
+    subEl.dataset.fontScale = String(fontScaleNow);
+
+    _updateButtonsElementsPr(layer, subId, { labels, actions, vSplits, hSplits, fontScale: fontScaleNow });
+    _syncCompositeRootToModel(engine, compId, { elementsText: String((layer as any).__elementsPr ?? "") });
+
+    // Persist elements.pr + current geoms.
+    const geoms: any = compositeGeomsByPath[compId] ?? (layer as any).__textGeoms ?? {};
+    void _debugCompositeSaveFetch(
+      `${BACKEND}/api/composite/save`,
+      { compositePath: compId, geoms, elementsPr: String((layer as any).__elementsPr ?? "") },
+      { kind, where: "buttons-editor-save", compositePath: compId }
+    );
+    void commit(before);
     close();
   });
 };
@@ -1326,11 +1751,12 @@ stage.addEventListener("dblclick", async (ev) => {
   await openEditorModal(id);
 });
 
-stage.addEventListener("pointerdown", (ev) => {
+const onCompositePointerDownCaptureDrag = (ev: PointerEvent) => {
   // Hard block: Live mode must be resistant to any editing gestures.
   if (getAppMode() !== "edit") return;
   if (!compositeEditTimerId) return;
   const t = ev.target as HTMLElement;
+  const dbgButtons = !!(window as any).__ip_debug_buttons;
   const rootEl = engine.getNodeElement(compositeEditTimerId);
   if (!rootEl) return;
   const layer =
@@ -1353,12 +1779,28 @@ stage.addEventListener("pointerdown", (ev) => {
     handleHit && directSub
       ? directSub
       : _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY, { activeCompPath: compositeEditPath });
+  if (dbgButtons) {
+    // eslint-disable-next-line no-console
+    console.log("[ip][composite][pointerdown] raw", {
+      kind: compositeEditKind,
+      compId: compositeEditTimerId,
+      activePath: compositeEditPath,
+      target: { tag: (t as any)?.tagName, cls: String((t as any)?.className ?? ""), pe: getComputedStyle(t).pointerEvents },
+      handleHit: !!handleHit,
+      directSub: directSub
+        ? { cls: directSub.className, subId: String(directSub.dataset.subId ?? ""), pe: getComputedStyle(directSub).pointerEvents }
+        : null,
+      picked: sub ? { cls: sub.className, subId: String(sub.dataset.subId ?? ""), pe: getComputedStyle(sub).pointerEvents } : null,
+    });
+  }
   if (!sub) return;
 
-  // Composite sub-elements: implement our own "double click" for sub-text editing.
+  // Composite sub-elements: implement our own "double click" for sub editing.
   // Native dblclick can be suppressed by pointer capture + preventDefault during composite drag.
-  // This makes timer/sound/graph text editing consistent.
-  if ((sub.classList.contains("timer-sub-text") || sub.classList.contains("sound-sub-text") || sub.classList.contains("graph-sub-text")) && compositeEditTimerId) {
+  // This makes timer/sound/graph editing consistent.
+  const isSubText = sub.classList.contains("timer-sub-text") || sub.classList.contains("sound-sub-text") || sub.classList.contains("graph-sub-text");
+  const isSubButtons = sub.classList.contains("timer-sub-buttons") || sub.classList.contains("sound-sub-buttons");
+  if ((isSubText || isSubButtons) && compositeEditTimerId) {
     const now = performance.now();
     const sid = String(sub.dataset.subId ?? "");
     const prev = (stage as any).__ip_lastCompositeSubClick as
@@ -1381,6 +1823,10 @@ stage.addEventListener("pointerdown", (ev) => {
         stage.dispatchEvent(fake);
       } else if (sub.classList.contains("sound-sub-text") && compositeEditKind === "sound") {
         // Sound composite doesn't currently have a dedicated text editor; fall back to no-op for now.
+      } else if (sub.classList.contains("timer-sub-buttons") && compositeEditKind === "timer") {
+        openCompositeButtonsEditor("timer", compositeEditTimerId, sub);
+      } else if (sub.classList.contains("sound-sub-buttons") && compositeEditKind === "sound") {
+        openCompositeButtonsEditor("sound", compositeEditTimerId, sub);
       }
       (ev as any).stopImmediatePropagation?.();
       ev.preventDefault();
@@ -1414,6 +1860,16 @@ stage.addEventListener("pointerdown", (ev) => {
   compositeSelectedSubEl = sub;
   for (const e of Array.from(timerEl.querySelectorAll<HTMLElement>(".comp-sub"))) e.classList.remove("is-selected");
   sub.classList.add("is-selected");
+  // Ensure DOM anchor matches stored geom anchor so handles + resizing math match what the user sees.
+  // (Some composite renderers historically used translate(-50%,-50%) unconditionally.)
+  if (subId) {
+    const geoms: Record<string, any> = (compositeGeomsByPath[compositeEditPath] ??= {});
+    const g0 = geoms[subId] ?? {};
+    sub.dataset.anchor = String(g0.anchor ?? sub.dataset.anchor ?? "centerCenter");
+  } else {
+    sub.dataset.anchor = String(sub.dataset.anchor ?? "centerCenter");
+  }
+  applyAnchorTransformCss(sub);
   // If selecting anything other than a plot-arrow, clear plot-arrow selection glow.
   if (!(sub.dataset.kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph"))) {
     delete (layer.dataset as any).selectedPlotArrowId;
@@ -1462,6 +1918,9 @@ stage.addEventListener("pointerdown", (ev) => {
     compositeStartGeom = { x: 0, y: 0, w: 1, h: 1, rotationDeg: 0, anchor: "topLeft", align: "left" };
     compositeStart = { x: ev.clientX, y: ev.clientY };
     compositeDragMode = "arrow";
+    compositeBeforeModel = cloneModel(engine.getModel());
+    compositeDirty = false;
+    (window as any).__ip_compositeDragging = true;
     compositeArrowDrag = nearEndpoint
       ? { arrowId, end: best!.end, startClientX: ev.clientX, startClientY: ev.clientY }
       : {
@@ -1485,12 +1944,22 @@ stage.addEventListener("pointerdown", (ev) => {
   ensureHandles(sub);
 
   // Parent-relative coordinates:
-  // - If compPath is nested (e.g. "<id>/bullets"), normalize within that group's box.
-  // - Otherwise normalize within the root node box.
-  const groupBoxEl =
-    compositeEditPath.includes("/")
-      ? (timerEl.querySelector<HTMLElement>(`[data-group-path="${compositeEditPath}"]`) ?? timerEl)
-      : timerEl;
+  // - Always normalize within the composite "data region" layer, not the full node element.
+  //   (Using the full node bbox causes translation/rotation drift because the editable sub-layer
+  //    can be inset from the node and can have different transforms.)
+  // - If compPath is nested (e.g. "<id>/bullets"), normalize within that group's box within the layer.
+  const layerBoxEl =
+    compositeEditKind === "timer"
+      ? timerEl.querySelector<HTMLElement>(".timer-sub-layer")
+      : compositeEditKind === "sound"
+        ? timerEl.querySelector<HTMLElement>(".sound-sub-layer")
+        : compositeEditKind === "graph"
+          ? timerEl.querySelector<HTMLElement>(".graph-sub-layer")
+          : timerEl.querySelector<HTMLElement>(".choices-sub-layer");
+  const baseBoxEl = layerBoxEl ?? timerEl;
+  const groupBoxEl = compositeEditPath.includes("/")
+    ? (baseBoxEl.querySelector<HTMLElement>(`[data-group-path="${compositeEditPath}"]`) ?? baseBoxEl)
+    : baseBoxEl;
   const box = groupBoxEl.getBoundingClientRect();
 
   const geoms: Record<string, any> = (compositeGeomsByPath[compositeEditPath] ??= {});
@@ -1503,24 +1972,35 @@ stage.addEventListener("pointerdown", (ev) => {
   const handleEl = t.closest<HTMLElement>(".handle");
   const anchorEl = t.closest<HTMLElement>(".anchor-dot");
   if (anchorEl?.dataset.anchor) {
-    // Re-anchor without snapping (keep top-left fixed)
-    const newAnchor = anchorEl.dataset.anchor;
-    const startAnchor = sub.dataset.anchor ?? "centerCenter";
-    const x = Number(sub.style.left.replace("%", "")) / 100;
-    const y = Number(sub.style.top.replace("%", "")) / 100;
-    const w = Number(sub.style.width.replace("%", "")) / 100;
-    const h = Number(sub.style.height.replace("%", "")) / 100;
-    const topLeft = anchorToTopLeftWorld({ x, y, w, h, anchor: startAnchor } as any);
-    const newPos = topLeftToAnchorWorld({ x: topLeft.x, y: topLeft.y, w, h }, newAnchor);
+    // Re-anchor without any visible "jump":
+    // Use DOMRects to compute the required left/top compensation in the CURRENT composite coordinate system.
+    // This is robust to rotation and to transform function order.
+    const newAnchor = _normalizeAnchor(anchorEl.dataset.anchor);
+    const x0 = Number(sub.style.left.replace("%", "")) / 100;
+    const y0 = Number(sub.style.top.replace("%", "")) / 100;
+
+    const pre = sub.getBoundingClientRect();
     sub.dataset.anchor = newAnchor;
-    sub.style.left = `${newPos.x * 100}%`;
-    sub.style.top = `${newPos.y * 100}%`;
+    applyAnchorTransformCss(sub);
+    const post = sub.getBoundingClientRect();
+
+    const dxPx = pre.left - post.left;
+    const dyPx = pre.top - post.top;
+    const x1 = x0 + dxPx / Math.max(1e-9, box.width);
+    const y1 = y0 + dyPx / Math.max(1e-9, box.height);
+
+    sub.style.left = `${x1 * 100}%`;
+    sub.style.top = `${y1 * 100}%`;
     ensureHandles(sub);
-    // For dynamic wheel labels, store offsets from the computed base anchor (not absolute coords).
-    if (isChoicesWheelLabel && subId) {
-      const ox = newPos.x - baseX;
-      const oy = newPos.y - baseY;
-      geoms[subId] = { ...(geoms[subId] ?? {}), x: ox, y: oy, anchor: newAnchor };
+
+    if (subId) {
+      if (isChoicesWheelLabel) {
+        const ox = x1 - baseX;
+        const oy = y1 - baseY;
+        geoms[subId] = { ...(geoms[subId] ?? {}), x: ox, y: oy, anchor: newAnchor };
+      } else {
+        geoms[subId] = { ...(geoms[subId] ?? {}), x: x1, y: y1, anchor: newAnchor };
+      }
     }
     (ev as any).stopImmediatePropagation?.();
     ev.preventDefault();
@@ -1528,20 +2008,32 @@ stage.addEventListener("pointerdown", (ev) => {
   }
 
   compositeStart = { x: ev.clientX, y: ev.clientY };
+  const xStyle = Number(sub.style.left.replace("%", "")) / 100;
+  const yStyle = Number(sub.style.top.replace("%", "")) / 100;
+  const wStyle = Number(sub.style.width.replace("%", "")) / 100;
+  const hStyle = Number(sub.style.height.replace("%", "")) / 100;
   compositeStartGeom = {
     // Source of truth is the stored geom (prevents jitter from DOM rect measurement).
     x: Number(
-      isChoicesWheelLabel
-        ? baseX + Number(g0.x ?? (r.left + r.width / 2 - box.left) / box.width - baseX)
-        : (g0.x ?? (r.left + r.width / 2 - box.left) / box.width)
+      Number.isFinite(isChoicesWheelLabel ? baseX + Number(g0.x ?? NaN) : Number(g0.x ?? NaN))
+        ? isChoicesWheelLabel
+          ? baseX + Number(g0.x ?? 0)
+          : Number(g0.x ?? 0)
+        : Number.isFinite(xStyle)
+          ? xStyle
+          : (r.left + r.width / 2 - box.left) / box.width
     ),
     y: Number(
-      isChoicesWheelLabel
-        ? baseY + Number(g0.y ?? (r.top + r.height / 2 - box.top) / box.height - baseY)
-        : (g0.y ?? (r.top + r.height / 2 - box.top) / box.height)
+      Number.isFinite(isChoicesWheelLabel ? baseY + Number(g0.y ?? NaN) : Number(g0.y ?? NaN))
+        ? isChoicesWheelLabel
+          ? baseY + Number(g0.y ?? 0)
+          : Number(g0.y ?? 0)
+        : Number.isFinite(yStyle)
+          ? yStyle
+          : (r.top + r.height / 2 - box.top) / box.height
     ),
-    w: Number(g0.w ?? r.width / box.width),
-    h: Number(g0.h ?? r.height / box.height),
+    w: Number(Number.isFinite(Number(g0.w ?? NaN)) ? Number(g0.w) : Number.isFinite(wStyle) ? wStyle : r.width / box.width),
+    h: Number(Number.isFinite(Number(g0.h ?? NaN)) ? Number(g0.h) : Number.isFinite(hStyle) ? hStyle : r.height / box.height),
     rotationDeg: Number(g0.rotationDeg ?? (Number((sub.style.rotate || "0deg").replace("deg", "")) || 0)),
     anchor: String(g0.anchor ?? sub.dataset.anchor ?? "centerCenter"),
     align: String(g0.align ?? (sub.style.textAlign || "center"))
@@ -1564,6 +2056,34 @@ stage.addEventListener("pointerdown", (ev) => {
     // (aspect is only used for reasoning; wFrac/hFrac already encode it)
     void aspect;
   }
+
+  // Button split lines: drag to adjust vSplits/hSplits (layout) inside the buttons box.
+  const splitEl = t.closest<HTMLElement>(".ip-btn-split");
+  if (splitEl?.dataset?.kind === "button-split" && (sub.classList.contains("timer-sub-buttons") || sub.classList.contains("sound-sub-buttons"))) {
+    const dir = (splitEl.dataset.dir === "h" ? "h" : "v") as "v" | "h";
+    const idx = Number(splitEl.dataset.idx ?? "0") || 0;
+    const rect = sub.getBoundingClientRect();
+    const rotDeg = Number(sub.dataset.rotationDeg ?? compositeStartGeom.rotationDeg ?? 0) || 0;
+    const nBtns = sub.querySelectorAll("button.ip-controlbtn").length;
+    const defaultSplits = (n: number) => (n > 1 ? Array.from({ length: n - 1 }, (_, i) => (i + 1) / n) : []);
+    const start =
+      dir === "v"
+        ? (_readJsonArr(sub.dataset.vSplits).map(Number).filter((x) => Number.isFinite(x)) as number[])
+        : (_readJsonArr(sub.dataset.hSplits).map(Number).filter((x) => Number.isFinite(x)) as number[]);
+    const seed = start.length ? start : defaultSplits(nBtns);
+
+    compositeStart = { x: ev.clientX, y: ev.clientY };
+    compositeDragMode = "split";
+    compositeBeforeModel = cloneModel(engine.getModel());
+    compositeDirty = false;
+    (window as any).__ip_compositeDragging = true;
+    compositeSplitDrag = { subId: subId || String(sub.dataset.subId ?? ""), dir, idx, start: seed.slice(), boxEl: sub, rotDeg };
+    setBodyCursor(dir === "v" ? "col-resize" : "row-resize");
+    stage.setPointerCapture?.(ev.pointerId);
+    (ev as any).stopImmediatePropagation?.();
+    ev.preventDefault();
+    return;
+  }
   // Preserve cursor-to-anchor offset to avoid the “jump” on drag start.
   const px = (ev.clientX - box.left) / box.width;
   const py = (ev.clientY - box.top) / box.height;
@@ -1575,15 +2095,22 @@ stage.addEventListener("pointerdown", (ev) => {
     // - rot / rot-tl / rot-tr => rotate
     // - n/e/s/w/sw/se => resize
     compositeDragMode = compositeActiveHandle === "rot" || compositeActiveHandle.startsWith("rot-") ? "rotate" : "resize";
-    setBodyCursor(cursorForHandle(compositeActiveHandle));
+    compositeBeforeModel = cloneModel(engine.getModel());
+    compositeDirty = false;
+    (window as any).__ip_compositeDragging = true;
+    setBodyCursor(cursorForHandle(compositeActiveHandle, compositeStartGeom.rotationDeg));
     if (compositeDragMode === "rotate") {
-      const cx = r.left + r.width / 2;
-      const cy = r.top + r.height / 2;
-      compositeStartAngleRad = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+      // Rotate around the anchor point (x,y) within the active composite box.
+      const ax = box.left + compositeStartGeom.x * box.width;
+      const ay = box.top + compositeStartGeom.y * box.height;
+      compositeStartAngleRad = Math.atan2(ev.clientY - ay, ev.clientX - ax);
       compositeStartRotationDeg = compositeStartGeom.rotationDeg;
     }
   } else {
     compositeDragMode = "move";
+    compositeBeforeModel = cloneModel(engine.getModel());
+    compositeDirty = false;
+    (window as any).__ip_compositeDragging = true;
     sub.style.cursor = "grabbing";
   }
   if (dbg) {
@@ -1600,9 +2127,9 @@ stage.addEventListener("pointerdown", (ev) => {
   // Prevent the normal selection/rotate handler from selecting the timer node while we're editing sub-elements.
   (ev as any).stopImmediatePropagation?.();
   ev.preventDefault();
-});
+};
 
-stage.addEventListener("pointermove", (ev) => {
+const onCompositePointerMoveCaptureDrag = (ev: PointerEvent) => {
   // Hard block: Live mode must be resistant to any editing gestures.
   if (getAppMode() !== "edit") return;
   if (!compositeEditTimerId || compositeDragMode === "none" || !compositeSelectedSubEl || !compositeStartGeom) return;
@@ -1619,10 +2146,18 @@ stage.addEventListener("pointermove", (ev) => {
   const timerEl = engine.getNodeElement(compositeEditTimerId);
   if (!timerEl) return;
   const sub = compositeSelectedSubEl;
-  const groupBoxEl =
-    compositeEditPath.includes("/")
-      ? (timerEl.querySelector<HTMLElement>(`[data-group-path="${compositeEditPath}"]`) ?? timerEl)
-      : timerEl;
+  const layerBoxEl =
+    compositeEditKind === "timer"
+      ? timerEl.querySelector<HTMLElement>(".timer-sub-layer")
+      : compositeEditKind === "sound"
+        ? timerEl.querySelector<HTMLElement>(".sound-sub-layer")
+        : compositeEditKind === "graph"
+          ? timerEl.querySelector<HTMLElement>(".graph-sub-layer")
+          : timerEl.querySelector<HTMLElement>(".choices-sub-layer");
+  const baseBoxEl = layerBoxEl ?? timerEl;
+  const groupBoxEl = compositeEditPath.includes("/")
+    ? (baseBoxEl.querySelector<HTMLElement>(`[data-group-path="${compositeEditPath}"]`) ?? baseBoxEl)
+    : baseBoxEl;
   const box = groupBoxEl.getBoundingClientRect();
   const geoms: Record<string, any> = (compositeGeomsByPath[compositeEditPath] ??= {});
   const sid = sub.dataset.subId ?? "";
@@ -1632,6 +2167,14 @@ stage.addEventListener("pointermove", (ev) => {
     compositeEditKind === "choices" && compositeEditPath.endsWith("/wheel") && Number.isFinite(baseX) && Number.isFinite(baseY);
   const dx = (ev.clientX - compositeStart.x) / box.width;
   const dy = (ev.clientY - compositeStart.y) / box.height;
+  // Dead-zone: prevent tiny accidental nudges.
+  // Only start applying changes once the pointer has moved meaningfully.
+  const DRAG_START_PX = 3.0;
+  if (!compositeDirty) {
+    const movedPx = Math.hypot(ev.clientX - compositeStart.x, ev.clientY - compositeStart.y);
+    if (movedPx < DRAG_START_PX) return;
+    compositeDirty = true;
+  }
 
   if (compositeDragMode === "arrow" && compositeArrowDrag) {
     const cad = compositeArrowDrag;
@@ -1702,9 +2245,66 @@ stage.addEventListener("pointermove", (ev) => {
     // IMPORTANT: join with REAL newlines. Using "\\n" writes literal backslash-n into elements.pr,
     // which then explodes into invalid PR content on subsequent edits.
     (layer as any).__elementsPr = out.join("\n");
+    // Keep model in sync so undo/redo restores elements.pr changes.
+    // Defer model syncing to pointerup to avoid rebuilding DOM mid-drag.
 
     if (compositeEditKind === "timer") renderTimerCompositeArrows(timerEl, layer);
     else renderSoundCompositeArrows(timerEl, layer);
+    return;
+  }
+
+  if (compositeDragMode === "split" && compositeSplitDrag) {
+    const sd = compositeSplitDrag;
+    const sub = sd.boxEl;
+    const sid2 = sd.subId || sub.dataset.subId || "";
+    if (!sid2) return;
+    const r = sub.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const aInv = (-sd.rotDeg * Math.PI) / 180;
+    const cInv = Math.cos(aInv);
+    const sInv = Math.sin(aInv);
+    const dx0 = ev.clientX - cx;
+    const dy0 = ev.clientY - cy;
+    const lx = dx0 * cInv - dy0 * sInv;
+    const ly = dx0 * sInv + dy0 * cInv;
+    // IMPORTANT: account for grid gaps.
+    // Splits are defined in "track fraction" space (excluding gaps), not raw box fraction.
+    const xTotal = lx + r.width / 2;
+    const yTotal = ly + r.height / 2;
+    const grid = sub.querySelector<HTMLElement>(":scope > .ip-buttons-grid");
+    const cs = grid ? getComputedStyle(grid) : null;
+    const gapX = Math.max(0, Number.parseFloat(cs?.columnGap ?? "") || Number.parseFloat(cs?.gap ?? "") || 10);
+    const gapY = Math.max(0, Number.parseFloat(cs?.rowGap ?? "") || Number.parseFloat(cs?.gap ?? "") || 10);
+    const nTracks = sd.start.length + 1;
+    const availW = Math.max(1, r.width - gapX * Math.max(0, nTracks - 1));
+    const availH = Math.max(1, r.height - gapY * Math.max(0, nTracks - 1));
+    const frac0 =
+      sd.dir === "v"
+        ? (xTotal - gapX * (sd.idx + 0.5)) / Math.max(1e-9, availW)
+        : (yTotal - gapY * (sd.idx + 0.5)) / Math.max(1e-9, availH);
+
+    const minGap = 0.06;
+    const splits = sd.start.slice();
+    const i = Math.max(0, Math.min(splits.length - 1, sd.idx));
+    const lo = i === 0 ? minGap : splits[i - 1]! + minGap;
+    const hi = i === splits.length - 1 ? 1 - minGap : splits[i + 1]! - minGap;
+    const frac = Math.max(lo, Math.min(hi, Math.max(minGap, Math.min(1 - minGap, frac0))));
+    splits[i] = frac;
+
+    if (sd.dir === "v") sub.dataset.vSplits = JSON.stringify(splits);
+    else sub.dataset.hSplits = JSON.stringify(splits);
+
+    if (compositeEditKind === "timer" || compositeEditKind === "sound") {
+      const rootLayer =
+        compositeEditKind === "timer"
+          ? timerEl.querySelector<HTMLElement>(".timer-sub-layer")
+          : timerEl.querySelector<HTMLElement>(".sound-sub-layer");
+      if (rootLayer) {
+        _updateButtonsElementsPr(rootLayer, sid2, sd.dir === "v" ? { vSplits: splits } : { hSplits: splits });
+        // Defer model syncing to pointerup to avoid rebuilding DOM mid-drag.
+      }
+    }
     return;
   }
 
@@ -1744,92 +2344,123 @@ stage.addEventListener("pointermove", (ev) => {
   }
 
   if (compositeDragMode === "rotate") {
-    const r = sub.getBoundingClientRect();
-    const cx = r.left + r.width / 2;
-    const cy = r.top + r.height / 2;
-    const a1 = Math.atan2(ev.clientY - cy, ev.clientX - cx);
+    // Rotate around the anchor point (x,y) within the active composite box.
+    const ax = box.left + compositeStartGeom.x * box.width;
+    const ay = box.top + compositeStartGeom.y * box.height;
+    const a1 = Math.atan2(ev.clientY - ay, ev.clientX - ax);
     const ddeg = (a1 - compositeStartAngleRad) * (180 / Math.PI);
     let rot = compositeStartRotationDeg + ddeg;
     if (ev.shiftKey) rot = Math.round(rot / 15) * 15;
-    sub.style.rotate = `${rot}deg`;
+    sub.dataset.rotationDeg = String(rot);
+    applyAnchorTransformCss(sub);
+    // Refresh hover cursor arrows (they depend on current rotation).
+    // Without this, the handle DOM can keep stale cursor styles until the next unrelated refresh.
+    ensureHandles(sub);
     if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), rotationDeg: rot };
+    // Keep the drag cursor aligned with the current rotation.
+    if (compositeActiveHandle) setBodyCursor(cursorForHandle(compositeActiveHandle, rot));
     return;
   }
 
   if (compositeDragMode === "resize" && compositeActiveHandle) {
-    // Resize in normalized timer coords (ignoring rotation, like the main editor).
-    let rect = { x: compositeStartGeom.x, y: compositeStartGeom.y, w: compositeStartGeom.w, h: compositeStartGeom.h };
-    const min = 0.01;
+    // Resize in normalized composite coords.
+    // IMPORTANT: for rotated sub-elements, project mouse delta into the element's local axes
+    // so dragging feels visually correct (same principle as root-mode resizing).
+    const rect0 = { x: compositeStartGeom.x, y: compositeStartGeom.y, w: compositeStartGeom.w, h: compositeStartGeom.h };
+    const minW = 0.01;
+    const minH = 0.01;
     const hnd = compositeActiveHandle;
     const isCorner = hnd === "nw" || hnd === "ne" || hnd === "sw" || hnd === "se";
     const forceUniform = compositeEditKind === "choices" && (sid === "wheel" || sid === "pie"); // keep wheel aspect
     const forceWheelCircle = compositeEditKind === "choices" && sid === "wheel";
 
-    // Convert anchor-point rect -> top-left rect for resizing math
-    const tl = anchorToTopLeftWorld({ ...rect, anchor: compositeStartGeom.anchor } as any);
-    let tlr = { x: tl.x, y: tl.y, w: rect.w, h: rect.h };
+    const rotDeg = Number(compositeStartGeom?.rotationDeg ?? 0) || 0;
+    const aInv = (-rotDeg * Math.PI) / 180; // world -> local
+    const cInv = Math.cos(aInv);
+    const sInv = Math.sin(aInv);
+    const dxL = dx * cInv - dy * sInv;
+    const dyL = dx * sInv + dy * cInv;
+    const aFwd = (rotDeg * Math.PI) / 180; // local -> world
+    const cF = Math.cos(aFwd);
+    const sF = Math.sin(aFwd);
+    const localToWorldDelta = (lx: number, ly: number) => ({ x: lx * cF - ly * sF, y: lx * sF + ly * cF });
+
+    const normalizeAnchor = (a: string | undefined) => {
+      if (!a) return "centerCenter";
+      if (a === "top") return "topCenter";
+      if (a === "bottom") return "bottomCenter";
+      if (a === "left") return "centerLeft";
+      if (a === "right") return "centerRight";
+      if (a === "center") return "centerCenter";
+      return a;
+    };
+    const aN = normalizeAnchor(compositeStartGeom.anchor);
+    const ax = aN.endsWith("Left") ? 0 : aN.endsWith("Right") ? 1 : 0.5;
+    const ay = aN.startsWith("Top") ? 0 : aN.startsWith("Bottom") ? 1 : 0.5;
+    const denomE = Math.max(0, 1 - ax);
+    const denomW = Math.max(0, ax);
+    const denomS = Math.max(0, 1 - ay);
+    const denomN = Math.max(0, ay);
+    const wFromE = denomE > 1e-9 ? ((denomE * rect0.w + dxL) / denomE) : rect0.w;
+    const wFromW = denomW > 1e-9 ? ((denomW * rect0.w - dxL) / denomW) : rect0.w;
+    const hFromS = denomS > 1e-9 ? ((denomS * rect0.h + dyL) / denomS) : rect0.h;
+    const hFromN = denomN > 1e-9 ? ((denomN * rect0.h - dyL) / denomN) : rect0.h;
+
+    let wNew = rect0.w;
+    let hNew = rect0.h;
 
     if (isCorner || forceUniform) {
-      // Uniform scale for bottom corners (equal aspect ratio)
-      const sx =
-        hnd.includes("w") ? -dx : hnd.includes("e") ? dx : 0;
-      const sy =
-        hnd.includes("n") ? -dy : hnd.includes("s") ? dy : 0;
-      const w1 = Math.max(min, rect.w + sx);
-      const h1 = Math.max(min, rect.h + sy);
-      // If we're forcing uniform scaling from an edge, scale from that axis only.
-      let s = isCorner ? Math.max(w1 / Math.max(1e-9, rect.w), h1 / Math.max(1e-9, rect.h)) : (sx !== 0 ? w1 / Math.max(1e-9, rect.w) : h1 / Math.max(1e-9, rect.h));
+      const wc = hnd.includes("e") ? wFromE : hnd.includes("w") ? wFromW : rect0.w;
+      const hc = hnd.includes("s") ? hFromS : hnd.includes("n") ? hFromN : rect0.h;
+      let s = Math.max(wc / Math.max(1e-9, rect0.w), hc / Math.max(1e-9, rect0.h));
       if (ev.shiftKey) {
         const step = 0.05;
         s = Math.max(step, Math.round(s / step) * step);
       }
-      tlr.w = Math.max(min, rect.w * s);
-      tlr.h = Math.max(min, rect.h * s);
-      if (hnd.includes("w")) tlr.x = tl.x + (rect.w - tlr.w);
-      if (hnd.includes("n")) tlr.y = tl.y + (rect.h - tlr.h);
+      wNew = Math.max(minW, rect0.w * s);
+      hNew = Math.max(minH, rect0.h * s);
     } else {
-      // Free edge resize (aspect ratio can change)
-      if (hnd.includes("w")) {
-        tlr.x += dx;
-        tlr.w -= dx;
-      }
-      if (hnd.includes("e")) {
-        tlr.w += dx;
-      }
-      if (hnd.includes("n")) {
-        tlr.y += dy;
-        tlr.h -= dy;
-      }
-      if (hnd.includes("s")) {
-        tlr.h += dy;
-      }
+      if (hnd.includes("e")) wNew = Math.max(minW, wFromE);
+      if (hnd.includes("w")) wNew = Math.max(minW, wFromW);
+      if (hnd.includes("s")) hNew = Math.max(minH, hFromS);
+      if (hnd.includes("n")) hNew = Math.max(minH, hFromN);
     }
-    tlr.w = Math.max(min, tlr.w);
-    tlr.h = Math.max(min, tlr.h);
+
     if (forceWheelCircle) {
       // Pixel-square enforcement:
       // wFrac*boxW == hFrac*boxH  =>  wFrac == hFrac*(boxH/boxW)
-      const sPx = Math.max(8, Math.max(tlr.w * box.width, tlr.h * box.height));
-      const wNew = sPx / box.width;
-      const hNew = sPx / box.height;
-      // Anchor opposite edges relative to the original top-left rect (tl).
-      const w0 = rect.w;
-      const h0 = rect.h;
-      if (hnd.includes("w")) tlr.x = tl.x + (w0 - wNew);
-      if (hnd.includes("n")) tlr.y = tl.y + (h0 - hNew);
-      tlr.w = wNew;
-      tlr.h = hNew;
+      const sPx = Math.max(8, Math.max(wNew * box.width, hNew * box.height));
+      wNew = sPx / box.width;
+      hNew = sPx / box.height;
     }
 
-    // Back to anchor point
-    const ap = topLeftToAnchorWorld(tlr, compositeStartGeom.anchor);
-    rect = { x: ap.x, y: ap.y, w: tlr.w, h: tlr.h };
+    const rect = { x: rect0.x, y: rect0.y, w: wNew, h: hNew };
 
-    sub.style.left = `${rect.x * 100}%`;
-    sub.style.top = `${rect.y * 100}%`;
+    // Keep anchor position fixed; only size changes.
+    sub.style.left = `${rect0.x * 100}%`;
+    sub.style.top = `${rect0.y * 100}%`;
     sub.style.width = `${rect.w * 100}%`;
     sub.style.height = `${rect.h * 100}%`;
+    applyAnchorTransformCss(sub);
     if (sid) geoms[sid] = { ...(geoms[sid] ?? {}), x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+
+    // Buttons: edge-resize should NOT affect font size.
+    // We implement this by compensating fontScale inversely when changing height via n/s handles.
+    if ((sub.classList.contains("timer-sub-buttons") || sub.classList.contains("sound-sub-buttons")) && !isCorner) {
+      const isVerticalEdge = hnd === "n" || hnd === "s";
+      if (isVerticalEdge) {
+        const fs0 = Number(sub.dataset.fontScale ?? "1") || 1;
+        const nextFs = Math.max(0.1, fs0 * (rect0.h / Math.max(1e-9, rect.h)));
+        sub.dataset.fontScale = String(Math.round(nextFs * 1e6) / 1e6);
+        if (compositeEditKind === "timer" || compositeEditKind === "sound") {
+          const rootLayer =
+            compositeEditKind === "timer"
+              ? timerEl.querySelector<HTMLElement>(".timer-sub-layer")
+              : timerEl.querySelector<HTMLElement>(".sound-sub-layer");
+          if (rootLayer && sid) _updateButtonsElementsPr(rootLayer, sid, { fontScale: nextFs });
+        }
+      }
+    }
 
     // Choices composite: scale bullets content ONLY for corner scaling (pure scale).
     // Edge resizing should not change text layout; it should only change the box.
@@ -1848,9 +2479,9 @@ stage.addEventListener("pointermove", (ev) => {
     }
     return;
   }
-});
+};
 
-stage.addEventListener("pointerup", () => {
+const onCompositePointerUpCaptureDrag = (_ev: PointerEvent) => {
   // Hard block: Live mode must be resistant to any editing gestures.
   if (getAppMode() !== "edit") return;
   if (!compositeEditTimerId) return;
@@ -1861,6 +2492,24 @@ stage.addEventListener("pointerup", () => {
   if (!compositeEditPath) return;
   if (compositeSelectedSubEl) compositeSelectedSubEl.style.cursor = "grab";
 
+  const before = compositeBeforeModel;
+  const shouldPersist = !!compositeDirty;
+
+  if (!shouldPersist) {
+    // No-op click: don't save, don't create history entries.
+    compositeDragMode = "none";
+    compositeActiveHandle = null;
+    compositeStartGeom = null;
+    compositeArrowDrag = null;
+    compositeSplitDrag = null;
+    (window as any).__ip_compositeDragging = false;
+    setBodyCursor("");
+    stage.style.cursor = "";
+    compositeBeforeModel = null;
+    compositeDirty = false;
+    return;
+  }
+
   // Persist composite geometries from the in-memory model (no DOM-rect measuring -> no jitter / size drift).
   const geoms: any = compositeGeomsByPath[compositeEditPath] ?? {};
   const payload: any = { compositePath: compositeEditPath, geoms };
@@ -1870,6 +2519,27 @@ stage.addEventListener("pointerup", () => {
     where: "composite-pointerup",
     compositePath: compositeEditPath
   });
+
+  // Keep the in-memory engine model in sync too, so deselecting/exiting edit doesn't "snap back"
+  // to stale compositeGeometriesByPath values until the next reload.
+  try {
+    const model = engine.getModel() as any;
+    const rootId = String(compositeEditTimerId ?? "");
+    if (model && rootId) {
+      const n = (model.nodes ?? []).find((x: any) => String(x?.id ?? "") === rootId);
+      if (n) {
+        const rel0 = compositeEditPath.startsWith(rootId) ? compositeEditPath.slice(rootId.length) : "";
+        const rel = rel0.startsWith("/") ? rel0.slice(1) : rel0;
+        const key = rel || "";
+        (n.compositeGeometriesByPath ??= {});
+        (n.compositeGeometriesByPath as any)[key] = geoms;
+        // Back-compat: keep compositeGeometries (root) aligned.
+        if (key === "") n.compositeGeometries = geoms;
+      }
+    }
+  } catch {
+    // ignore
+  }
 
   // Timer/sound: axis arrow edits mutate the ROOT elements.pr regardless of which level is active.
   // (Arrows are currently authored in `groups/<id>/elements.pr`, not in `plot/elements.pr`.)
@@ -1887,6 +2557,7 @@ stage.addEventListener("pointerup", () => {
         { compositePath: compositeEditTimerId, geoms: compositeGeomsByPath[compositeEditTimerId] ?? {}, elementsPr },
         { kind: compositeEditKind, where: "composite-pointerup-elementsPr", compositePath: compositeEditTimerId }
       );
+      _syncCompositeRootToModel(engine, compositeEditTimerId, { elementsText: elementsPr });
     }
   }
 
@@ -1894,8 +2565,16 @@ stage.addEventListener("pointerup", () => {
   compositeActiveHandle = null;
   compositeStartGeom = null;
   compositeArrowDrag = null;
+  compositeSplitDrag = null;
+  (window as any).__ip_compositeDragging = false;
   setBodyCursor("");
-});
+  // Ensure the per-handle hover cursor can take effect immediately after drag.
+  stage.style.cursor = "";
+  compositeDirty = false;
+  compositeBeforeModel = null;
+  // Commit ONE undo step for this entire drag.
+  void commit(before);
+};
 
 // Composite edit background panning:
 // When in group mode, dragging on "disabled"/non-editable parts should behave like background and pan.
@@ -1911,9 +2590,7 @@ let compositePan:
       lastY: number;
     } = null;
 const startCompositePan = (ev: PointerEvent) => {
-  // Treat background pan as "deselect current sub-element".
-  // This matches normal editor behavior: click empty space clears selection.
-  clearCompositeSubSelection();
+  // Keep selection while panning (do not deselect).
   compositePan = { pointerId: ev.pointerId, lastX: ev.clientX, lastY: ev.clientY };
   setBodyCursor("grabbing");
   try {
@@ -1927,9 +2604,12 @@ const stopCompositePan = () => {
   compositePan = null;
   setBodyCursor("");
 };
-stage.addEventListener(
-  "pointerdown",
-  (ev) => {
+
+// Expose a cancel hook so global Escape can reliably stop panning
+// (composite pan is managed inside this module, not in bootstrap).
+// Composite pan is routed through the central interaction state machine.
+(window as any).__ip_cancelCompositePan = () => stopCompositePan();
+const onCompositePointerDownCapturePan = (ev: PointerEvent) => {
     if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId) return;
     if (ev.button !== 0) return;
@@ -1947,6 +2627,7 @@ stage.addEventListener(
     // Instead: pick the smallest composite sub by bbox and only pan if nothing selectable exists.
   const picked = _pickSmallestCompositeSub(rootEl, ev.clientX, ev.clientY, { activeCompPath: compositeEditPath });
     const kind = String(picked?.dataset.kind ?? "");
+    const subId = String(picked?.dataset.subId ?? "");
     const dbg = ipDebugEnabled("ip_debug_composite_hit");
     if (dbg) {
       // eslint-disable-next-line no-console
@@ -1958,7 +2639,11 @@ stage.addEventListener(
         client: { x: ev.clientX, y: ev.clientY },
       });
     }
-    if (picked && kind !== "plot-region") {
+    // Treat the plot group itself as non-selectable "background" (pan region) for timer/sound/graph.
+    // Otherwise a pan-start click would select `plot` and appear to "deselect" the current sub.
+    const isPlotGroup = subId === "plot" && (compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph");
+
+    if (picked && kind !== "plot-region" && !isPlotGroup) {
     // Plot arrows: behave like normal arrows in root mode (selectable in the middle too).
       if (kind === "plot-arrow" && (compositeEditKind === "timer" || compositeEditKind === "sound" || compositeEditKind === "graph")) {
             return;
@@ -1977,12 +2662,8 @@ stage.addEventListener(
     }
     (ev as any).stopImmediatePropagation?.();
     ev.preventDefault();
-  },
-  { capture: true }
-);
-stage.addEventListener(
-  "pointermove",
-  (ev) => {
+};
+const onCompositePointerMoveCapturePan = (ev: PointerEvent) => {
     if (!compositePan) return;
     if (getAppMode() !== "edit") return;
     if (!compositeEditTimerId) return;
@@ -1993,19 +2674,7 @@ stage.addEventListener(
     compositePan.lastY = ev.clientY;
     engine.setCamera({ cx: cam.cx - dx / cam.zoom, cy: cam.cy - dy / cam.zoom, zoom: cam.zoom });
     ev.preventDefault();
-  },
-  { capture: true }
-);
-window.addEventListener("pointerup", () => stopCompositePan(), { capture: true });
-window.addEventListener("pointercancel", () => stopCompositePan(), { capture: true });
-
-window.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") {
-    (window as any).__ip_exitCompositeEdit?.();
-    (window as any).__ip_exitGroupEdit?.();
-  }
-});
-
+};
 
   // Public API back to the host.
   return {
@@ -2021,5 +2690,45 @@ window.addEventListener("keydown", (ev) => {
     exitScreenEdit,
     isScreenEditMode: () => !!screenEditMode,
     getCompositeState: () => ({ id: compositeEditTimerId, kind: compositeEditKind, path: compositeEditPath }),
+    handlers: {
+      onPointerDownCapture: (ev) => {
+        if (!compositeEditTimerId) return false;
+        const before = ev.defaultPrevented;
+        onCompositePointerDownCaptureDrag(ev);
+        if (ev.defaultPrevented && !before) return true;
+        onCompositePointerDownCapturePan(ev);
+        return ev.defaultPrevented;
+      },
+      onPointerMoveCapture: (ev) => {
+        if (!compositeEditTimerId) return false;
+        const before = ev.defaultPrevented;
+        onCompositePointerMoveCaptureDrag(ev);
+        if (ev.defaultPrevented && !before) return true;
+        onCompositePointerMoveCapturePan(ev);
+        return ev.defaultPrevented;
+      },
+      onPointerUpCapture: (ev) => {
+        if (!compositeEditTimerId) return false;
+        onCompositePointerUpCaptureDrag(ev);
+        stopCompositePan();
+        return true;
+      },
+      onPointerCancelCapture: (_ev) => {
+        if (!compositeEditTimerId) return false;
+        // Stop pan and clear transient drag state without persisting.
+        stopCompositePan();
+        compositeDragMode = "none";
+        compositeActiveHandle = null;
+        compositeStartGeom = null;
+        compositeArrowDrag = null;
+        compositeSplitDrag = null;
+        (window as any).__ip_compositeDragging = false;
+        setBodyCursor("");
+        stage.style.cursor = "";
+        compositeDirty = false;
+        compositeBeforeModel = null;
+        return true;
+      },
+    },
   };
 }
