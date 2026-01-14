@@ -1,0 +1,29 @@
+{
+  "name": "pr-language",
+  "publisher": "local",
+  "displayName": "Presentation Language (.pr) (workspace-local)",
+  "description": "Workspace-local syntax highlighting for .pr presentation files (not published).",
+  "version": "0.0.0",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [
+      {
+        "id": "pr",
+        "aliases": ["Presentation", "pr"],
+        "extensions": [".pr"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "pr",
+        "scopeName": "source.pr",
+        "path": "./syntaxes/pr.tmLanguage.json"
+      }
+    ]
+  }
+}
+

@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Raw cursor SVGs</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #0b1020;
+        color: rgba(255, 255, 255, 0.92);
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      }
+      .wrap {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 32px;
+        padding: 32px;
+        align-items: start;
+      }
+      .card {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 12px;
+        padding: 18px;
+      }
+      .title {
+        font-size: 14px;
+        opacity: 0.9;
+        margin-bottom: 12px;
+      }
+      svg {
+        width: 128px;
+        height: 128px;
+        background: rgba(0, 0, 0, 0.15);
+        border-radius: 10px;
+        display: block;
+      }
+      .sub {
+        margin-top: 10px;
+        font-size: 12px;
+        opacity: 0.85;
+        line-height: 1.35;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      .grid3 {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 14px;
+      }
+      .cell {
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 12px;
+        padding: 14px;
+        min-height: 170px;
+        display: grid;
+        align-content: start;
+        justify-items: start;
+      }
+      .cell .lbl {
+        font-size: 13px;
+        opacity: 0.9;
+        margin-bottom: 10px;
+      }
+      .cell .meta {
+        margin-top: 10px;
+        font-size: 12px;
+        opacity: 0.8;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      .cell.center-skip {
+        background: transparent;
+        border: 1px dashed rgba(255, 255, 255, 0.18);
+        opacity: 0.5;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card" style="grid-column: 1 / -1">
+        <div class="title">A) 3×3 placement grid (box rotation = 0°)</div>
+        <div class="sub">Mapping: <b>svgAngle = -yourAngle</b>. Center is intentionally skipped.</div>
+        <div class="grid3" style="margin-top: 14px">
+          <!-- TOP-LEFT: rotation cursor -->
+          <div class="cell">
+            <div class="lbl">Top-left (rotate)</div>
+            <!-- Chosen: your +135° → svg -135° (so the arc “faces into” the corner) -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-135 16 16)">
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(16 26.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(16 5.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">your=+135° → svg=-135°</div>
+          </div>
+
+          <!-- TOP: vertical resize -->
+          <div class="cell">
+            <div class="lbl">Top (resize)</div>
+            <!-- vertical: your +90° → svg -90° -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-90 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">your=+90° → svg=-90°</div>
+          </div>
+
+          <!-- TOP-RIGHT: rotation cursor -->
+          <div class="cell">
+            <div class="lbl">Top-right (rotate)</div>
+            <!-- your +45° → svg -45° (per your instruction) -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-45 16 16)">
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(16 26.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(16 5.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">your=+45° → svg=-45°</div>
+          </div>
+
+          <!-- LEFT: horizontal resize -->
+          <div class="cell">
+            <div class="lbl">Left (resize)</div>
+            <!-- horizontal: your 0° → svg 0° -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+              <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+              <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+              </g>
+              <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+              </g>
+            </svg>
+            <div class="meta">your=0° → svg=0°</div>
+          </div>
+
+          <!-- CENTER: skipped -->
+          <div class="cell center-skip">
+            <div class="lbl">Center (skipped)</div>
+          </div>
+
+          <!-- RIGHT: horizontal resize -->
+          <div class="cell">
+            <div class="lbl">Right (resize)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+              <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+              <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+              </g>
+              <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+              </g>
+            </svg>
+            <div class="meta">your=0° → svg=0°</div>
+          </div>
+
+          <!-- BOTTOM-LEFT: angled resize -->
+          <div class="cell">
+            <div class="lbl">Bottom-left (scale)</div>
+            <!-- your +45° → svg -45° -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-45 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">your=+45° → svg=-45°</div>
+          </div>
+
+          <!-- BOTTOM: vertical resize -->
+          <div class="cell">
+            <div class="lbl">Bottom (resize)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-90 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">your=+90° → svg=-90°</div>
+          </div>
+
+          <!-- BOTTOM-RIGHT: angled resize -->
+          <div class="cell">
+            <div class="lbl">Bottom-right (scale)</div>
+            <!-- your -45° → svg +45° -->
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(45 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">your=-45° → svg=+45°</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="grid-column: 1 / -1">
+        <div class="title">B) 3×3 placement grid (box rotation = +15° CCW in your view)</div>
+        <div class="sub">
+          Box rotated by your +15° ⇒ each cursor rotates with the box.<br />
+          New mapping: <b>svgAngle = -(yourAngle + 15)</b> ⇒ <b>svgAngle = (baseSvgAngle - 15)</b>.
+        </div>
+
+        <div class="grid3" style="margin-top: 14px">
+          <!-- TOP-LEFT: rotation cursor -->
+          <div class="cell">
+            <div class="lbl">Top-left (rotate)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-150 16 16)">
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(16 26.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(16 5.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=-135° → -150°</div>
+          </div>
+
+          <!-- TOP: vertical resize -->
+          <div class="cell">
+            <div class="lbl">Top (resize)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-105 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=-90° → -105°</div>
+          </div>
+
+          <!-- TOP-RIGHT: rotation cursor -->
+          <div class="cell">
+            <div class="lbl">Top-right (rotate)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-60 16 16)">
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <path d="M 16.00 26.50 C 21.80 26.50 26.50 21.80 26.50 16.00 C 26.50 10.20 21.80 5.50 16.00 5.50" fill="none" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(16 26.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(16 5.5) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=-45° → -60°</div>
+          </div>
+
+          <!-- LEFT: horizontal resize -->
+          <div class="cell">
+            <div class="lbl">Left (resize)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-15 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=0° → -15°</div>
+          </div>
+
+          <!-- CENTER: skipped -->
+          <div class="cell center-skip">
+            <div class="lbl">Center (skipped)</div>
+          </div>
+
+          <!-- RIGHT: horizontal resize -->
+          <div class="cell">
+            <div class="lbl">Right (resize)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-15 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=0° → -15°</div>
+          </div>
+
+          <!-- BOTTOM-LEFT: angled resize -->
+          <div class="cell">
+            <div class="lbl">Bottom-left (scale)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-60 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=-45° → -60°</div>
+          </div>
+
+          <!-- BOTTOM: vertical resize -->
+          <div class="cell">
+            <div class="lbl">Bottom (resize)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(-105 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=-90° → -105°</div>
+          </div>
+
+          <!-- BOTTOM-RIGHT: angled resize -->
+          <div class="cell">
+            <div class="lbl">Bottom-right (scale)</div>
+            <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32" shape-rendering="geometricPrecision">
+              <g transform="rotate(30 16 16)">
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(0,0,0,0.65)" stroke-width="3.7" stroke-linecap="round" />
+                <line x1="6.5" y1="16" x2="25.5" y2="16" stroke="rgba(255,255,255,0.92)" stroke-width="2.1" stroke-linecap="round" />
+                <g transform="translate(6.5 16) rotate(180) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+                <g transform="translate(25.5 16) rotate(0) translate(0 -3.6)">
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(0,0,0,0.65)" />
+                  <path d="M0 0 L6.2 3.6 L0 7.2 Z" fill="rgba(255,255,255,0.92)" transform="scale(0.92) translate(0.2 0.3)" />
+                </g>
+              </g>
+            </svg>
+            <div class="meta">base svg=+45° → +30°</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

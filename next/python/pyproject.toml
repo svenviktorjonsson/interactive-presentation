@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "interactive-presentation-next"
+version = "0.0.1"
+description = "Next-gen interactive presentation engine (python package + offline web client)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "Interactive Presentation" }]
+dependencies = [
+  "flask>=3.0.0",
+]
+
+[project.scripts]
+interactive-presentation-next = "interactive_presentation.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["interactive_presentation"]
+

@@ -1,0 +1,172 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Interactive Presentation (.pr)",
+  "scopeName": "source.ippr",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#viewHeader" },
+    { "include": "#nodeLine" },
+    { "include": "#freeText" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.number-sign.ippr",
+          "match": "#.*$"
+        }
+      ]
+    },
+    "viewHeader": {
+      "patterns": [
+        {
+          "name": "meta.view.header.ippr",
+          "begin": "^(\\s*)(view)\\b",
+          "beginCaptures": {
+            "1": { "name": "punctuation.whitespace.leading.ippr" },
+            "2": { "name": "keyword.control.view.ippr" }
+          },
+          "end": "(:)\\s*$",
+          "endCaptures": {
+            "1": { "name": "punctuation.separator.colon.ippr" }
+          },
+          "patterns": [{ "include": "#argList" }]
+        }
+      ]
+    },
+    "nodeLine": {
+      "patterns": [
+        {
+          "name": "meta.node.line.ippr",
+          "begin": "^(\\s*)([a-zA-Z_][a-zA-Z0-9_-]*)\\b",
+          "beginCaptures": {
+            "1": { "name": "punctuation.whitespace.leading.ippr" },
+            "2": { "name": "entity.name.function.node.ippr" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#argList" },
+            {
+              "name": "punctuation.separator.colon.ippr",
+              "match": "\\s*:\\s*"
+            },
+            { "include": "#template" },
+            { "include": "#strings" },
+            { "include": "#timeLiteral" },
+            { "include": "#numbers" }
+          ]
+        }
+      ]
+    },
+    "argList": {
+      "patterns": [
+        {
+          "name": "meta.arglist.ippr",
+          "begin": "\\[",
+          "beginCaptures": {
+            "0": { "name": "punctuation.section.brackets.begin.ippr" }
+          },
+          "end": "\\]",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.brackets.end.ippr" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            { "include": "#strings" },
+            { "include": "#template" },
+            { "include": "#timeLiteral" },
+            { "include": "#numbers" },
+            {
+              "name": "punctuation.separator.comma.ippr",
+              "match": ","
+            },
+            {
+              "name": "keyword.operator.assignment.ippr",
+              "match": "="
+            },
+            {
+              "name": "variable.parameter.key.ippr",
+              "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*\\b(?=\\s*=)"
+            },
+            {
+              "name": "constant.other.bareword.ippr",
+              "match": "\\b[^\\s\\],=#:]+\\b"
+            }
+          ]
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.ippr",
+          "begin": "\"",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.string.begin.ippr" }
+          },
+          "end": "\"",
+          "endCaptures": {
+            "0": { "name": "punctuation.definition.string.end.ippr" }
+          },
+          "patterns": [
+            {
+              "name": "constant.character.escape.ippr",
+              "match": "\\\\."
+            },
+            { "include": "#template" }
+          ]
+        }
+      ]
+    },
+    "template": {
+      "patterns": [
+        {
+          "name": "meta.template.mustache.ippr",
+          "begin": "\\{\\{",
+          "beginCaptures": {
+            "0": { "name": "punctuation.section.embedded.begin.ippr" }
+          },
+          "end": "\\}\\}",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.embedded.end.ippr" }
+          },
+          "patterns": [
+            {
+              "name": "variable.other.mustache.ippr",
+              "match": "[^}]+"
+            }
+          ]
+        }
+      ]
+    },
+    "timeLiteral": {
+      "patterns": [
+        {
+          "name": "constant.numeric.time.ippr",
+          "match": "(?<![0-9])(?:\\d{2}:\\d{2}(?::\\d{2})?)(?:\\.\\d+)?(?![0-9])"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.ippr",
+          "match": "(?<![\\w.])[-+]?\\d+\\.\\d+(?![\\w.])"
+        },
+        {
+          "name": "constant.numeric.integer.ippr",
+          "match": "(?<![\\w.])[-+]?\\d+(?![\\w.])"
+        }
+      ]
+    },
+    "freeText": {
+      "patterns": [
+        {
+          "name": "string.unquoted.freetext.ippr",
+          "match": ".*"
+        }
+      ]
+    }
+  }
+}
+
