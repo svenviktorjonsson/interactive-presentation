@@ -1,8 +1,8 @@
 param(
   [Parameter(Position = 0)]
-  [string]$Presentation = "test",
+  [string]$Presentation = "default",
 
-  # Forward any remaining args directly to run_presentation.py (e.g. --port 8001 --no-reload)
+  # Forward any remaining args directly to scripts/run_presentation.py (e.g. --port 8001 --no-reload)
   [Parameter(ValueFromRemainingArguments = $true)]
   [string[]]$Rest
 )
@@ -18,12 +18,12 @@ $poetry = Get-Command poetry -ErrorAction SilentlyContinue
 $python = Get-Command python -ErrorAction SilentlyContinue
 
 if ($poetry) {
-  & $poetry.Path run python (Join-Path $repoRoot "run_presentation.py") -p $Presentation @Rest
+  & $poetry.Path run python (Join-Path $repoRoot "scripts" "run_presentation.py") -p $Presentation @Rest
   exit $LASTEXITCODE
 }
 
 if ($python) {
-  & $python.Path (Join-Path $repoRoot "run_presentation.py") -p $Presentation @Rest
+  & $python.Path (Join-Path $repoRoot "scripts" "run_presentation.py") -p $Presentation @Rest
   exit $LASTEXITCODE
 }
 

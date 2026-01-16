@@ -1,34 +1,18 @@
-# presentation.txt v1 (canonical)
-
-screen[name=main]:
-
-image[name=EOES_logo,bgColor=white]
-text[name=place_date]:
-NRM, 24 Jan 2026
-
-text[name=author]:
+text[id=screen_title,align=left]: NRM, 24 Jan 2026
+text[id=screen_hint,align=left]: Presented by Viktor Jonsson
 Presented by Viktor Jonsson
+Screen footer (bottom)
+image[id=EOES_logo,src=/media/EOES_logo.png]
 
-
-view[name=home]:
-text[name=title]:
-Welcome to my presentation
-
-image[name=join_qr]
-
-view[name=view2,refView=home,loc=right]:
-text[name=v2_note]:
-Hur bra är vi på att estimera 30 sekunder tror ni?
-
-timer[name=timer1,barColor=orange,binSize=1,grid=off,lineColor=green,lineWidth=2,max=40,min=20,showTime=0,stat=gaussian]
-
-view[name=view3,refView=view2,loc=right]:
-choices[name=fav_subjects,type=pie,bullets=A,includeLimit=3,textInsideLimit=6,otherLabel=Other,choices={Biologi:green,Kemi:red,Fysik:blue,Matematik:magenta,Övrigt:cyan}]:
-Vilket ämne tycker ni är roligast i skolan?
-
-
-view[name=view4,refView=home,loc=down]:
-text[name=sound_title]:
-Live sound (server mic)
-
-sound[name=sound1,mode=spectrum,windowS=30,color=white]
+text[id=t_73ba1c77,align=left]: NRM, 24 Jan 2026
+view[id=home]:
+text[id=home_title,align=left]: Home view text
+bullets[id=home_bullets,type=1.a.,align=center]: A\nB\n	C\n	D\nE\nF
+join[id=join_1,fields={namn,email,födelseår}]: Fyll i detaljerna så kör vi!
+arrow[id=arrow_034b85c7,color=white,strokePx=4.0]
+view[id=view2,loc=right,ref=home]:
+text[id=view2_title,align=left]: View 2 text
+text[id=view2_note,align=left]: View 2 secondary text
+view[id=view3,loc=down,ref=view2]:
+text[id=view3_title,align=left]: View 3 text
+text[id=view3_note,align=left]: View 3 secondary text

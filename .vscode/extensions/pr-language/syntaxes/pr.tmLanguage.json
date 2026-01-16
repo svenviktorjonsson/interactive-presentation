@@ -4,9 +4,9 @@
   "scopeName": "source.pr",
   "patterns": [
     { "include": "#comment" },
-    { "include": "#element-screen" },
     { "include": "#element-view" },
     { "include": "#element-arrow" },
+    { "include": "#element-join" },
     { "include": "#element-lines" },
     { "include": "#element-bullets" },
     { "include": "#element-choices" },
@@ -23,18 +23,6 @@
       "name": "comment.line.number-sign.pr",
       "match": "#.*$"
     },
-    "element-screen": {
-      "name": "meta.element.screen.pr",
-      "match": "^(screen)(\\[)([^\\]]*)(\\])(:)?(.*)$",
-      "captures": {
-        "1": { "name": "keyword.control.screen.pr" },
-        "2": { "name": "punctuation.definition.attributes.begin.pr" },
-        "3": { "patterns": [{ "include": "#attributes-common" }] },
-        "4": { "name": "punctuation.definition.attributes.end.pr" },
-        "5": { "name": "punctuation.separator.colon.pr" },
-        "6": { "name": "meta.content.pr" }
-      }
-    },
     "element-view": {
       "name": "meta.element.view.pr",
       "match": "^(view)(\\[)([^\\]]*)(\\])(:)?(.*)$",
@@ -50,6 +38,18 @@
     "element-arrow": {
       "name": "meta.element.arrow.pr",
       "match": "^(arrow)(\\[)([^\\]]*)(\\])(:)?(.*)$",
+      "captures": {
+        "1": { "name": "entity.name.function.element.pr" },
+        "2": { "name": "punctuation.definition.attributes.begin.pr" },
+        "3": { "patterns": [{ "include": "#attributes-common" }] },
+        "4": { "name": "punctuation.definition.attributes.end.pr" },
+        "5": { "name": "punctuation.separator.colon.pr" },
+        "6": { "name": "meta.content.pr" }
+      }
+    },
+    "element-join": {
+      "name": "meta.element.join.pr",
+      "match": "^(join)(\\[)([^\\]]*)(\\])(:)?(.*)$",
       "captures": {
         "1": { "name": "entity.name.function.element.pr" },
         "2": { "name": "punctuation.definition.attributes.begin.pr" },
@@ -446,7 +446,7 @@
 
     "content": {
       "name": "meta.content.pr",
-      "match": "^(?!#|screen|view|arrow|text|image|bullets|timer|sound|choices|poll|wheel|button|buttons|input|video|audio|shape|group|table|graph|lines|line).+$"
+      "match": "^(?!#|view|arrow|join|text|image|bullets|timer|sound|choices|poll|wheel|button|buttons|input|video|audio|shape|group|table|graph|lines|line).+$"
     }
   }
 }

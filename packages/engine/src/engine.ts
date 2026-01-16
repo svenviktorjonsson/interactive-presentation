@@ -196,6 +196,13 @@ export class Engine {
 
   private onPointerMove(ev: PointerEvent) {
     if (!this.isPanning || !this.lastPointer) return;
+    // Hard invariant: never keep panning if the left button isn't down.
+    // This makes "stuck pan" impossible even if a pointerup is missed.
+    if ((ev.buttons & 1) === 0) {
+      this.isPanning = false;
+      this.lastPointer = null;
+      return;
+    }
     const dx = ev.clientX - this.lastPointer.x;
     const dy = ev.clientY - this.lastPointer.y;
     this.lastPointer = { x: ev.clientX, y: ev.clientY };
@@ -471,12 +478,11 @@ export class Engine {
       // In Composite (group) edit mode, dim any nodes that the app layer marked as "disabled" via ip-dim-node.
       const domEl = this.domNodes.get(String(n.id))?.el ?? null;
       const isDimmedByUi = !!domEl?.classList?.contains("ip-dim-node");
-      const finalOpacity =
-        (window as any).__ip_screenEditing && n.space === "world"
-          ? opacity * 0.1
-          : (window as any).__ip_compositeEditing && isDimmedByUi
-            ? opacity * 0.1
-            : opacity;
+      const isEditMode = document.documentElement.dataset.ipMode === "edit";
+      const isScreenEditing = !!(window as any).__ip_screenEditing;
+      const dimForScreenMode = isEditMode && (isScreenEditing ? n.space === "world" : n.space === "screen");
+      const dimForComposite = (window as any).__ip_compositeEditing && isDimmedByUi;
+      const finalOpacity = dimForScreenMode || dimForComposite ? opacity * 0.1 : opacity;
       const wRaw = Number(n.width ?? 4);
       const selected = document.documentElement.dataset.ipMode === "edit"
         ? !!this.domNodes.get(String(n.id))?.el?.classList?.contains("is-selected")

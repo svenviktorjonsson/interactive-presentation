@@ -1,0 +1,7 @@
+id,view,x,y,w,h,rotationDeg,anchor,align
+x_label,sound,0.50,1.06,0.60,0.08,0,topCenter,center
+y_label,sound,-0.17038335565784135,0.11719580843509136,0.45,0.08,-90,centerCenter,center
+sound1_buttons,sound,0.50,-0.02,0.86,0.10,0,topCenter,center
+peak,sound,0.5028738858079436,0.055646919385237144,0.55,0.08,0,topCenter,center
+x_axis,sound,0,0,1,1,0,topLeft,
+y_axis,sound,0,0,1,1,0,topLeft,

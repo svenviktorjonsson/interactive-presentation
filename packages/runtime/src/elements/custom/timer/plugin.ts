@@ -1,5 +1,5 @@
 import type { ElementPlugin, FrameContext, RuntimeContext } from "../../../runtime/types";
-import { ensureTimerCompositeLayer, layoutTimerCompositeTexts, renderTimerCompositeArrows, renderTimerCompositeButtons, renderTimerCompositeTexts } from "./ui";
+import { ensureTimerCompositeLayer, layoutTimerCompositeTexts, renderTimerCompositeButtons, renderTimerCompositeTexts } from "./ui";
 import { drawTimerNode } from "./render";
 
 type TimerState = {
@@ -101,7 +101,6 @@ export function createTimerPlugin(): ElementPlugin {
 
         const layer = ensureTimerCompositeLayer(ctx.engine, id);
         if (layer) {
-          renderTimerCompositeArrows(el, layer);
           layoutTimerCompositeTexts(el, layer);
 
           const fmtS = (ms: any) => {

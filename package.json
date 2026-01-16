@@ -2,10 +2,10 @@
   "name": "interactive-presentation",
   "private": true,
   "scripts": {
-    "dev:web": "npm --prefix apps/web run dev",
-    "build:web": "npm --prefix apps/web run build",
-    "preview:web": "npm --prefix apps/web run preview",
-    "typecheck": "npm --prefix apps/web run typecheck"
+    "dev:web": "npm --prefix app/web run dev",
+    "build:web": "npm --prefix app/web run build",
+    "preview:web": "npm --prefix app/web run preview",
+    "typecheck": "npm --prefix app/web run typecheck"
   },
   "devDependencies": {
     "typescript": "^5.8.3",

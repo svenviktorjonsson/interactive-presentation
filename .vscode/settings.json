@@ -5,10 +5,6 @@
   "editor.tokenColorCustomizations": {
     "textMateRules": [
       {
-        "scope": "keyword.control.screen.pr",
-        "settings": { "foreground": "#FFFF00" }
-      },
-      {
         "scope": "keyword.control.view.pr",
         "settings": { "foreground": "#569CD6" }
       },

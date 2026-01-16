@@ -1,0 +1,293 @@
+:root {
+  color-scheme: dark;
+  --bg: #0b1020;
+  --grid1: rgba(255, 255, 255, 0.06);
+  --grid2: rgba(255, 255, 255, 0.10);
+  --text: rgba(255, 255, 255, 0.92);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(1200px 700px at 50% 10%, rgba(110, 168, 255, 0.12), transparent 60%),
+    radial-gradient(900px 500px at 30% 80%, rgba(255, 120, 190, 0.08), transparent 65%),
+    var(--bg);
+  color: var(--text);
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+.stage {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.stage-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+}
+
+.stage-overlay {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+  z-index: 1;
+}
+
+.stage-toolbar {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+}
+
+.mode-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(10, 12, 18, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  backdrop-filter: blur(10px);
+}
+
+.mode-switch button {
+  appearance: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(255, 255, 255, 0.92);
+  border-radius: 999px;
+  padding: 6px 12px;
+  font: 700 12px/1 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+    "Segoe UI Emoji";
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.mode-switch button.is-active {
+  background: rgba(110, 168, 255, 0.28);
+  border-color: rgba(110, 168, 255, 0.6);
+  color: #e8f0ff;
+}
+
+.node {
+  position: absolute;
+  pointer-events: auto;
+  user-select: none;
+  transform-origin: 50% 50%;
+  white-space: pre-wrap;
+}
+
+.node.is-disabled {
+  opacity: 0.35 !important;
+  filter: grayscale(0.55);
+}
+
+.node-text,
+.node-bullets {
+  /* Keep node positioning absolute (inherited from `.node`). */
+  padding: 0;
+  background: transparent;
+  /* Make plain text match KaTeX roman (so `math` and `\mathrm{math}` look identical). */
+  font-family: KaTeX_Main, "Times New Roman", Times, serif;
+}
+
+.node-text-content {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  pointer-events: none; /* interaction handled by node container + state machine */
+}
+
+.node-text-inner {
+  display: inline-block;
+  pointer-events: none;
+}
+
+.node-bullets {
+}
+
+.node-bullets-content {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.node-bullets-line {
+  white-space: pre-wrap;
+}
+
+.node-image {
+  background: transparent;
+}
+
+.node-image-content {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+}
+
+.node-join {
+  background: transparent;
+}
+
+.node-join-qr {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+  user-select: none;
+  image-rendering: pixelated;
+}
+
+.node-arrow {
+  pointer-events: none;
+  overflow: visible;
+}
+
+.node-arrow-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.node.is-selected {
+  outline: 3px solid rgba(110, 168, 255, 0.95);
+  outline-offset: 0px;
+}
+
+.node-arrow.is-selected {
+  outline: none;
+}
+
+.handles .handle {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid rgba(110, 168, 255, 0.92);
+  background: rgba(15, 17, 24, 0.35);
+  box-sizing: border-box;
+}
+
+.handles .handle-rot {
+  width: 14px;
+  height: 14px;
+  border-width: 2px;
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.handles .anchor-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px; /* circular dots */
+  background: rgba(255, 255, 255, 0.55);
+  border: 0; /* no ring */
+  box-sizing: border-box;
+  display: none;
+}
+
+.handles .anchor-dot.is-current {
+  background: rgba(255, 40, 40, 0.95);
+}
+
+.node.is-selected .handles .anchor-dot {
+  display: block;
+}
+
+
+.marquee {
+  position: absolute;
+  pointer-events: none;
+  border: 1px dashed rgba(110, 168, 255, 0.75);
+  background: rgba(110, 168, 255, 0.06);
+  border-radius: 4px;
+  z-index: 1500;
+}
+
+.text-editor {
+  box-sizing: border-box;
+  padding: 10px 12px;
+  resize: none;
+  border-radius: 0px;
+  border: 1px solid rgba(110, 168, 255, 0.75);
+  background: rgba(5, 8, 18, 0.92);
+  color: rgba(255, 255, 255, 0.92);
+  outline: none;
+  /* Editor should be monospace; render output uses KaTeX fonts. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+  font-weight: inherit;
+  font-style: inherit;
+  line-height: 1.35;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow: hidden;
+}
+
+.text-editor-anchors {
+  position: absolute;
+  pointer-events: none;
+  width: 100%;
+  height: 0;
+  left: 0;
+  top: 0;
+}
+
+.text-editor-anchors .anchor-dot {
+  width: 10px;
+  height: 10px;
+  min-width: 10px;
+  min-height: 10px;
+  padding: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.55);
+  border: 0;
+  box-sizing: border-box;
+  pointer-events: auto;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  display: block;
+  line-height: 0;
+}
+
+.text-editor-anchors .anchor-dot.is-current {
+  background: rgba(120, 255, 140, 0.95);
+}
+
+.text-editor-error {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  font-size: 12px;
+  line-height: 1.3;
+  color: rgba(255, 90, 90, 0.98);
+  background: rgba(255, 50, 50, 0.10);
+  border: 1px solid rgba(255, 90, 90, 0.35);
+  border-radius: 8px;
+  padding: 6px 8px;
+  box-sizing: border-box;
+}
+

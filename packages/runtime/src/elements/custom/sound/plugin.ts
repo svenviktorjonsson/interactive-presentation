@@ -1,6 +1,6 @@
 import type { ElementPlugin, FrameContext, RuntimeContext } from "../../../runtime/types";
 import { drawSoundNode } from "./render";
-import { ensureSoundCompositeLayer, layoutSoundCompositeTexts, renderSoundCompositeArrows, renderSoundCompositeButtons, renderSoundCompositeTexts } from "./ui";
+import { ensureSoundCompositeLayer, layoutSoundCompositeTexts, renderSoundCompositeButtons, renderSoundCompositeTexts } from "./ui";
 
 type SoundState = {
   enabled: boolean;
@@ -154,7 +154,6 @@ export function createSoundPlugin(): ElementPlugin {
 
         const layer = ensureSoundCompositeLayer(ctx.engine, id);
         if (layer) {
-          renderSoundCompositeArrows(el, layer);
           layoutSoundCompositeTexts(el, layer);
           // Basic bindings (extend as needed)
           const peakDb = (() => {

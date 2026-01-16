@@ -1,7 +1,7 @@
 # Interactive presentation builder
 
 This repo contains:
-- A **Python backend** (FastAPI) that serves a presentation from `presentations/default/`
+- A **Python backend** (Flask) that serves a presentation from `presentations/default/`
 - A **TypeScript web app** (Vite) that renders the presentation, plus an **editor** (Edit mode)
 
 You can author presentations in two ways:
@@ -16,18 +16,17 @@ From repo root:
 
 ```bash
 poetry install
-poetry run python run_presentation.py
+poetry run python scripts/run_presentation.py
 ```
 
 This script will:
-- Install web deps if missing (`npm install` in `apps/web`)
-- Build the web app once (`npm run build` in `apps/web`)
+- Install web deps if missing (`npm install` in `app/web`)
+- Build the web app once (`npm run build` in `app/web`)
 - Start the backend on `http://localhost:8000`
-- (Optionally) create a public tunnel and generate `presentations/default/media/join_qr.png`
 
 Useful endpoints:
 - **health**: `http://localhost:8000/api/health`
-- **presentation JSON**: `http://localhost:8000/api/presentation`
+- **presentation JSON**: `http://localhost:8000/model`
 - **audience join page**: `http://localhost:8000/join`
 
 ---
@@ -83,6 +82,14 @@ This is how the system supports “special widgets” while still keeping them e
 
 ---
 
+## Repo layout (active vs legacy)
+
+- `app/` is the **active app** (current implementation).
+- `legacy/` is the **old app** kept for reference only.
+- `legacy/presentations/` contains the archived legacy decks.
+
+---
+
 ## Authoring via files (DSL + CSV)
 
 All presentation content for the default deck lives in:
@@ -105,8 +112,6 @@ All presentation content for the default deck lives in:
 Example (from `presentations/default/presentation.pr`):
 
 ```text
-screen[name=main]:
-
 image[name=EOES_logo,bgColor=white]
 text[name=place_date]:
 NRM, 24 Jan 2026
@@ -123,7 +128,7 @@ image[name=join_qr]
 - The `name=...` parameter becomes the **node id**
 - Nodes that carry text have a `:` and then their text on the next line(s)
 - Views are declared with `view[...]` (and then list which nodes exist in that view)
-- `screen[...]` is the screen-space view section (HUD nodes)
+- Any nodes **before the first `view[...]`** are treated as screen-space (HUD nodes)
 
 #### Parameters
 Parameters are comma-separated inside `[...]`:

@@ -1,3 +1,10 @@
-id,when,how,from,durationMs,delayMs
-title,enter,fade,left,1500,0
-join_qr,enter,fade,all,1500,0
+id,what,when,how,where,delayMs
+screen_title,enter,next,fade:0.05,left:0.2,0
+screen_hint,enter,same,fade:0.05,left:0.2,0
+screen_footer,enter,after,fade:0.05,left:0.2,0
+home_title,enter,next,fade:0.05,left:0.2,0
+home_note,enter,same,fade:0.05,left:0.2,0
+view2_title,enter,next,fade:0.05,left:0.2,0
+view2_note,enter,after,fade:0.05,left:0.2,0
+view3_title,enter,next,fade:0.05,left:0.2,0
+view3_note,enter,after,fade:0.05,left:0.2,0

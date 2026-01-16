@@ -8,28 +8,65 @@ export interface DomNodeHandle {
   destroy: () => void;
 }
 
-type ControlButtonSpec = { label: string; action: string; primary?: boolean };
-
-function createControlBar(opts: { className: string; buttonClass: string; buttons: ControlButtonSpec[] }) {
-  const bar = document.createElement("div");
-  bar.className = `${opts.className} ip-controlbar`;
-  bar.style.position = "absolute";
-  bar.style.left = "0";
-  bar.style.right = "0";
-  bar.style.display = "flex";
-  bar.style.alignItems = "center";
-  bar.style.pointerEvents = "auto";
-  const buttons: Record<string, HTMLButtonElement> = {};
-  for (const b of opts.buttons) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = `ip-controlbtn ${opts.buttonClass}${b.primary ? " primary" : ""}`;
-    btn.dataset.action = b.action;
-    btn.textContent = b.label;
-    bar.appendChild(btn);
-    buttons[b.action] = btn;
+function ensureButtonsGrid(
+  host: HTMLElement,
+  opts: { orientation: "h" | "v"; labels: string[]; actions: string[] }
+) {
+  // Use the same button element structure as the timer composite buttons:
+  // - container: .ip-buttons-grid
+  // - children: button.ip-controlbtn > .ip-button-content
+  let grid = host.querySelector<HTMLElement>(":scope > .ip-buttons-grid");
+  if (!grid) {
+    grid = document.createElement("div");
+    grid.className = "ip-buttons-grid";
+    grid.style.position = "absolute";
+    grid.style.inset = "0";
+    grid.style.display = "grid";
+    grid.style.alignItems = "stretch";
+    grid.style.justifyItems = "stretch";
+    grid.style.gap = "10px";
+    grid.style.padding = "0";
+    grid.style.boxSizing = "border-box";
+    host.appendChild(grid);
   }
-  return { bar, buttons };
+
+  const n = Math.min(opts.labels.length, opts.actions.length);
+  if (opts.orientation === "v") {
+    grid.style.gridTemplateColumns = "1fr";
+    grid.style.gridTemplateRows = `repeat(${Math.max(1, n)}, 1fr)`;
+  } else {
+    grid.style.gridTemplateRows = "1fr";
+    grid.style.gridTemplateColumns = `repeat(${Math.max(1, n)}, 1fr)`;
+  }
+
+  const existing = Array.from(grid.querySelectorAll<HTMLButtonElement>(":scope > button.ip-controlbtn"));
+  const needRebuild = existing.length !== n || existing.some((b) => !b.querySelector(":scope > .ip-button-content"));
+  if (needRebuild) {
+    grid.replaceChildren();
+    for (let i = 0; i < n; i++) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "ip-controlbtn";
+      btn.dataset.idx = String(i + 1);
+      btn.dataset.template = String(opts.labels[i] ?? "");
+      btn.dataset.action = String(opts.actions[i] ?? "");
+      const contentEl = document.createElement("div");
+      contentEl.className = "ip-button-content";
+      // In engine space we can't do KaTeX hydration; plain text is fine (runtime may replace).
+      contentEl.textContent = String(opts.labels[i] ?? "");
+      btn.appendChild(contentEl);
+      grid.appendChild(btn);
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      const btn = existing[i]!;
+      btn.dataset.idx = String(i + 1);
+      btn.dataset.template = String(opts.labels[i] ?? "");
+      btn.dataset.action = String(opts.actions[i] ?? "");
+      const contentEl = btn.querySelector<HTMLElement>(":scope > .ip-button-content");
+      if (contentEl) contentEl.textContent = String(opts.labels[i] ?? "");
+    }
+  }
 }
 
 function parseInlineParams(s: string): Record<string, string> {
@@ -100,6 +137,9 @@ function parseList(v: string | undefined): string[] {
 function setCommonStyles(el: HTMLElement, node: NodeModel) {
   el.style.position = "absolute";
   el.style.pointerEvents = "auto";
+  // Ensure DOM stacking matches model zIndex (critical for hit-testing transparent nodes like arrows/lines).
+  // Without this, a large composite root can sit "on top" and make child arrows impossible to click.
+  el.style.zIndex = String((node as any).zIndex ?? 0);
   el.style.opacity = String(node.opacity ?? 1);
   el.style.display = node.visible === false ? "none" : "block";
   const normalizeAnchor = (a: string | undefined) => {
@@ -330,6 +370,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       setCommonStyles(el, n);
       // Override setCommonStyles display=block so we can use flex for vertical alignment.
       el.style.display = n.visible === false ? "none" : "flex";
+      const col = String((n as any).color ?? "").trim();
+      el.style.color = col || "rgba(255,255,255,0.92)";
+      el.dataset.color = col || "";
       const align = (n as any).align;
       el.style.textAlign = align === "right" ? "right" : align === "center" ? "center" : "left";
 
@@ -407,6 +450,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     const update = (n: NodeModel) => {
       setCommonStyles(el, n);
       if (n.type !== "bullets") return;
+      const col = String((n as any).color ?? "").trim();
+      el.style.color = col || "rgba(255,255,255,0.92)";
+      el.dataset.color = col || "";
       const style = (n as any).bullets ?? "A";
       renderItems((n as any).items ?? [], style);
     };
@@ -1307,7 +1353,6 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     // Always visible: presenter can animate it in/out if desired.
     wheelGroup.style.display = "block";
 
-    const debug = !!(node as any).debug;
     // Buttons group: movable as a unit (like other comp-sub elements), but the buttons themselves
     // are only clickable in Live mode (CSS disables button pointer-events in Edit mode).
     const buttonsGroup = document.createElement("div");
@@ -1338,33 +1383,20 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       btnActions = parseList(params.actions);
       break;
     }
+    // IMPORTANT: no defaults. Choices controls must be authored via `buttons[...]`
+    // in groups/<id>/elements.pr (same system as timer/sound).
     if (btnLabels.length === 0 || btnActions.length === 0) {
-      btnLabels = ["Run", "Reset", ...(debug ? ["Test"] : [])];
-      btnActions = ["choices-startstop", "choices-reset", ...(debug ? ["choices-test"] : [])];
-    } else if (debug && !btnActions.includes("choices-test")) {
-      // Debug mode adds a test button if not authored.
-      btnLabels = [...btnLabels, "Test"];
-      btnActions = [...btnActions, "choices-test"];
+      // Keep an empty container; runtime/authoring decides what buttons exist.
+      btnLabels = [];
+      btnActions = [];
     }
-    const buttons: ControlButtonSpec[] = [];
-    const nBtn = Math.min(btnLabels.length, btnActions.length);
-    for (let i = 0; i < nBtn; i++) {
-      const action = String(btnActions[i] ?? "").trim();
-      if (!action) continue;
-      buttons.push({ label: String(btnLabels[i] ?? ""), action, primary: i === 0 });
-    }
-
-    const { bar: controlsBar } = createControlBar({
-      className: "choices-headerbar",
-      buttonClass: "choices-btn",
-      buttons,
-    });
     // Fill the buttonsGroup box; sizing is controlled by the composite geom.
-    controlsBar.style.position = "absolute";
-    controlsBar.style.inset = "0";
-    // Match authored orientation.
-    controlsBar.style.flexDirection = btnOrient === "v" ? "column" : "row";
-    buttonsGroup.appendChild(controlsBar);
+    // IMPORTANT: do NOT use ad-hoc control bars here. Use the same `buttons[...]` element structure
+    // as the timer composite buttons (ip-buttons-grid + ip-controlbtn).
+    const nBtn = Math.min(btnLabels.length, btnActions.length);
+    const labels = btnLabels.slice(0, nBtn).map((x) => String(x ?? ""));
+    const actions = btnActions.slice(0, nBtn).map((x) => String(x ?? ""));
+    ensureButtonsGrid(buttonsGroup, { orientation: btnOrient, labels, actions });
     frame.appendChild(buttonsGroup);
 
     const title = document.createElement("div");
@@ -1581,22 +1613,6 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     overlayBg.style.pointerEvents = "none";
     overlay.append(overlayBg);
 
-    const debug = !!(node as any).debug;
-    const { bar: header } = createControlBar({
-      className: "timer-header",
-      buttonClass: "timer-btn",
-      buttons: [
-        { label: "Run", action: "timer-startstop", primary: true },
-        { label: "Reset", action: "timer-reset" },
-        ...(debug ? [{ label: "Test", action: "timer-test" } as any] : [])
-      ]
-    });
-    // Buttons should live outside the timer "data rect" overlay. Place them above.
-    // Scale header offsets with the timer's pixel size (set via --timer-scale / --ui-scale).
-    header.style.top = "calc(-44px * var(--ui-scale, var(--timer-scale, 1)))";
-    header.style.padding = "0 calc(10px * var(--ui-scale, var(--timer-scale, 1)))";
-    (header.style as any).gap = "calc(10px * var(--ui-scale, var(--timer-scale, 1)))";
-
     const canvas = document.createElement("canvas");
     canvas.className = "timer-canvas";
     canvas.style.position = "absolute";
@@ -1605,7 +1621,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     canvas.style.height = "100%";
     canvas.style.borderRadius = "0";
 
-    frame.append(overlay, canvas, header);
+    // IMPORTANT: never create ad-hoc buttons in the engine. Timer controls must be authored
+    // via the `buttons[...]` element (rendered by the runtime timer composite layer).
+    frame.append(overlay, canvas);
     el.append(frame);
 
     setCommonStyles(el, node);
@@ -1660,19 +1678,6 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     overlayBg.style.pointerEvents = "none";
     overlay.append(overlayBg);
 
-    const { bar: header } = createControlBar({
-      className: "sound-header",
-      buttonClass: "sound-btn",
-      buttons: [
-        { label: "Run", action: "sound-toggle", primary: true },
-        { label: "Reset", action: "sound-reset" },
-        { label: "As Time Series", action: "sound-mode-toggle" },
-      ],
-    });
-    header.style.top = "calc(-44px * var(--ui-scale, var(--sound-scale, 1)))";
-    header.style.padding = "0 calc(10px * var(--ui-scale, var(--sound-scale, 1)))";
-    (header.style as any).gap = "calc(10px * var(--ui-scale, var(--sound-scale, 1)))";
-
     const canvas = document.createElement("canvas");
     canvas.className = "sound-canvas";
     canvas.style.position = "absolute";
@@ -1681,7 +1686,9 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
     canvas.style.height = "100%";
     canvas.style.borderRadius = "0";
 
-    frame.append(overlay, canvas, header);
+    // IMPORTANT: never create ad-hoc buttons in the engine. Sound controls must be authored
+    // via the `buttons[...]` element (rendered by the runtime sound composite layer).
+    frame.append(overlay, canvas);
     el.append(frame);
     setCommonStyles(el, node);
 

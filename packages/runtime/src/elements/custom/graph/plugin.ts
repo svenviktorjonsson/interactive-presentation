@@ -1,5 +1,5 @@
 import type { ElementPlugin, FrameContext } from "../../../runtime/types";
-import { ensureGraphCompositeLayer, layoutGraphCompositeTexts, renderGraphCompositeArrows, renderGraphCompositeTexts } from "./ui";
+import { ensureGraphCompositeLayer, layoutGraphCompositeTexts, renderGraphCompositeTexts } from "./ui";
 import { renderGraphCanvas } from "./render";
 
 export function createGraphPlugin(): ElementPlugin {
@@ -16,7 +16,6 @@ export function createGraphPlugin(): ElementPlugin {
         // Ensure composite overlay exists and is rendered every frame (like timer).
         const layer = ensureGraphCompositeLayer(ctx.engine, id);
         if (layer) {
-          renderGraphCompositeArrows(el, layer);
           layoutGraphCompositeTexts(el, layer);
           renderGraphCompositeTexts(el, layer, { xLabel: String(n.xLabel ?? "x"), yLabel: String(n.yLabel ?? "y"), name: id });
         }

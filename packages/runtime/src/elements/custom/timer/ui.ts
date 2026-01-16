@@ -355,6 +355,16 @@ export function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     }
   }
 
+  // Default axis arrows (selectable/editable via plot-arrow hitboxes).
+  // Origin is (0,0) in plot coords (bottom-left).
+  const ensureAxis = (id: "x_axis" | "y_axis", def: { x0: number; y0: number; x1: number; y1: number }) => {
+    const existing = arrowSpecs.find((a: any) => String(a?.id ?? "") === id);
+    if (existing) return;
+    arrowSpecs.push({ id, ...def, color: "white", width: 0.006 });
+  };
+  ensureAxis("x_axis", { x0: 0, y0: 0, x1: 1, y1: 0 });
+  ensureAxis("y_axis", { x0: 0, y0: 0, x1: 0, y1: 1 });
+
   // Remove stale sub-elements (if elements.pr removed them).
   for (const e of Array.from(layer.querySelectorAll<HTMLElement>(".timer-sub-text.comp-sub"))) {
     const sid = String(e.dataset.subId ?? "");
@@ -557,102 +567,8 @@ export function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLEle
   }
 }
 
-export function renderTimerCompositeArrows(timerEl: HTMLElement, layer: HTMLElement) {
-  const svg = layer.querySelector<SVGSVGElement>(":scope > .timer-sub-svg");
-  if (!svg) return;
-  const specs: any[] = (layer as any).__arrowSpecs ?? [];
-  if (!Array.isArray(specs) || specs.length === 0) {
-    svg.replaceChildren();
-    return;
-  }
-
-  const cachedW = Number(timerEl.dataset.timerWpx ?? "0");
-  const cachedH = Number(timerEl.dataset.timerHpx ?? "0");
-  if (!(cachedW > 1 && cachedH > 1)) return;
-  const w = cachedW;
-  const h = cachedH;
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-
-  const defs = document.createElementNS("http://www.w3.org/2000/svg", "defs");
-  const g = document.createElementNS("http://www.w3.org/2000/svg", "g");
-  const timerId = layer.dataset.timerId ?? "timer";
-  const selectedArrowId = String((layer as any).dataset?.selectedPlotArrowId ?? "");
-
-  const fr = PLOT_FRACS;
-  const ox = fr.leftF * w;
-  const oy = fr.bottomF * h;
-  const xLen = (fr.rightF - fr.leftF) * w;
-  const yLen = (fr.bottomF - fr.topF) * h;
-  const mapX = (u: number) => ox + u * xLen;
-  const mapY = (vUp: number) => oy - vUp * yLen;
-  const dataMin = Math.max(1, Math.min(xLen, yLen));
-
-  for (const a of specs) {
-    const relW = typeof a.width === "number" && isFinite(a.width) ? a.width : 0.006;
-    const lwPx = Math.max(0.5, Math.min(16, relW * dataMin));
-    const headWPx = 3 * lwPx;
-    const headLPx = 5 * lwPx;
-
-    const x1 = mapX(Number(a.x0 ?? 0));
-    const y1 = mapY(Number(a.y0 ?? 0));
-    const x2 = mapX(Number(a.x1 ?? 1));
-    const y2 = mapY(Number(a.y1 ?? 1));
-
-    const plotGroup = (layer as any).__plotGroup as HTMLElement | null;
-    const hit = (plotGroup ?? layer).querySelector<HTMLElement>(`:scope > .timer-sub-arrow-hit[data-arrow-id="${String(a.id ?? "")}"]`);
-    if (hit) {
-      const padPx = 24;
-      const minX = Math.min(x1, x2) - padPx;
-      const maxX = Math.max(x1, x2) + padPx;
-      const minY = Math.min(y1, y2) - padPx;
-      const maxY = Math.max(y1, y2) + padPx;
-      hit.style.left = `${((minX - ox) / Math.max(1e-9, xLen)) * 100}%`;
-      hit.style.top = `${((minY - (oy - yLen)) / Math.max(1e-9, yLen)) * 100}%`;
-      hit.style.width = `${((maxX - minX) / Math.max(1e-9, xLen)) * 100}%`;
-      hit.style.height = `${((maxY - minY) / Math.max(1e-9, yLen)) * 100}%`;
-    }
-
-    const markerId = `arrowhead-${timerId}-${a.id}`;
-    const marker = document.createElementNS("http://www.w3.org/2000/svg", "marker");
-    marker.setAttribute("id", markerId);
-    marker.setAttribute("markerUnits", "userSpaceOnUse");
-    marker.setAttribute("markerWidth", String(headLPx));
-    marker.setAttribute("markerHeight", String(headWPx));
-    marker.setAttribute("refX", "0");
-    marker.setAttribute("refY", String(headWPx / 2));
-    marker.setAttribute("orient", "auto");
-    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
-    path.setAttribute("d", `M0,0 L${headLPx},${headWPx / 2} L0,${headWPx} Z`);
-    path.setAttribute("fill", a.color ?? "white");
-    marker.append(path);
-    defs.append(marker);
-
-    const isSelected = selectedArrowId && String(a.id ?? "") === selectedArrowId;
-    if (isSelected) {
-      const glow = document.createElementNS("http://www.w3.org/2000/svg", "line");
-      glow.setAttribute("x1", String(x1));
-      glow.setAttribute("y1", String(y1));
-      glow.setAttribute("x2", String(x2));
-      glow.setAttribute("y2", String(y2));
-      glow.setAttribute("stroke", "rgba(110,168,255,0.95)");
-      glow.setAttribute("stroke-width", String(Math.min(48, lwPx + 10)));
-      glow.setAttribute("stroke-linecap", "round");
-      g.append(glow);
-    }
-
-    const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
-    line.setAttribute("x1", String(x1));
-    line.setAttribute("y1", String(y1));
-    line.setAttribute("x2", String(x2));
-    line.setAttribute("y2", String(y2));
-    line.setAttribute("stroke", a.color ?? "white");
-    line.setAttribute("stroke-width", String(lwPx));
-    line.setAttribute("stroke-linecap", "round");
-    line.setAttribute("marker-end", `url(#${markerId})`);
-    g.append(line);
-  }
-
-  svg.replaceChildren(defs, g);
+export function renderTimerCompositeArrows(_timerEl: HTMLElement, _layer: HTMLElement) {
+  // Deprecated: axis arrows must be real `arrow` nodes (engine-drawn), not SVG overlays.
 }
 
 export function syncTimerPlotRegion(timerEl: HTMLElement, layer: HTMLElement) {
