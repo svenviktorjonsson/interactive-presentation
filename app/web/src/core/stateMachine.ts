@@ -1,21 +1,41 @@
 import type { Store } from "./store";
-import { activeView, fitCameraToScreen, resolveViewCamera } from "./store";
-import { screenToWorld, worldToScreen } from "./geom";
+import { activeView, fitCameraToScreen, persistActiveViewId, resolveViewCamera } from "./store";
+import { applyNodeAlign, editorStartAlignForNode, normalizeAlign, updateEditorAlignUi } from "../editor/textEditRuntime";
+import type { ActiveTextEditor, TextAlign } from "../editor/textEditRuntime";
+import { createGroupEditRuntime } from "../editor/groupEditRuntime";
+import { createTransformRuntime } from "../editor/transformRuntime";
+import { createSelectionRuntime } from "../editor/selectionRuntime";
+import { createEditorSessionRuntime } from "../editor/editorSessionRuntime";
+import type { Snapshot } from "../editor/editorSessionRuntime";
+import {
+  cameraForScreenPan,
+  screenToWorld,
+  worldRectToViewRect,
+  worldToScreen,
+  worldToScreenScale,
+  worldToView,
+} from "./geom";
 import type { Anchor, Transform } from "./model";
 import type { Model } from "./model";
 import {
   persistArrow,
+  persistButtons,
   persistBullets,
   persistDelete,
   persistGeometry,
+  persistElement,
+  persistGroup,
   persistImage,
   persistJoin,
+  persistTable,
   persistText,
+  publishTableUpdate,
   uploadImageFile,
+  uploadMediaFile,
 } from "./transport";
 import { isNodeInteractiveInMode } from "./mode";
 import { createHandlesView, anchorFrac, type HandleId } from "../editor/handles";
-import { cursorForResize, cursorForRotate } from "../editor/cursors";
+import { cursorForRotate } from "../editor/cursors";
 
 type PointerOwner =
   | null
@@ -24,12 +44,21 @@ type PointerOwner =
       pointerId: number;
       nodeId: string;
       targetIds: string[];
-      starts: Array<{ id: string; x: number; y: number }>;
+      starts: Array<{
+        id: string;
+        x: number;
+        y: number;
+        start?: { x: number; y: number };
+        end?: { x: number; y: number };
+      }>;
+      groupChildStarts?: Array<{ id: string; x: number; y: number; w: number; h: number; rotationDeg: number; fontPx: number }>;
+      groupStart?: { x: number; y: number; w: number; h: number; rotationDeg: number };
       startClientX: number;
       startClientY: number;
       startX: number;
       startY: number;
       dirty: boolean;
+      zBumped?: boolean;
       startSnapshot: Snapshot | null;
     }
   | {
@@ -39,6 +68,9 @@ type PointerOwner =
       startClientY: number;
       startCx: number;
       startCy: number;
+      startWorldX: number;
+      startWorldY: number;
+      startZoom: number;
     }
   | {
       kind: "rselect";
@@ -47,13 +79,16 @@ type PointerOwner =
       startClientY: number;
       dirty: boolean;
       startSnapshot: Snapshot;
+      action?: "group" | "ungroup";
     }
   | {
       kind: "rotate";
       pointerId: number;
       nodeId: string;
       targetIds: string[];
-      starts: Array<{ id: string; rotationDeg: number }>;
+      starts: Array<{ id: string; rotationDeg: number; x?: number; y?: number }>;
+      groupChildStarts?: Array<{ id: string; x: number; y: number; w: number; h: number; rotationDeg: number; fontPx: number }>;
+      groupStart?: { x: number; y: number; w: number; h: number; rotationDeg: number };
       corner: "nw" | "ne";
       startAngleRad: number;
       startRotationDeg: number;
@@ -66,6 +101,9 @@ type PointerOwner =
       nodeId: string;
       targetIds: string[];
       starts: Array<{ id: string; w: number; h: number; fontPx: number }>;
+      groupChildStarts?: Array<{ id: string; x: number; y: number; w: number; h: number; rotationDeg: number; fontPx: number }>;
+      groupStart?: { x: number; y: number; w: number; h: number; rotationDeg: number };
+      groupVisualStart?: { midX: number; midY: number; width: number; height: number };
       handle: Exclude<HandleId, "rot">;
       startW: number;
       startH: number;
@@ -82,6 +120,7 @@ type PointerOwner =
       startStart: { x: number; y: number };
       startEnd: { x: number; y: number };
       dirty: boolean;
+      zBumped?: boolean;
       startSnapshot: Snapshot | null;
     }
   | {
@@ -90,6 +129,7 @@ type PointerOwner =
       nodeId: string;
       endId: "start" | "end";
       dirty: boolean;
+      zBumped?: boolean;
       startSnapshot: Snapshot | null;
     }
   | {
@@ -99,14 +139,12 @@ type PointerOwner =
       startClientX: number;
       startClientY: number;
       dirty: boolean;
+      zBumped?: boolean;
       startSnapshot: Snapshot | null;
     };
 
-type Snapshot = { model: Model; activeViewId: string; selectedId: string | null; selectedIds: string[] };
-type TextAlign = "left" | "center" | "right";
-
 const DRAG_START_PX = 3;
-const GRID_BASE_WORLD = 1;
+const GRID_BASE_WORLD = 0.1;
 const GRID_MAJOR_TARGET_PX = 225;
 const ROT_SNAP_DEG = 15;
 
@@ -115,8 +153,8 @@ const snapTo = (v: number, step: number) => {
   return Math.round(v / step) * step;
 };
 
-const gridMajorStepWorld = (zoom: number) => {
-  const z = Math.max(1e-6, zoom);
+const gridMajorStepWorld = (zoom: number, screenW: number) => {
+  const z = Math.max(1e-6, zoom * Math.max(1e-9, screenW));
   const raw = GRID_MAJOR_TARGET_PX / (GRID_BASE_WORLD * z);
   const k = Math.round(Math.log10(Math.max(1e-9, raw)));
   const kClamped = Math.max(-10, Math.min(10, k));
@@ -134,24 +172,88 @@ const parseBulletIndent = (line: string) => {
   return { indent: tabs + Math.floor(spaces / 2), leadChars: tabs + spaces };
 };
 
+const isElementLine = (line: string) => {
+  const trimmed = line.trimStart();
+  return /^(view|text|image|bullets|arrow|join|sound|multichoice|wheel|timer|webcam|player|video|iframe|table|experiment|group|buttons|button|slider|axis|camera)\[/.test(
+    trimmed
+  );
+};
+
 const bulletSpecForLine = (line: string) => {
-  const trimmed = line.trim();
+  const trimmed = line.trimStart();
   if (!trimmed) return null;
-  if (/^[-.>]\s+/.test(trimmed)) return trimmed[0]!;
-  const m = trimmed.match(/^(\d+|[A-Za-z])([.)])\s+/);
-  if (!m) return null;
-  const token = m[1]!;
-  const sep = m[2]!;
+  const unordered = trimmed.match(/^([-.>*•›–])(?:\s+|$)/);
+  if (unordered) {
+    const unorderedMap: Record<string, string> = {
+      "-": "-",
+      ".": ".",
+      ">": ">",
+      "*": "-",
+      "•": ".",
+      "›": ">",
+      "–": "-",
+    };
+    return unorderedMap[unordered[1] ?? ""] ?? null;
+  }
+  const ordered = trimmed.match(/^(\d+|[Aa]|[ivxlcdm]+)([.)])?(?:\s+|$)/);
+  if (!ordered) return null;
+  const token = ordered[1] ?? "";
+  const sep = ordered[2] ?? "";
   if (/^\d+$/.test(token)) return `1${sep}`;
-  if (token >= "A" && token <= "Z") return `A${sep}`;
-  return `a${sep}`;
+  const roman = /^[ivxlcdm]+$/.test(token);
+  if (roman) return `${token === token.toUpperCase() ? "I" : "i"}${sep}`;
+  const isUpper = token[0] === token[0]?.toUpperCase();
+  return `${isUpper ? "A" : "a"}${sep}`;
+};
+
+const bulletMarkerForLine = (line: string) => {
+  const trimmed = line.trimStart();
+  if (!trimmed) return null;
+  const unordered = trimmed.match(/^([-.>*•›–])(?:\s+|$)/);
+  if (unordered) {
+    const unorderedMap: Record<string, string> = {
+      "-": "-",
+      ".": ".",
+      ">": ">",
+      "*": "-",
+      "•": ".",
+      "›": ">",
+      "–": "-",
+    };
+    const spec = unorderedMap[unordered[1] ?? ""];
+    return spec ? { kind: "unordered" as const, spec } : null;
+  }
+  const ordered = trimmed.match(/^(\d+|[Aa]|[ivxlcdm]+)([.)])?(?:\s+|$)/);
+  if (!ordered) return null;
+  const tokenRaw = ordered[1] ?? "";
+  const sep = ordered[2] ?? "";
+  if (/^\d+$/.test(tokenRaw)) return { kind: "ordered" as const, token: "1", sep };
+  const roman = /^[ivxlcdm]+$/.test(tokenRaw);
+  if (roman) return { kind: "ordered" as const, token: tokenRaw === tokenRaw.toUpperCase() ? "I" : "i", sep };
+  return { kind: "ordered" as const, token: tokenRaw === tokenRaw.toUpperCase() ? "A" : "a", sep };
 };
 
 const stripBulletMarker = (line: string) => {
   const trimmed = line.trimStart();
-  if (/^[-.>]\s+/.test(trimmed)) return trimmed.replace(/^[-.>]\s+/, "");
-  const m = trimmed.match(/^(\d+|[A-Za-z])[.)]\s+/);
-  if (m) return trimmed.replace(/^(\d+|[A-Za-z])[.)]\s+/, "");
+  if (!trimmed) return line;
+  let rest = trimmed;
+  for (let i = 0; i < 4; i += 1) {
+    const before = rest;
+    // Unordered bullets.
+    rest = rest.replace(/^(?:[-.>*•›–]\s*)+/, "");
+    if (rest !== before) {
+      rest = rest.replace(/^\s+/, "");
+      continue;
+    }
+    // Ordered bullets (e.g. 1., A), i:, etc).
+    const m = rest.match(/^(\d+|[Aa]|[ivxlcdm]+)([.)])(\s*|$)/);
+    if (m) {
+      rest = rest.slice(m[0].length).replace(/^\s+/, "");
+      continue;
+    }
+    break;
+  }
+  if (rest !== trimmed) return rest;
   return line;
 };
 
@@ -198,7 +300,7 @@ const toRoman = (n: number, upper: boolean) => {
 };
 
 const formatOrderedLabel = (token: string, value: number, sep: string) => {
-  const suffix = sep === "-" ? "–" : sep === ")" ? ")" : ".";
+  const suffix = sep === "-" ? "–" : sep === ")" ? ")" : sep === ":" ? ":" : sep === "" ? "" : ".";
   if (token === "1") return `${value}${suffix}`;
   if (token === "a") return `${toAlpha(value, false)}${suffix}`;
   if (token === "A") return `${toAlpha(value, true)}${suffix}`;
@@ -211,13 +313,30 @@ const buildBulletMarker = (specRaw: string, counters: number[], indent: number) 
   const spec = specRaw.trim();
   if (!spec) return "";
   const unordered = spec.length === 1 && ["-", ".", ">"].includes(spec);
-  if (unordered) {
-    const glyph = spec === "-" ? "–" : spec === ">" ? "›" : "•";
-    return `${glyph}`;
-  }
-  const sep = [".", ")", "-"].includes(spec[spec.length - 1] ?? "") ? spec[spec.length - 1] : ".";
-  const tokenRaw = sep && spec.endsWith(sep) ? spec.slice(0, -1) : spec;
+  if (unordered) return spec;
+  const sep = [".", ")", "-", ":"].includes(spec[spec.length - 1] ?? "") ? spec[spec.length - 1] : "";
+  const tokenRaw = sep ? spec.slice(0, -1) : spec;
   const tokens = tokenRaw.split(".").map((t) => t.trim()).filter(Boolean);
+  const rootToken = tokens[0] ?? "1";
+  const defaultToken = (level: number) => {
+    if (level <= 0) return rootToken;
+    const isUpper = rootToken === rootToken.toUpperCase();
+    const lower = rootToken.toLowerCase();
+    if (lower === "1") {
+      if (level === 1) return "a";
+      if (level >= 2) return "i";
+    }
+    if (lower === "a") {
+      return isUpper ? "I" : "i";
+    }
+    if (lower === "i") {
+      return isUpper ? "I" : "i";
+    }
+    return rootToken;
+  };
+  while (tokens.length <= indent) {
+    tokens.push(defaultToken(tokens.length));
+  }
   const token = tokens[Math.min(indent, tokens.length - 1)] ?? "1";
   const count = counters[indent] ?? 1;
   return formatOrderedLabel(token, count, sep);
@@ -228,6 +347,7 @@ const parseBulletEditorValue = (value: string) => {
   const items: Array<{ text: string; indent: number }> = [];
   let spec: string | null = null;
   for (const line of lines) {
+    if (isElementLine(line)) break;
     if (line === "") {
       items.push({ text: "", indent: 0 });
       continue;
@@ -249,16 +369,40 @@ const mergeBulletSpec = (existingRaw: string | undefined, parsed: string | null)
   if (!parsed) return existingRaw || null;
   if (parsed.length === 1 && ["-", ".", ">"].includes(parsed)) return parsed;
   const existing = (existingRaw || "").trim();
-  const sep = [".", ")", "-"].includes(parsed[parsed.length - 1] ?? "") ? parsed[parsed.length - 1] : ".";
-  const token = parsed.replace(/[.)-]$/, "");
+  const sep = [".", ")", "-", ":"].includes(parsed[parsed.length - 1] ?? "") ? parsed[parsed.length - 1] : "";
+  const token = sep ? parsed.slice(0, -1) : parsed;
   if (!existing) return `${token}${sep}`;
   if (existing.length === 1 && ["-", ".", ">"].includes(existing)) return `${token}${sep}`;
-  const existingSep = [".", ")", "-"].includes(existing[existing.length - 1] ?? "") ? existing[existing.length - 1] : ".";
-  const tokenRaw = existingSep && existing.endsWith(existingSep) ? existing.slice(0, -1) : existing;
+  const existingSep = [".", ")", "-", ":"].includes(existing[existing.length - 1] ?? "") ? existing[existing.length - 1] : "";
+  const tokenRaw = existingSep ? existing.slice(0, -1) : existing;
   const tokens = tokenRaw.split(".").map((t) => t.trim()).filter(Boolean);
   if (!tokens.length) return `${token}${sep}`;
   tokens[0] = token;
   return `${tokens.join(".")}${sep}`;
+};
+
+const updateBulletSpecFromLines = (value: string, existingRaw: string | undefined) => {
+  const lines = value.split("\n");
+  let spec = existingRaw || "";
+  for (const line of lines) {
+    if (isElementLine(line)) break;
+    if (!line.trim()) continue;
+    const { indent } = parseBulletIndent(line);
+    const content = line.replace(/^[\t ]+/, "");
+    const marker = bulletMarkerForLine(content);
+    if (!marker) continue;
+    if (marker.kind === "unordered") return marker.spec;
+    const sep = [".", ")", "-", ":"].includes(marker.sep) ? marker.sep : "";
+    const existingSep =
+      spec && [".", ")", "-", ":"].includes(spec[spec.length - 1] ?? "") ? spec[spec.length - 1] : "";
+    const sepOut = sep || existingSep || ".";
+    const tokenRaw = spec && existingSep ? spec.slice(0, -1) : spec;
+    const tokens = tokenRaw ? tokenRaw.split(".").map((t) => t.trim()).filter(Boolean) : [];
+    while (tokens.length <= indent) tokens.push(marker.token);
+    tokens[indent] = marker.token;
+    spec = `${tokens.join(".")}${sepOut}`;
+  }
+  return spec || null;
 };
 
 const renderBulletEditorValue = (items: Array<{ text: string; indent: number }>, spec: string) => {
@@ -315,23 +459,58 @@ const mapRawToCaret = (value: string, target: { line: number; col: number }) => 
   return Math.max(0, acc - 1);
 };
 
-const normalizeTransformForPersist = (store: Store, transform: Transform, viewId: string, space: string | undefined) => {
-  if (space !== "world") return transform;
-  const cam = resolveViewCamera(store, viewId);
-  const designW = (store.model as any).defaults?.designWidth ?? 1920;
-  const designH = (store.model as any).defaults?.designHeight ?? 1080;
-  const viewW = designW / Math.max(1e-9, cam.zoom || 1);
-  const viewH = designH / Math.max(1e-9, cam.zoom || 1);
-  const left = cam.cx - viewW / 2;
-  const bottom = cam.cy - viewH / 2;
-  const aspect = designH / designW;
+const groupAnchorLocal = (group: Transform) => {
+  const { ax, ay } = anchorFrac(group.anchor);
+  return { ax, ay };
+};
+
+const worldPointToGroupLocal = (group: Transform, p: { x: number; y: number }) => {
+  const { ax, ay } = groupAnchorLocal(group);
+  const rot = (group.rotationDeg * Math.PI) / 180;
+  const cos = Math.cos(rot);
+  const sin = Math.sin(rot);
+  const dx = p.x - group.x;
+  const dy = p.y - group.y;
+  const lx = dx * cos + dy * sin;
+  const ly = -dx * sin + dy * cos;
+  const scaleX = Math.max(1e-9, group.w);
+  const scaleY = Math.max(1e-9, group.h);
   return {
-    ...transform,
-    x: (transform.x - left) / viewW,
-    y: ((transform.y - bottom) / viewH) * aspect,
-    w: transform.w / viewW,
-    h: (transform.h / viewH) * aspect,
+    x: ax + lx / scaleX,
+    y: ay + ly / scaleY,
   };
+};
+
+const normalizeTransformForPersist = (
+  store: Store,
+  transform: Transform,
+  viewId: string,
+  space: string | undefined,
+  groupId?: string | null
+) => {
+  if (groupId) {
+    const group = store.model.nodes.find((n: any) => String(n.id) === String(groupId)) as any;
+    if (group?.transform) {
+      const localAnchor = worldPointToGroupLocal(group.transform, { x: transform.x, y: transform.y });
+      const scaleX = Math.max(1e-9, group.transform.w);
+      const scaleY = Math.max(1e-9, group.transform.h);
+      return {
+        ...transform,
+        x: localAnchor.x,
+        y: localAnchor.y,
+        w: transform.w / scaleX,
+        h: transform.h / scaleY,
+        rotationDeg: transform.rotationDeg - group.transform.rotationDeg,
+      };
+    }
+  }
+  if (space === "screen") return transform;
+  const cam = resolveViewCamera(store, viewId);
+  const rect = worldRectToViewRect(
+    { x: transform.x, y: transform.y, w: transform.w, h: transform.h },
+    cam
+  );
+  return { ...transform, ...rect };
 };
 
 // Cursor angles are authored/understood in Viktor's coordinate system:
@@ -366,16 +545,84 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   let overlayEverEntered = false;
   let overlayIsOver = false;
   let lastClient: { x: number; y: number } | null = null;
-  const isInteractive = (node: any) => isNodeInteractiveInMode(store.mode, node as any);
-  const docForNode = (node: any): "presentation" | "notes" => ((node as any).layer === "live" ? "notes" : "presentation");
-  const groupIdsByDoc = (ids: string[]) => {
-    const by: Record<"presentation" | "notes", string[]> = { presentation: [], notes: [] };
-    for (const id of ids) {
-      const n: any = store.model.nodes.find((x) => String(x?.id ?? "") === String(id));
-      if (!n) continue;
-      by[docForNode(n)].push(String(id));
+  let lastMarqueeSelectAt = 0;
+  const isNodeInActiveGroup = (node: any) => {
+    const activeGid = String(store.activeGroupId ?? "");
+    const parentGid = String(node?.groupId ?? "");
+    if (!activeGid) return !parentGid;
+    let cursor = parentGid;
+    while (cursor) {
+      if (cursor === activeGid) return true;
+      const next = store.model.nodes.find((n: any) => String(n?.id ?? "") === cursor) as any;
+      cursor = String(next?.groupId ?? "");
     }
-    return by;
+    return false;
+  };
+  const isInteractive = (node: any) => {
+    const isEditableTable = node && node.type === "table" && node.editable !== false;
+    const byMode = isNodeInteractiveInMode(store.mode, node as any) || isEditableTable;
+    const byGroup = isEditableTable ? true : isNodeInActiveGroup(node);
+    return byMode && byGroup;
+  };
+  const docForNode = (node: any): "presentation" | "notes" => ((node as any).layer === "live" ? "notes" : "presentation");
+  const persistViewIdForNode = (node: any, fallbackViewId: string) => {
+    if (node?.groupId) return "group";
+    if (node?.space === "screen") return "screen_main";
+    if (node?.viewId) return String(node.viewId);
+    if (Array.isArray(node?.viewIds) && node.viewIds.length) return String(node.viewIds[0]);
+    return String(fallbackViewId || "home");
+  };
+  const bgPayload = (node: any) => ({
+    bgColor: node?.bgColor,
+    bgAlpha: node?.bgAlpha,
+    bgPadding: node?.bgPadding,
+    bgRadius: node?.bgRadius,
+  });
+  const ensureTableCells = (node: any) => {
+    const rows = Math.max(1, Number(node.rows ?? node.cells?.length ?? 1));
+    const cols = Math.max(1, Number(node.cols ?? node.cells?.[0]?.length ?? 1));
+    const cells: string[][] = Array.isArray(node.cells) ? node.cells.map((r: any) => Array.isArray(r) ? r.map((c: any) => String(c)) : []) : [];
+    while (cells.length < rows) cells.push([]);
+    for (let r = 0; r < rows; r += 1) {
+      const row = cells[r] ?? [];
+      while (row.length < cols) row.push("");
+      cells[r] = row;
+    }
+    node.cells = cells;
+    node.rows = rows;
+    node.cols = cols;
+  };
+  const applyTableCellUpdate = (node: any, row: number, col: number, value: string) => {
+    if (!node || node.type !== "table") return;
+    const hHeader: string[] = Array.isArray(node.hHeader) ? node.hHeader : [];
+    const vHeader: string[] = Array.isArray(node.vHeader) ? node.vHeader : [];
+    const headerRow = hHeader.length > 0;
+    const headerCol = vHeader.length > 0;
+    if (row <= 0 || col <= 0) return;
+    const r = row - 1;
+    const c = col - 1;
+    if (headerRow && r == 0) {
+      if (headerCol && c == 0) return;
+      const idx = c - (headerCol ? 1 : 0);
+      while (hHeader.length <= idx) hHeader.push("");
+      hHeader[idx] = value;
+      node.hHeader = hHeader;
+      return;
+    }
+    if (headerCol && c == 0) {
+      const idx = r - (headerRow ? 1 : 0);
+      while (vHeader.length <= idx) vHeader.push("");
+      vHeader[idx] = value;
+      node.vHeader = vHeader;
+      return;
+    }
+    ensureTableCells(node);
+    const rr = r - (headerRow ? 1 : 0);
+    const cc = c - (headerCol ? 1 : 0);
+    if (rr < 0 || cc < 0) return;
+    while ((node.cells as string[][]).length <= rr) (node.cells as string[][]).push([]);
+    while ((node.cells as string[][])[rr]!.length <= cc) (node.cells as string[][])[rr]!.push("");
+    (node.cells as string[][])[rr]![cc] = value;
   };
 
   const activeViewRef = () => {
@@ -390,13 +637,34 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
 
   const cameraForEdit = () => store.cameraOverride ?? fitCameraToScreen(resolveViewCamera(store, store.activeViewId), store);
 
+  const screenSpaceToPx = (p: { x: number; y: number }, screen: { w: number; h: number }) => ({
+    // Screen-space: normalized [0,1] with +y down.
+    x: p.x * screen.w,
+    y: p.y * screen.h,
+  });
+  const screenSpaceSizeToPx = (w: number, h: number, screen: { w: number; h: number }) => ({
+    wPx: w * screen.w,
+    hPx: h * screen.h,
+  });
+  const screenPxToSpace = (px: number, py: number, screen: { w: number; h: number }) => ({
+    x: px / Math.max(1e-9, screen.w),
+    y: py / Math.max(1e-9, screen.h),
+  });
+
   const liveCueIndexByView = new Map<string, number>();
   let lastMode: "edit" | "screen-edit" | "live" = store.mode;
+  let preLiveViewId: string | null = null;
+  let preLiveCameraOverride: { cx: number; cy: number; zoom: number } | null = null;
+  let preLiveCameraTween: Store["cameraTween"] = null;
 
   const isNodeForView = (node: any, viewId: string, screenId?: string) => {
     const nodeScreen = node?.screenId;
+    const nodeScreens = Array.isArray(node?.screenIds) ? node.screenIds : null;
     const nodeView = node?.viewId;
+    const nodeViews = Array.isArray(node?.viewIds) ? node.viewIds : null;
+    if (nodeScreens) return nodeScreens.includes(screenId);
     if (nodeScreen != null) return nodeScreen === screenId;
+    if (nodeViews) return nodeViews.includes(viewId);
     if (nodeView != null) return nodeView === viewId;
     return true;
   };
@@ -432,6 +700,9 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   };
 
   let pendingAuto: { viewId: string; index: number; runAtMs: number } | null = null;
+  let pendingLiveAction:
+    | { viewId: string; kind: "cue-forward" | "cue-back"; index: number; runAtMs: number }
+    | null = null;
 
   const startViewTransition = (fromCam: { cx: number; cy: number; zoom: number }, toCam: { cx: number; cy: number; zoom: number }, durationMs: number) => {
     const now = performance.now();
@@ -440,6 +711,35 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       idx: 0,
       segments: [{ from: { ...fromCam }, to: { ...toCam }, durationMs, startMs: now, easing: "cos2" }],
     };
+  };
+
+  const queueLiveActionAfterReset = (kind: "cue-forward" | "cue-back", index: number, now: number) => {
+    if (!store.cameraOverride) return false;
+    const v = activeView(store);
+    const target = fitCameraToScreen(resolveViewCamera(store, v.id), store);
+    const durationMs = (v as any).durationMs ?? (store.model as any).defaults?.viewTransitionMs ?? 800;
+    startViewTransition(store.cameraOverride, target, durationMs);
+    pendingLiveAction = { viewId: v.id, kind, index, runAtMs: now + durationMs };
+    pendingAuto = null;
+    return true;
+  };
+
+  const bumpZIndex = (targetIds: string[]) => {
+    if (!targetIds.length) return;
+    const excluded = new Set(targetIds.map(String));
+    let maxZ = 0;
+    for (const n of store.model.nodes as any[]) {
+      if (!n) continue;
+      const zid = Number(n.zIndex ?? 0);
+      if (!excluded.has(String(n.id))) maxZ = Math.max(maxZ, zid);
+    }
+    let nextZ = maxZ + 1;
+    for (const id of targetIds) {
+      const n = store.model.nodes.find((x) => String(x.id) === String(id)) as any;
+      if (!n) continue;
+      n.zIndex = nextZ;
+      nextZ += 1;
+    }
   };
 
   const initLiveView = (viewId: string, animate = false, resetCues = false) => {
@@ -456,12 +756,14 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       store.transitionToViewId = null;
     }
     store.activeViewId = v.id;
+    persistActiveViewId(store);
     if (animate) {
       const target = fitCameraToScreen(resolveViewCamera(store, v.id), store);
       startViewTransition(fromCam, { ...target, zoom: fromCam.zoom }, durationMs);
     }
     else {
-      store.cameraOverride = null;
+      const target = fitCameraToScreen(resolveViewCamera(store, v.id), store);
+      store.cameraOverride = target;
       store.cameraTween = null;
     }
     const cues = viewCues(v.id);
@@ -493,8 +795,10 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const cam = cameraForScreen();
     const screenW = Math.max(1e-9, store.screen?.w ?? 1);
     const screenH = Math.max(1e-9, store.screen?.h ?? 1);
-    const wPx = node.space === "world" ? node.transform.w * cam.zoom : node.transform.w * screenW;
-    const hPx = node.space === "world" ? node.transform.h * cam.zoom : node.transform.h * screenH;
+    const isScreen = node.space === "screen";
+    const worldScale = worldToScreenScale(cam, { w: screenW, h: screenH });
+    const wPx = isScreen ? node.transform.w * screenW : node.transform.w * worldScale.x;
+    const hPx = isScreen ? node.transform.h * screenH : node.transform.h * worldScale.y;
     const whereRaw = String(node.where ?? anim.where ?? "");
     const where = whereRaw === "null" || whereRaw === "none" ? "" : whereRaw;
     const axisSize = where === "top" || where === "bottom" ? hPx : where === "left" || where === "right" ? wPx : Math.max(wPx, hPx);
@@ -554,13 +858,30 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   const resetViewToCueIndex = (cues: any[], nextIndex: number) => {
     const v = activeView(store);
     const viewId = v.id;
+    const hasCues = cues.length > 0;
     const enterIds = new Set(cues.filter((c) => c.what === "enter").map((c) => String(c.id)));
     const exitIds = new Set(cues.filter((c) => c.what === "exit").map((c) => String(c.id)));
+    const inTransition = !!store.cameraTween && !!store.transitionFromViewId && !!store.transitionToViewId;
     for (const n of store.model.nodes as any[]) {
-      if (n.space === "screen") continue;
+      if (n.space === "screen") {
+        if (!hasCues) {
+          n.visible = true;
+          (n as any).__exitStartMs = null;
+        }
+        continue;
+      }
       if (!isNodeForView(n, viewId)) {
-        n.visible = false;
+        if (!inTransition) {
+          n.visible = false;
+          (n as any).__exitStartMs = null;
+        }
+        continue;
+      }
+      if (!hasCues) {
+        n.visible = true;
         (n as any).__exitStartMs = null;
+        (n as any).__suppressAppear = true;
+        (n as any).__appearedOnce = true;
         continue;
       }
       if (enterIds.has(String(n.id))) n.visible = false;
@@ -581,15 +902,18 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       (node as any).__appearedOnce = true;
     }
   };
-  let activeTextEditor:
+  let activeTextEditor: (ActiveTextEditor & { startSnapshot: Snapshot }) | null = null;
+  let activeButtonsEditor:
     | {
         nodeId: string;
         el: HTMLTextAreaElement;
-        errEl: HTMLDivElement;
-        alignEl: HTMLDivElement;
-        alignDots: Record<TextAlign, HTMLButtonElement>;
         prevText: string;
-        everEntered: boolean;
+        startSnapshot: Snapshot;
+      }
+    | null = null;
+  let activeTableEditor:
+    | {
+        nodeId: string;
         startSnapshot: Snapshot;
       }
     | null = null;
@@ -597,9 +921,8 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   // During that gap, route keystrokes (including Space) into that new node.
   let pendingTextEdit: { nodeId: string } | null = null;
   let lastClick: { atMs: number; nodeId: string; x: number; y: number } | null = null;
+  let lastGroupClick: { atMs: number; nodeId: string; x: number; y: number } | null = null;
   let lastCanvasClick: { atMs: number; x: number; y: number } | null = null;
-  const undoStack: Snapshot[] = [];
-  const redoStack: Snapshot[] = [];
   type ClipboardNode = { node: any; relAnchor: { dx: number; dy: number } };
   type Clipboard = { nodes: ClipboardNode[]; primaryType: string };
   let internalClipboard: Clipboard | null = null;
@@ -643,38 +966,87 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     ed.alignEl.style.height = "0px";
   };
 
+  const pointWithinRectMargin = (x: number, y: number, rect: DOMRect | undefined | null, margin: number) => {
+    if (!rect) return false;
+    return x >= rect.left - margin && x <= rect.right + margin && y >= rect.top - margin && y <= rect.bottom + margin;
+  };
+
+  const pointWithinActiveTextEditorChrome = (x: number, y: number) => {
+    const ed = activeTextEditor;
+    if (!ed) return false;
+    if (pointWithinRectMargin(x, y, ed.el.getBoundingClientRect(), 20)) return true;
+    for (const btn of Object.values(ed.alignDots)) {
+      if (pointWithinRectMargin(x, y, btn.getBoundingClientRect(), 12)) return true;
+    }
+    return false;
+  };
+
+  const relayoutActiveButtonsEditor = () => {
+    const ed = activeButtonsEditor;
+    if (!ed) return;
+    const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(ed.nodeId)}"]`);
+    if (!nodeEl) return;
+    const nr = nodeEl.getBoundingClientRect();
+    const or = overlay.getBoundingClientRect();
+    const left = nr.left - or.left;
+    const width = nr.width;
+    ed.el.style.left = `${left}px`;
+    ed.el.style.width = `${width}px`;
+    const lines = String(ed.el.value ?? "").split("\n").length;
+    ed.el.rows = Math.max(2, lines + 1);
+    const h = ed.el.getBoundingClientRect().height;
+    const top = Math.max(8, nr.top - or.top - h - 6);
+    ed.el.style.top = `${top}px`;
+  };
+
   const cloneModel = (m: Model): Model => {
     const sc: any = (globalThis as any).structuredClone;
     if (typeof sc === "function") return sc(m);
     return JSON.parse(JSON.stringify(m)) as Model;
   };
 
-  const snapshotNow = (): Snapshot => ({
-    model: cloneModel(store.model),
-    activeViewId: store.activeViewId,
-    selectedId: store.selectedId,
-    selectedIds: [...(store.selectedIds ?? [])],
-  });
-
-  const pushUndo = (snap: Snapshot) => {
-    undoStack.push(snap);
-    redoStack.length = 0;
-  };
-
-  const persistModelToFiles = (prevIds: Set<string>) => {
+  const persistModelToFiles = (prevMeta: Map<string, { doc: "presentation" | "notes"; groupId: string | null }>) => {
     const currentIds = new Set((store.model.nodes ?? []).map((n: any) => String(n?.id ?? "")));
-    const removed = Array.from(prevIds).filter((id) => !currentIds.has(id));
+    const removed = Array.from(prevMeta.keys()).filter((id) => !currentIds.has(id));
     if (removed.length) {
-      const by = groupIdsByDoc(removed);
-      if (by.presentation.length) void persistDelete({ ids: by.presentation, doc: "presentation" });
-      if (by.notes.length) void persistDelete({ ids: by.notes, doc: "notes" });
+      const deletesByDoc: Record<"presentation" | "notes", { root: string[]; groups: Map<string, string[]> }> = {
+        presentation: { root: [], groups: new Map() },
+        notes: { root: [], groups: new Map() },
+      };
+      for (const id of removed) {
+        const meta = prevMeta.get(id);
+        if (!meta) continue;
+        if (meta.groupId) {
+          const bucket = deletesByDoc[meta.doc].groups;
+          if (!bucket.has(meta.groupId)) bucket.set(meta.groupId, []);
+          bucket.get(meta.groupId)!.push(id);
+        } else {
+          deletesByDoc[meta.doc].root.push(id);
+        }
+      }
+      for (const doc of ["presentation", "notes"] as const) {
+        if (deletesByDoc[doc].root.length) void persistDelete({ ids: deletesByDoc[doc].root, doc });
+        for (const [gid, ids] of deletesByDoc[doc].groups.entries()) {
+          if (ids.length) void persistDelete({ ids, doc, groupId: gid });
+        }
+      }
     }
     for (const n of store.model.nodes as any[]) {
       if (!n) continue;
-      const viewId = n.space === "screen" ? "screen_main" : String(n.viewId ?? store.activeViewId ?? "home");
+      const groupId = n.groupId ? String(n.groupId) : null;
+      const viewId = groupId ? "group" : n.space === "screen" ? "screen_main" : String(n.viewId ?? store.activeViewId ?? "home");
       const doc = docForNode(n);
       if (n.type === "text") {
-        void persistText({ id: String(n.id), viewId, text: String(n.text ?? ""), doc, space: n.space, align: normalizeAlign(n.align) });
+        void persistText({
+          id: String(n.id),
+          viewId,
+          text: String(n.text ?? ""),
+          doc,
+          space: groupId ? "group" : n.space,
+          align: normalizeAlign(n.align),
+          ...bgPayload(n),
+          groupId,
+        });
       } else if (n.type === "bullets") {
         void persistBullets({
           id: String(n.id),
@@ -682,11 +1054,13 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
           text: String(n.rawText ?? ""),
           bullets: String(n.bullets ?? ""),
           doc,
-          space: n.space,
+          space: groupId ? "group" : n.space,
           align: normalizeAlign(n.align),
+          ...bgPayload(n),
+          groupId,
         });
       } else if (n.type === "image") {
-        void persistImage({ id: String(n.id), viewId, src: n.src, doc, space: n.space });
+        void persistImage({ id: String(n.id), viewId, src: n.src, doc, space: groupId ? "group" : n.space, groupId, ...bgPayload(n) });
       } else if (n.type === "join") {
         void persistJoin({
           id: String(n.id),
@@ -694,11 +1068,30 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
           text: String(n.text ?? ""),
           fields: Array.isArray(n.fields) ? n.fields : [],
           doc,
-          space: n.space,
+          space: groupId ? "group" : n.space,
+          ...bgPayload(n),
+          groupId,
+        });
+      } else if (n.type === "table") {
+        void persistTable({
+          id: String(n.id),
+          viewId,
+          cells: Array.isArray((n as any).cells) ? (n as any).cells : [],
+          rows: Number((n as any).rows ?? undefined),
+          cols: Number((n as any).cols ?? undefined),
+          editable: Boolean((n as any).editable),
+          hHeader: Array.isArray((n as any).hHeader) ? (n as any).hHeader : undefined,
+          vHeader: Array.isArray((n as any).vHeader) ? (n as any).vHeader : undefined,
+          hStyle: Array.isArray((n as any).hStyle) ? (n as any).hStyle : undefined,
+          color: (n as any).color,
+          doc,
+          space: groupId ? "group" : n.space,
+          ...bgPayload(n),
+          groupId,
         });
       } else if (n.type === "arrow") {
-        const start = normalizePointForPersist(n.start ?? { x: 0, y: 0.5 }, viewId, n.space);
-        const end = normalizePointForPersist(n.end ?? { x: 1, y: 0.5 }, viewId, n.space);
+        const start = normalizePointForPersist(store, n.start ?? { x: 0, y: 0.5 }, viewId, n.space, groupId);
+        const end = normalizePointForPersist(store, n.end ?? { x: 1, y: 0.5 }, viewId, n.space, groupId);
         const color = typeof n.color === "string" && n.color.includes(",") ? "white" : n.color;
         void persistArrow({
           id: String(n.id),
@@ -708,28 +1101,23 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
           color,
           strokePx: n.strokePx,
           doc,
-          space: n.space,
+          space: groupId ? "group" : n.space,
+          ...bgPayload(n),
+          groupId,
         });
       }
       if (n.type !== "arrow") {
         void persistGeometry({
           id: String(n.id),
           viewId,
-          transform: normalizeTransformForPersist(store, n.transform, viewId, n.space),
+          transform: normalizeTransformForPersist(store, n.transform, viewId, n.space, groupId),
           fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : undefined,
           doc,
-          space: n.space,
+          space: groupId ? "group" : n.space,
+          groupId,
         });
       }
     }
-  };
-
-  const restoreSnapshot = (snap: Snapshot) => {
-    store.model = cloneModel(snap.model);
-    store.activeViewId = snap.activeViewId;
-    store.selectedId = snap.selectedId;
-    store.selectedIds = [...(snap.selectedIds ?? (snap.selectedId ? [snap.selectedId] : []))];
-    updateHandles();
   };
 
   const newId = (prefix = "n") => {
@@ -745,92 +1133,42 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     return id;
   };
 
-  const normalizeAlign = (value: any): TextAlign => {
-    if (value === "left" || value === "center" || value === "right") return value;
-    return "left";
-  };
+  const sessionRuntime = createEditorSessionRuntime(store, {
+    updateHandles: () => updateHandles(),
+    persistActiveViewId,
+    applyTableCellUpdate,
+  });
+  const {
+    undoStack,
+    redoStack,
+    snapshotNow,
+    pushUndo,
+    restoreSnapshot,
+    clearSelection,
+    setSingleSelection,
+    setMultiSelection,
+  } = sessionRuntime;
 
-  const updateEditorAlignUi = (ed: NonNullable<typeof activeTextEditor>, align: TextAlign) => {
-    ed.el.style.textAlign = align;
-    (["left", "center", "right"] as TextAlign[]).forEach((key) => {
-      ed.alignDots[key].classList.toggle("is-current", key === align);
-    });
-  };
+  window.addEventListener("ip-clear-selection", () => {
+    clearSelection();
+  });
 
-  const applyNodeAlign = (nodeId: string, align: TextAlign) => {
-    const node: any = store.model.nodes.find((n) => n.id === nodeId);
-    if (!node || (node.type !== "text" && node.type !== "bullets")) return;
-    node.align = align;
-    if (activeTextEditor && activeTextEditor.nodeId === nodeId) {
-      updateEditorAlignUi(activeTextEditor, align);
-    }
-    const persistViewId = node.space === "screen" ? "screen_main" : store.activeViewId;
-    if (node.type === "text") {
-      void persistText({
-        id: String(node.id),
-        viewId: persistViewId,
-        text: String(node.text ?? ""),
-        doc: docForNode(node),
-        space: node.space,
-        align,
-      });
-    } else if (node.type === "bullets") {
-      void persistBullets({
-        id: String(node.id),
-        viewId: persistViewId,
-        text: String(node.rawText ?? ""),
-        bullets: String(node.bullets ?? ""),
-        doc: docForNode(node),
-        space: node.space,
-        align,
-      });
-    }
-  };
-
-  const clearSelection = () => {
-    store.selectedId = null;
-    store.selectedIds = [];
-    updateHandles();
-  };
-
-  const setSingleSelection = (id: string | null) => {
-    store.selectedId = id;
-    store.selectedIds = id ? [id] : [];
-    updateHandles();
-  };
-
-  const setMultiSelection = (ids: string[], preferredPrimary?: string | null) => {
-    const uniq = Array.from(new Set(ids.filter(Boolean)));
-    store.selectedIds = uniq;
-    if (preferredPrimary && uniq.includes(preferredPrimary)) {
-      store.selectedId = preferredPrimary;
-    } else {
-      store.selectedId = uniq[0] ?? null;
-    }
-    updateHandles();
-  };
-
-  const screenAabbForNode = (node: any) => {
+  const aabbForNodeInSpace = (node: any) => {
     if (node.type === "arrow") {
-      const ends = arrowEndpointsScreen(node);
-      const minX = Math.min(ends.start.x, ends.end.x);
-      const maxX = Math.max(ends.start.x, ends.end.x);
-      const minY = Math.min(ends.start.y, ends.end.y);
-      const maxY = Math.max(ends.start.y, ends.end.y);
-      return { minX, minY, maxX, maxY };
+      const x = Number(node.transform?.x ?? 0);
+      const y = Number(node.transform?.y ?? 0);
+      const w = Number(node.transform?.w ?? 0);
+      const h = Number(node.transform?.h ?? 0);
+      return { minX: x, minY: y, maxX: x + w, maxY: y + h };
     }
-    const cam = cameraForScreen();
-    const sr = stage.getBoundingClientRect();
-    const screen = { w: sr.width, h: sr.height };
     const { ax, ay } = anchorFrac(node.transform.anchor);
-    const isWorld = node.space === "world";
-    const w = isWorld ? node.transform.w * cam.zoom : node.transform.w * screen.w;
-    const h = isWorld ? node.transform.h * cam.zoom : node.transform.h * screen.h;
+    const w = Number(node.transform.w ?? 0);
+    const h = Number(node.transform.h ?? 0);
     const xMin = -ax * w;
     const xMax = (1 - ax) * w;
     const yMin = -ay * h;
     const yMax = (1 - ay) * h;
-    const rot = (node.transform.rotationDeg * Math.PI) / 180;
+    const rot = (Number(node.transform.rotationDeg ?? 0) * Math.PI) / 180;
     const cos = Math.cos(rot);
     const sin = Math.sin(rot);
     const corners = [
@@ -838,18 +1176,10 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       { x: xMax, y: yMin },
       { x: xMax, y: yMax },
       { x: xMin, y: yMax },
-    ].map((p) => {
-      if (isWorld) {
-        const wx = node.transform.x + p.x * cos - p.y * sin;
-        const wy = node.transform.y + p.x * sin + p.y * cos;
-        return worldToScreen({ x: wx, y: wy }, cam, screen);
-      }
-      const axPx = node.transform.x * screen.w;
-      const ayPx = (1 - node.transform.y) * screen.h;
-      const sx = axPx + p.x * cos - p.y * sin;
-      const sy = ayPx + p.x * sin + p.y * cos;
-      return { x: sx, y: sy };
-    });
+    ].map((p) => ({
+      x: node.transform.x + p.x * cos - p.y * sin,
+      y: node.transform.y + p.x * sin + p.y * cos,
+    }));
     let minX = Infinity,
       minY = Infinity,
       maxX = -Infinity,
@@ -863,6 +1193,114 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     return { minX, minY, maxX, maxY };
   };
 
+  const groupEdit = createGroupEditRuntime({
+    store,
+    newId,
+    clearSelection,
+    updateHandles: () => updateHandles(),
+    setSingleSelection,
+    setMultiSelection,
+    snapshotNow,
+    pushUndo,
+    aabbForNodeInSpace: (node) => aabbForNodeInSpace(node),
+    anchorFrac,
+    docForNode,
+    persistViewIdForNode,
+    bgPayload,
+    normalizeTransformForPersist,
+    normalizePointForPersist: (storeArg, point, viewId, space, groupId) => normalizePointForPersist(storeArg, point, viewId, space, groupId),
+    persistText,
+    persistBullets,
+    persistImage,
+    persistJoin,
+    persistArrow,
+    persistGeometry,
+    persistElement,
+    persistGroup,
+    persistDelete,
+  });
+  const {
+    groupChildren,
+    groupDescendants,
+    enterGroupEdit,
+    exitGroupEdit,
+    createGroupFromSelection,
+    canUngroupSelected,
+    ungroupSelectedGroup,
+  } = groupEdit;
+
+  const selectionRuntime = createSelectionRuntime({
+    store,
+    stage,
+    overlay,
+    groupDescendants,
+    isInteractive,
+    cameraForScreen,
+    worldToScreen,
+    worldToScreenScale,
+    screenSpaceToPx,
+    screenSpaceSizeToPx,
+    screenPxToSpace,
+    screenToWorld,
+    anchorFrac,
+    isNodeInteractiveInMode: (mode, node) => isNodeInteractiveInMode(mode as any, node),
+    cursorAngleYourForHandle,
+    cursorForRotate,
+    toSvgAngle,
+    snapAngle,
+  });
+  const {
+    distPointToSegment,
+    arrowLineHitPx,
+    groupVisibleRectPx,
+    arrowEndpointsScreen,
+    arrowPointFromClient,
+    pickNodeNearClientPoint,
+    hitVirtualHandleAtClientPoint,
+    hitNodeId,
+    hitHandle,
+    updateHoverCursorAtClientPoint,
+  } = selectionRuntime;
+
+  const transformRuntime = createTransformRuntime({
+    store,
+    stage,
+    overlay,
+    dragStartPx: DRAG_START_PX,
+    rotSnapDeg: ROT_SNAP_DEG,
+    cameraForScreen,
+    cameraForEdit,
+    groupDescendants,
+    groupVisibleRectPx,
+    snapshotNow,
+    pushUndo,
+    updateHandles: () => updateHandles(),
+    bumpZIndex,
+    screenToWorld,
+    worldToScreen,
+    worldToScreenScale,
+    screenSpaceToPx,
+    anchorFrac,
+    snapTo,
+    gridMajorStepWorld,
+    cursorAngleYourForHandle,
+    toSvgAngle,
+    cursorForRotate,
+    syncArrowTransform: (node) => syncArrowTransform(node),
+    docForNode,
+    persistViewIdForNode,
+    normalizeTransformForPersist,
+    normalizePointForPersist: (storeArg, point, viewId, space, groupId) => normalizePointForPersist(storeArg, point, viewId, space, groupId),
+    persistGeometry,
+    persistArrow,
+    bgPayload,
+  });
+
+  window.addEventListener("ip-exit-group-edit", () => {
+    if (store.activeGroupId) exitGroupEdit();
+  });
+
+
   const createTextNodeAtClientPoint = (clientX: number, clientY: number, initialText: string) => {
     const cam = cameraForScreen();
     const r = stage.getBoundingClientRect();
@@ -872,24 +1310,25 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const defaultHpx = 80;
     const mode = store.mode;
     const isScreen = mode === "screen-edit";
+    const groupId = store.activeGroupId;
     const wp = !isScreen ? screenToWorld({ x: clientX - r.left, y: clientY - r.top }, cam, screen) : null;
-    const relX = (clientX - r.left) / Math.max(1e-9, r.width);
-    const relY = 1 - (clientY - r.top) / Math.max(1e-9, r.height);
+    const rel = screenPxToSpace(clientX - r.left, clientY - r.top, screen);
     const n: any = {
       id,
       type: "text",
       space: isScreen ? "screen" : "world",
+      ...(groupId ? { groupId } : null),
       ...(mode === "live" ? { layer: "live" } : null),
       zIndex: 0,
       visible: true,
       opacity: 1,
       transform: {
-        // world: world units; screen: relative coords (0..1) with origin bottom-left
-        x: isScreen ? relX : wp!.x,
-        y: isScreen ? relY : wp!.y,
-        // world: size stored in world units derived from px; screen: store in relative coords
-        w: isScreen ? defaultWpx / Math.max(1e-9, screen.w) : defaultWpx / cam.zoom,
-        h: isScreen ? defaultHpx / Math.max(1e-9, screen.h) : defaultHpx / cam.zoom,
+        // world: world units; screen: normalized coords [0,1] with y down
+        x: isScreen ? rel.x : wp!.x,
+        y: isScreen ? rel.y : wp!.y,
+        // world: size stored in world units derived from px; screen: store in normalized coords
+        w: isScreen ? defaultWpx / Math.max(1e-9, screen.w) : defaultWpx / Math.max(1e-9, cam.zoom * screen.w),
+        h: isScreen ? defaultHpx / Math.max(1e-9, screen.h) : defaultHpx / Math.max(1e-9, cam.zoom * screen.h),
         rotationDeg: 0,
         anchor: "centerCenter",
       },
@@ -902,16 +1341,39 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     setSingleSelection(id);
     // Persist creation: element in .pr and geometry in geometries.csv
     const doc = docForNode(n);
-    const persistViewId = isScreen ? "screen_main" : store.activeViewId;
-    void persistText({ id: String(id), viewId: persistViewId, text: String(initialText), doc, space: n.space, align: n.align });
+    const persistViewId = persistViewIdForNode(n, store.activeViewId);
+    void persistText({
+      id: String(id),
+      viewId: persistViewId,
+      text: String(initialText),
+      doc,
+      space: groupId ? "group" : n.space,
+      align: n.align,
+      ...bgPayload(n),
+      groupId,
+    });
     void persistGeometry({
       id: String(id),
       viewId: persistViewId,
-      transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space),
+      transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space, groupId),
       fontPx: n.fontPx,
       doc,
-      space: n.space,
+      space: groupId ? "group" : n.space,
+      groupId,
     });
+    return id;
+  };
+
+  const createNodeIdFromFilename = (filename: string | undefined, fallback: string) => {
+    const baseName = String(filename ?? fallback).replace(/\.[^/.]+$/, "");
+    const safeBase = baseName.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || fallback;
+    const existing = new Set((store.model.nodes ?? []).map((n: any) => String(n?.id ?? "")));
+    let id = safeBase;
+    let i = 2;
+    while (existing.has(id)) {
+      id = `${safeBase}_${i}`;
+      i += 1;
+    }
     return id;
   };
 
@@ -921,18 +1383,10 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const screen = { w: r.width, h: r.height };
     const mode = store.mode;
     const isScreen = mode === "screen-edit";
-    const relX = (clientX - r.left) / Math.max(1e-9, r.width);
-    const relY = 1 - (clientY - r.top) / Math.max(1e-9, r.height);
+    const groupId = store.activeGroupId;
+    const rel = screenPxToSpace(clientX - r.left, clientY - r.top, screen);
     const wp = !isScreen ? screenToWorld({ x: clientX - r.left, y: clientY - r.top }, cam, screen) : null;
-    const baseName = String(opts.filename ?? "image").replace(/\.[^/.]+$/, "");
-    const safeBase = baseName.replace(/[^a-zA-Z0-9_-]+/g, "_").replace(/^_+|_+$/g, "") || "image";
-    const existing = new Set((store.model.nodes ?? []).map((n: any) => String(n?.id ?? "")));
-    let id = safeBase;
-    let i = 2;
-    while (existing.has(id)) {
-      id = `${safeBase}_${i}`;
-      i += 1;
-    }
+    const id = createNodeIdFromFilename(opts.filename, "image");
     const defaultWpx = 240;
     const aspect = Math.max(1e-6, Number(opts.aspect ?? 1));
     const defaultHpx = defaultWpx / aspect;
@@ -940,15 +1394,16 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       id,
       type: "image",
       space: isScreen ? "screen" : "world",
+      ...(groupId ? { groupId } : null),
       ...(mode === "live" ? { layer: "live" } : null),
       zIndex: 0,
       visible: true,
       opacity: 1,
       transform: {
-        x: isScreen ? relX : wp!.x,
-        y: isScreen ? relY : wp!.y,
-        w: isScreen ? defaultWpx / Math.max(1e-9, screen.w) : defaultWpx / cam.zoom,
-        h: isScreen ? defaultHpx / Math.max(1e-9, screen.h) : defaultHpx / cam.zoom,
+        x: isScreen ? rel.x : wp!.x,
+        y: isScreen ? rel.y : wp!.y,
+        w: isScreen ? defaultWpx / Math.max(1e-9, screen.w) : defaultWpx / Math.max(1e-9, cam.zoom * screen.w),
+        h: isScreen ? defaultHpx / Math.max(1e-9, screen.h) : defaultHpx / Math.max(1e-9, cam.zoom * screen.h),
         rotationDeg: 0,
         anchor: "centerCenter",
       },
@@ -959,83 +1414,298 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     store.model.nodes.push(n);
     setSingleSelection(id);
     const doc = docForNode(n);
-    const persistViewId = isScreen ? "screen_main" : store.activeViewId;
-    void persistImage({ id, viewId: persistViewId, src: n.src, doc, space: n.space });
+    const persistViewId = persistViewIdForNode(n, store.activeViewId);
+    void persistImage({ id, viewId: persistViewId, src: n.src, doc, space: groupId ? "group" : n.space, groupId, ...bgPayload(n) });
     void persistGeometry({
       id,
       viewId: persistViewId,
-      transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space),
+      transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space, groupId),
       doc,
-      space: n.space,
+      space: groupId ? "group" : n.space,
+      groupId,
     });
     return id;
   };
 
-  const updateHoverCursorAtClientPoint = (clientX: number, clientY: number, ev?: PointerEvent | null) => {
-    const selectedIds = store.selectedIds ?? [];
-    if (!selectedIds.length) {
-      overlay.style.cursor = "";
-      return;
+  const createVideoNodeAtClientPoint = (clientX: number, clientY: number, opts: { src: string; filename?: string; aspect?: number }) => {
+    const cam = cameraForScreen();
+    const r = stage.getBoundingClientRect();
+    const screen = { w: r.width, h: r.height };
+    const mode = store.mode;
+    const isScreen = mode === "screen-edit";
+    const groupId = store.activeGroupId;
+    const rel = screenPxToSpace(clientX - r.left, clientY - r.top, screen);
+    const wp = !isScreen ? screenToWorld({ x: clientX - r.left, y: clientY - r.top }, cam, screen) : null;
+    const id = createNodeIdFromFilename(opts.filename, "video");
+    const defaultWpx = 320;
+    const aspect = Math.max(1e-6, Number(opts.aspect ?? 16 / 9));
+    const defaultHpx = defaultWpx / aspect;
+    const n: any = {
+      id,
+      type: "video",
+      space: isScreen ? "screen" : "world",
+      ...(groupId ? { groupId } : null),
+      ...(mode === "live" ? { layer: "live" } : null),
+      zIndex: 0,
+      visible: true,
+      opacity: 1,
+      transform: {
+        x: isScreen ? rel.x : wp!.x,
+        y: isScreen ? rel.y : wp!.y,
+        w: isScreen ? defaultWpx / Math.max(1e-9, screen.w) : defaultWpx / Math.max(1e-9, cam.zoom * screen.w),
+        h: isScreen ? defaultHpx / Math.max(1e-9, screen.h) : defaultHpx / Math.max(1e-9, cam.zoom * screen.h),
+        rotationDeg: 0,
+        anchor: "centerCenter",
+      },
+      src: opts.src,
+    };
+    if (isScreen) n.screenId = "screen_main";
+    else n.viewId = store.activeViewId;
+    store.model.nodes.push(n);
+    setSingleSelection(id);
+    const doc = docForNode(n);
+    const persistViewId = persistViewIdForNode(n, store.activeViewId);
+    void persistElement({
+      id,
+      type: "video",
+      viewId: persistViewId,
+      attrs: { src: n.src, ...bgPayload(n) },
+      doc,
+      space: groupId ? "group" : n.space,
+      groupId,
+    });
+    void persistGeometry({
+      id: String(id),
+      viewId: persistViewId,
+      transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space, groupId),
+      doc,
+      space: groupId ? "group" : n.space,
+      groupId,
+    });
+    return id;
+  };
+
+  const createHtmlFrameNodeAtClientPoint = (
+    clientX: number,
+    clientY: number,
+    opts: { src: string; filename?: string; aspect?: number; html?: string }
+  ) => {
+    const cam = cameraForScreen();
+    const r = stage.getBoundingClientRect();
+    const screen = { w: r.width, h: r.height };
+    const mode = store.mode;
+    const isScreen = mode === "screen-edit";
+    const groupId = store.activeGroupId;
+    const rel = screenPxToSpace(clientX - r.left, clientY - r.top, screen);
+    const wp = !isScreen ? screenToWorld({ x: clientX - r.left, y: clientY - r.top }, cam, screen) : null;
+    const id = createNodeIdFromFilename(opts.filename, "iframe");
+    const defaultWpx = 320;
+    const aspect = Math.max(1e-6, Number(opts.aspect ?? 16 / 9));
+    const defaultHpx = defaultWpx / aspect;
+    const n: any = {
+      id,
+      type: "htmlFrame",
+      space: isScreen ? "screen" : "world",
+      ...(groupId ? { groupId } : null),
+      ...(mode === "live" ? { layer: "live" } : null),
+      zIndex: 0,
+      visible: true,
+      opacity: 1,
+      transform: {
+        x: isScreen ? rel.x : wp!.x,
+        y: isScreen ? rel.y : wp!.y,
+        w: isScreen ? defaultWpx / Math.max(1e-9, screen.w) : defaultWpx / Math.max(1e-9, cam.zoom * screen.w),
+        h: isScreen ? defaultHpx / Math.max(1e-9, screen.h) : defaultHpx / Math.max(1e-9, cam.zoom * screen.h),
+        rotationDeg: 0,
+        anchor: "centerCenter",
+      },
+      src: opts.src,
+    };
+    if (isScreen) n.screenId = "screen_main";
+    else n.viewId = store.activeViewId;
+    store.model.nodes.push(n);
+    setSingleSelection(id);
+    const doc = docForNode(n);
+    const persistViewId = persistViewIdForNode(n, store.activeViewId);
+    void persistElement({
+      id,
+      type: "iframe",
+      viewId: persistViewId,
+      attrs: { ...(opts.html ? { html: opts.html } : { src: n.src }), ...bgPayload(n) },
+      doc,
+      space: groupId ? "group" : n.space,
+      groupId,
+    });
+    void persistGeometry({
+      id: String(id),
+      viewId: persistViewId,
+      transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space, groupId),
+      doc,
+      space: groupId ? "group" : n.space,
+      groupId,
+    });
+    return id;
+  };
+
+  const loadImageAspect = (src: string) =>
+    new Promise<number>((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const w = Math.max(1, img.naturalWidth || img.width || 0);
+        const h = Math.max(1, img.naturalHeight || img.height || 0);
+        resolve(w > 0 && h > 0 ? w / h : 1);
+      };
+      img.onerror = () => resolve(1);
+      img.src = src;
+    });
+
+  const loadVideoAspect = (src: string) =>
+    new Promise<number>((resolve) => {
+      const video = document.createElement("video");
+      video.preload = "metadata";
+      video.onloadedmetadata = () => {
+        const w = Math.max(1, video.videoWidth || 0);
+        const h = Math.max(1, video.videoHeight || 0);
+        resolve(w > 0 && h > 0 ? w / h : 16 / 9);
+      };
+      video.onerror = () => resolve(16 / 9);
+      video.src = src;
+    });
+
+  const pasteInternalAtClientPoint = (clientX: number, clientY: number) => {
+    if (!internalClipboard) return;
+    pushUndo(snapshotNow());
+    const cam = cameraForScreen();
+    const r = stage.getBoundingClientRect();
+    const cx = clientX;
+    const cy = clientY;
+    const groupId = store.activeGroupId;
+
+    // If you keep pasting without moving the mouse, nudge by +50px,+50px each time to separate.
+    if (lastPasteClient && Math.abs(cx - lastPasteClient.x) < 0.5 && Math.abs(cy - lastPasteClient.y) < 0.5) {
+      pasteNudgeSteps += 1;
+    } else {
+      pasteNudgeSteps = 0;
     }
+    lastPasteClient = { x: cx, y: cy };
+    const nudgePx = 50 * pasteNudgeSteps;
+    const screen = { w: r.width, h: r.height };
+    const nudgeWorldX = nudgePx / Math.max(1e-9, cam.zoom * screen.w);
+    const nudgeWorldY = nudgePx / Math.max(1e-9, cam.zoom * screen.h);
 
-    // If multiple items are selected, choose the best handle hit among them.
-    let best: { nodeId: string; h: { id: HandleId; d2: number } } | null = null;
-    for (const nodeId of selectedIds) {
-      const h = hitVirtualHandleAtClientPoint(clientX, clientY, nodeId);
-      if (!h) continue;
-      if (!best || h.d2 < best.h.d2) best = { nodeId, h };
-    }
+    // Place primary anchor exactly at mouse cursor (plus optional repeated-paste nudge).
+    const cursorRel = screenPxToSpace(cx - r.left, cy - r.top, screen);
+    const cursorWorld = screenToWorld({ x: cx - r.left, y: cy - r.top }, cam, screen);
 
-    const nodeId = best?.nodeId ?? store.selectedId ?? selectedIds[0]!;
-    const next = (ev ? hitHandle(ev) : null) ?? best?.h ?? hitVirtualHandleAtClientPoint(clientX, clientY, nodeId);
-    const handleId = (next as any)?.id ? (next as any).id : (next as any);
-
-    if (nodeId) {
-      const node = store.model.nodes.find((n) => n.id === nodeId) as any;
-      if (node?.type === "arrow") {
-        const ends = arrowEndpointsScreen(node);
-        const endRadius = 20;
-        const dStart = Math.hypot(clientX - ends.start.x, clientY - ends.start.y);
-        const dEnd = Math.hypot(clientX - ends.end.x, clientY - ends.end.y);
-        if (dStart <= endRadius || dEnd <= endRadius) {
-          overlay.style.cursor = "pointer";
-          return;
-        }
-        const lineHit = distPointToSegment(clientX, clientY, ends.start.x, ends.start.y, ends.end.x, ends.end.y);
-        if (lineHit <= arrowLineHitPx(node)) {
-          overlay.style.cursor = "grab";
-          return;
-        }
-      }
-    }
-
-    if (handleId && String(handleId).startsWith("anchor:")) {
-      overlay.style.cursor = "pointer";
-      return;
-    }
-
-    if (handleId && String(handleId).startsWith("anchor:")) {
-      overlay.style.cursor = "pointer";
-      return;
-    }
-
-    if (nodeId && handleId && !String(handleId).startsWith("anchor:")) {
-      const node = store.model.nodes.find((n) => n.id === nodeId);
-      if (node) {
-        // IMPORTANT: model rotationDeg currently behaves like screen/CSS rotation (CW-positive),
-        // so convert to Viktor's CCW-positive system before computing cursor angles.
-        const rotYour = -node.transform.rotationDeg;
-        const isRotateCorner = handleId === "nw" || handleId === "ne";
-        const angleYour = cursorAngleYourForHandle(rotYour, handleId as any);
-        if (isRotateCorner) {
-          overlay.style.cursor = cursorForRotate(toSvgAngle(angleYour));
+    const newIds: string[] = [];
+    for (const item of internalClipboard.nodes) {
+      const n: any = cloneModel(item.node);
+      n.id = newId(String(n.type ?? internalClipboard.primaryType ?? "n"));
+      if (groupId) n.groupId = groupId;
+      if (n.type === "arrow") {
+        const start = n.start ?? { x: 0, y: 0 };
+        const end = n.end ?? { x: 0, y: 0 };
+        const mid = { x: (Number(start.x) + Number(end.x)) / 2, y: (Number(start.y) + Number(end.y)) / 2 };
+        const target =
+          n.space === "screen"
+            ? {
+                x: cursorRel.x + nudgePx / Math.max(1e-9, screen.w) + item.relAnchor.dx,
+                y: cursorRel.y + nudgePx / Math.max(1e-9, screen.h) + item.relAnchor.dy,
+              }
+            : { x: cursorWorld.x + nudgeWorldX + item.relAnchor.dx, y: cursorWorld.y + nudgeWorldY + item.relAnchor.dy };
+        const dx = target.x - mid.x;
+        const dy = target.y - mid.y;
+        n.start = { x: Number(start.x) + dx, y: Number(start.y) + dy };
+        n.end = { x: Number(end.x) + dx, y: Number(end.y) + dy };
+      } else if (n.transform) {
+        if (n.space === "screen") {
+          n.transform.x = cursorRel.x + nudgePx / Math.max(1e-9, screen.w) + item.relAnchor.dx;
+          n.transform.y = cursorRel.y + nudgePx / Math.max(1e-9, screen.h) + item.relAnchor.dy;
         } else {
-          overlay.style.cursor = cursorForResize(toSvgAngle(snapAngle(angleYour, 45)));
+          n.transform.x = cursorWorld.x + nudgeWorldX + item.relAnchor.dx;
+          n.transform.y = cursorWorld.y + nudgeWorldY + item.relAnchor.dy;
         }
-        return;
+      }
+      store.model.nodes.push(n);
+      newIds.push(n.id);
+      // Persist paste as creation (text + geometry)
+      const doc = docForNode(n);
+      const persistViewId = persistViewIdForNode(n, store.activeViewId);
+      if (n.type === "text") {
+        void persistText({
+          id: String(n.id),
+          viewId: persistViewId,
+          text: String(n.text ?? ""),
+          doc,
+          space: groupId ? "group" : n.space,
+          align: normalizeAlign((n as any).align),
+          ...bgPayload(n),
+          groupId,
+        });
+      }
+      if (n.type === "bullets") {
+        void persistBullets({
+          id: String(n.id),
+          viewId: persistViewId,
+          text: String(n.rawText ?? ""),
+          bullets: String(n.bullets ?? ""),
+          doc,
+          space: groupId ? "group" : n.space,
+          align: normalizeAlign((n as any).align),
+          ...bgPayload(n),
+          groupId,
+        });
+      }
+      void persistGeometry({
+        id: String(n.id),
+        viewId: persistViewId,
+        transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space, groupId),
+        fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : undefined,
+        doc,
+        space: groupId ? "group" : n.space,
+        groupId,
+      });
+    }
+    setMultiSelection(newIds, newIds[0] ?? null);
+  };
+
+  const deleteSelectedNodes = () => {
+    if ((store.selectedIds?.length ?? 0) <= 0) return;
+    pushUndo(snapshotNow());
+    const baseSel = Array.from(new Set(store.selectedIds.map(String)));
+    const expanded = new Set(baseSel);
+    for (const id of baseSel) {
+      const node = store.model.nodes.find((n: any) => String(n.id) === String(id)) as any;
+      if (node?.type === "group") {
+        for (const child of groupChildren(node.id)) {
+          expanded.add(String(child.id));
+        }
       }
     }
-    overlay.style.cursor = "";
+    const deletesByDoc: Record<"presentation" | "notes", { root: string[]; groups: Map<string, string[]> }> = {
+      presentation: { root: [], groups: new Map() },
+      notes: { root: [], groups: new Map() },
+    };
+    for (const id of expanded) {
+      const node = store.model.nodes.find((n: any) => String(n.id) === String(id)) as any;
+      if (!node) continue;
+      const doc = docForNode(node);
+      const gid = node.groupId ? String(node.groupId) : null;
+      if (gid) {
+        if (!deletesByDoc[doc].groups.has(gid)) deletesByDoc[doc].groups.set(gid, []);
+        deletesByDoc[doc].groups.get(gid)!.push(String(id));
+      } else {
+        deletesByDoc[doc].root.push(String(id));
+      }
+    }
+    for (const doc of ["presentation", "notes"] as const) {
+      if (deletesByDoc[doc].root.length) void persistDelete({ ids: deletesByDoc[doc].root, doc });
+      for (const [gid, delIds] of deletesByDoc[doc].groups.entries()) {
+        if (delIds.length) void persistDelete({ ids: delIds, doc, groupId: gid });
+      }
+    }
+    store.model.nodes = store.model.nodes.filter((n) => !expanded.has(String((n as any).id)));
+    clearSelection();
   };
 
   const onOverlayPointerEnter = () => {
@@ -1048,154 +1718,21 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     if (!owner) overlay.style.cursor = "";
   };
 
-  const hitNodeId = (ev: PointerEvent): string | null => {
-    const t = ev.target as HTMLElement | null;
-    if (t?.closest?.(".text-editor")) return null;
-    const el = t?.closest?.(".node") as HTMLElement | null;
-    const id = String(el?.dataset?.nodeId ?? "");
-    if (!id) return null;
-    const node = store.model.nodes.find((n) => n.id === id) as any;
-    if (!node) return null;
-    if (node.type === "arrow") {
-      const ends = arrowEndpointsScreen(node);
-      const hit = distPointToSegment(ev.clientX, ev.clientY, ends.start.x, ends.start.y, ends.end.x, ends.end.y);
-      const threshold = arrowLineHitPx(node);
-      if (hit > threshold) return null;
-    }
-    return isInteractive(node) ? id : null;
-  };
 
-  const hitHandle = (ev: PointerEvent): HandleId | null => {
-    const t = ev.target as HTMLElement | null;
-    const h = t?.closest?.("[data-handle-id]") as HTMLElement | null;
-    return (h?.dataset?.handleId as HandleId | undefined) ?? null;
-  };
-
-  const pickNodeNearClientPoint = (clientX: number, clientY: number): string | null => {
-    const cam = cameraForScreen();
-    const sr = stage.getBoundingClientRect();
-    const screen = { w: sr.width, h: sr.height };
-    const px = clientX - sr.left;
-    const py = clientY - sr.top;
-
-    // Prefer highest zIndex.
-    let best: { id: string; z: number; order: number } | null = null;
-    for (let i = 0; i < store.model.nodes.length; i++) {
-      const n: any = store.model.nodes[i];
-      if (!n || n.visible === false) continue;
-      if (!isInteractive(n)) continue;
-      if (n.type === "arrow") {
-        const ends = arrowEndpointsScreen(n);
-        const hit = distPointToSegment(px, py, ends.start.x, ends.start.y, ends.end.x, ends.end.y);
-        const threshold = arrowLineHitPx(n);
-        if (hit > threshold) continue;
-        const z = Number(n.zIndex ?? 0);
-        if (!best || z > best.z || (z === best.z && i > best.order)) best = { id: String(n.id), z, order: i };
-        continue;
-      }
-      const isWorld = n.space === "world";
-      const wPx = isWorld ? n.transform.w * cam.zoom : n.transform.w * screen.w;
-      const hPx = isWorld ? n.transform.h * cam.zoom : n.transform.h * screen.h;
-      const { ax, ay } = anchorFrac(n.transform.anchor);
-      const left = -ax * wPx;
-      const right = (1 - ax) * wPx;
-      const top = -ay * hPx;
-      const bottom = (1 - ay) * hPx;
-      const anchorScreen = isWorld
-        ? worldToScreen({ x: n.transform.x, y: n.transform.y }, cam, screen)
-        : { x: n.transform.x * screen.w, y: (1 - n.transform.y) * screen.h };
-      const dx = px - anchorScreen.x;
-      const dy = py - anchorScreen.y;
-      const rot = (n.transform.rotationDeg * Math.PI) / 180;
-      const cos = Math.cos(rot);
-      const sin = Math.sin(rot);
-      const lx = dx * cos + dy * sin;
-      const ly = -dx * sin + dy * cos;
-
-      const OUTSIDE = 20;
-      const inExpanded = lx >= left - OUTSIDE && lx <= right + OUTSIDE && ly >= top - OUTSIDE && ly <= bottom + OUTSIDE;
-      if (!inExpanded) continue;
-
-      const z = Number(n.zIndex ?? 0);
-      if (!best || z > best.z || (z === best.z && i > best.order)) best = { id: String(n.id), z, order: i };
-    }
-    return best?.id ?? null;
-  };
-
-  const localForNodePx = (node: any, clientX: number, clientY: number) => {
-    const cam = cameraForScreen();
-    const sr = stage.getBoundingClientRect();
-    const screen = { w: sr.width, h: sr.height };
-    const px = clientX - sr.left;
-    const py = clientY - sr.top;
-
-    const isWorld = node.space === "world";
-    const zoom = isWorld ? cam.zoom : 1;
-    const wPx = isWorld ? node.transform.w * cam.zoom : node.transform.w * screen.w;
-    const hPx = isWorld ? node.transform.h * cam.zoom : node.transform.h * screen.h;
-    const { ax, ay } = anchorFrac(node.transform.anchor);
-    const left = -ax * wPx;
-    const right = (1 - ax) * wPx;
-    const top = -ay * hPx;
-    const bottom = (1 - ay) * hPx;
-
-    const anchorScreen = isWorld
-      ? worldToScreen({ x: node.transform.x, y: node.transform.y }, cam, screen)
-      : { x: node.transform.x * screen.w, y: (1 - node.transform.y) * screen.h };
-    const dx = px - anchorScreen.x;
-    const dy = py - anchorScreen.y;
-    const rot = (node.transform.rotationDeg * Math.PI) / 180;
-    const cos = Math.cos(rot);
-    const sin = Math.sin(rot);
-    const lx = dx * cos + dy * sin;
-    const ly = -dx * sin + dy * cos;
-    return { left, right, top, bottom, lx, ly, rotDeg: node.transform.rotationDeg, zoom };
-  };
-
-  const arrowEndpointsScreen = (node: any) => {
-    const cam = cameraForScreen();
-    const sr = stage.getBoundingClientRect();
-    const screen = { w: sr.width, h: sr.height };
-    const start = node.start ?? { x: 0, y: 0.5 };
-    const end = node.end ?? { x: 1, y: 0.5 };
-    const toScreen = (p: { x: number; y: number }) =>
-      node.space === "world"
-        ? worldToScreen({ x: p.x, y: p.y }, cam, screen)
-        : { x: p.x * screen.w, y: (1 - p.y) * screen.h };
-    const s = toScreen(start);
-    const e = toScreen(end);
-    return {
-      start: { x: s.x, y: s.y },
-      end: { x: e.x, y: e.y },
-    };
-  };
-
-  const arrowPointFromClient = (node: any, clientX: number, clientY: number) => {
-    const cam = cameraForScreen();
-    const sr = stage.getBoundingClientRect();
-    const screen = { w: sr.width, h: sr.height };
-    const px = clientX - sr.left;
-    const py = clientY - sr.top;
-    if (node.space === "world") {
-      return screenToWorld({ x: px, y: py }, cam, screen);
-    }
-    return { x: px / Math.max(1e-9, screen.w), y: 1 - py / Math.max(1e-9, screen.h) };
-  };
-
-  const normalizePointForPersist = (p: { x: number; y: number }, viewId: string, space: string | undefined) => {
-    if (space !== "world") return p;
-    const cam = resolveViewCamera(store, viewId);
-    const designW = (store.model as any).defaults?.designWidth ?? 1920;
-    const designH = (store.model as any).defaults?.designHeight ?? 1080;
-    const viewW = designW / Math.max(1e-9, cam.zoom || 1);
-    const viewH = designH / Math.max(1e-9, cam.zoom || 1);
-    const left = cam.cx - viewW / 2;
-    const bottom = cam.cy - viewH / 2;
-    const aspect = designH / designW;
-    return {
-      x: (p.x - left) / viewW,
-      y: ((p.y - bottom) / viewH) * aspect,
-    };
+const normalizePointForPersist = (
+  store: Store,
+  p: { x: number; y: number },
+  viewId: string,
+  space: string | undefined,
+  groupId?: string | null
+) => {
+  if (groupId) {
+    const group = store.model.nodes.find((n: any) => String(n.id) === String(groupId)) as any;
+    if (group?.transform) return worldPointToGroupLocal(group.transform, p);
+  }
+  if (space === "screen") return p;
+  const cam = resolveViewCamera(store, viewId);
+  return worldToView(p, cam);
   };
 
   const updateArrowFromClientDrag = (node: any, startX: number, startY: number, endX: number, endY: number) => {
@@ -1224,98 +1761,6 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     };
   };
 
-  const distPointToSegment = (px: number, py: number, ax: number, ay: number, bx: number, by: number) => {
-    const abx = bx - ax;
-    const aby = by - ay;
-    const apx = px - ax;
-    const apy = py - ay;
-    const denom = abx * abx + aby * aby;
-    if (denom <= 1e-9) return Math.hypot(apx, apy);
-    let t = (apx * abx + apy * aby) / denom;
-    t = Math.max(0, Math.min(1, t));
-    const cx = ax + abx * t;
-    const cy = ay + aby * t;
-    return Math.hypot(px - cx, py - cy);
-  };
-
-  const arrowLineHitPx = (node: any) => {
-    const strokePx = Math.max(1, Number(node?.strokePx ?? 4));
-    return Math.max(12, strokePx * 2.5);
-  };
-
-  const hitVirtualHandleAtClientPoint = (
-    clientX: number,
-    clientY: number,
-    nodeId: string | null
-  ): { id: HandleId; d2: number } | null => {
-    if (!nodeId) return null;
-    const node: any = store.model.nodes.find((n) => n.id === nodeId);
-    if (!node) return null;
-    if (!isInteractive(node)) return null;
-    const { left, right, top, bottom, lx, ly } = localForNodePx(node as any, clientX, clientY);
-    const { ax, ay } = anchorFrac((node as any).transform.anchor);
-
-    // Hover geometry
-    const INSIDE = 5;
-    const OUTSIDE = 20;
-    const CORNER_ALONG = 20;
-
-    // Disable anchor-side handles (same rule as existing UI)
-    const hideW = ax <= 1e-9;
-    const hideE = ax >= 1 - 1e-9;
-    const hideN = ay <= 1e-9;
-    const hideS = ay >= 1 - 1e-9;
-
-    // IMPORTANT: band hit-tests must constrain BOTH axes.
-    // Otherwise you'd get a cursor "anywhere" along a band axis (looks like OR instead of AND).
-    const inYRange = ly >= top - OUTSIDE && ly <= bottom + OUTSIDE;
-    const inXRange = lx >= left - OUTSIDE && lx <= right + OUTSIDE;
-    const inLeftBand = !hideW && inYRange && lx >= left - OUTSIDE && lx <= left + INSIDE;
-    const inRightBand = !hideE && inYRange && lx <= right + OUTSIDE && lx >= right - INSIDE;
-    const inTopBand = !hideN && inXRange && ly >= top - OUTSIDE && ly <= top + INSIDE;
-    const inBottomBand = !hideS && inXRange && ly <= bottom + OUTSIDE && ly >= bottom - INSIDE;
-
-    const candidates: Array<{ id: HandleId; d2: number }> = [];
-    const push = (hid: HandleId, ddx: number, ddy: number) => candidates.push({ id: hid, d2: ddx * ddx + ddy * ddy });
-
-    const midX = (left + right) / 2;
-    const midY = (top + bottom) / 2;
-
-    // Four sides, each split into 3 regions: corner | middle | corner.
-    if (inTopBand) {
-      const alongL = lx - left;
-      const alongR = right - lx;
-      if (alongL <= CORNER_ALONG) push("nw", lx - left, ly - top);
-      else if (alongR <= CORNER_ALONG) push("ne", lx - right, ly - top);
-      else push("n", lx - midX, ly - top); // middle: closest-to-center wins naturally
-    }
-    if (inBottomBand) {
-      const alongL = lx - left;
-      const alongR = right - lx;
-      if (alongL <= CORNER_ALONG) push("sw", lx - left, ly - bottom);
-      else if (alongR <= CORNER_ALONG) push("se", lx - right, ly - bottom);
-      else push("s", lx - midX, ly - bottom);
-    }
-    if (inLeftBand) {
-      const alongT = ly - top;
-      const alongB = bottom - ly;
-      if (alongT <= CORNER_ALONG) push("nw", lx - left, ly - top);
-      else if (alongB <= CORNER_ALONG) push("sw", lx - left, ly - bottom);
-      else push("w", lx - left, ly - midY);
-    }
-    if (inRightBand) {
-      const alongT = ly - top;
-      const alongB = bottom - ly;
-      if (alongT <= CORNER_ALONG) push("ne", lx - right, ly - top);
-      else if (alongB <= CORNER_ALONG) push("se", lx - right, ly - bottom);
-      else push("e", lx - right, ly - midY);
-    }
-
-    if (!candidates.length) return null;
-    candidates.sort((a, b) => a.d2 - b.d2);
-    return candidates[0]!;
-  };
-
   const updateHandles = () => {
     const id = store.selectedId;
     if (!id) {
@@ -1328,8 +1773,34 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       handles.hide();
       return;
     }
+    if (node.type === "group") {
+      const descendantRects = groupDescendants(id)
+        .map((child: any) =>
+          overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(String(child.id))}"]`)
+        )
+        .filter((el): el is HTMLElement => !!el && el.style.display !== "none")
+        .map((el) => el.getBoundingClientRect());
+      if (descendantRects.length) {
+        const overlayRect = overlay.getBoundingClientRect();
+        const minLeft = Math.min(...descendantRects.map((r) => r.left));
+        const minTop = Math.min(...descendantRects.map((r) => r.top));
+        const maxRight = Math.max(...descendantRects.map((r) => r.right));
+        const maxBottom = Math.max(...descendantRects.map((r) => r.bottom));
+        handles.showForRect(
+          {
+            left: minLeft - overlayRect.left,
+            top: minTop - overlayRect.top,
+            width: Math.max(1, maxRight - minLeft),
+            height: Math.max(1, maxBottom - minTop),
+          },
+          node.transform.anchor
+        );
+        return;
+      }
+    }
     handles.showFor(nodeEl, node.transform, node.transform.anchor);
   };
+
 
   const applyAnchorChange = (id: string, nextAnchor: Anchor) => {
     const node = store.model.nodes.find((n) => n.id === id);
@@ -1340,55 +1811,104 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const rot = (t.rotationDeg * Math.PI) / 180;
     const cos = Math.cos(rot);
     const sin = Math.sin(rot);
-    if (node.space === "screen") {
-      const sr = stage.getBoundingClientRect();
-      const screen = { w: sr.width, h: sr.height };
-      const anchorPxX = t.x * screen.w;
-      const anchorPxY = (1 - t.y) * screen.h;
-      const wPx = t.w * screen.w;
-      const hPx = t.h * screen.h;
-      const v0x = -ax0 * wPx;
-      const v0y = -ay0 * hPx;
-      const tlx = anchorPxX + v0x * cos - v0y * sin;
-      const tly = anchorPxY + v0x * sin + v0y * cos;
-      const v1x = -ax1 * wPx;
-      const v1y = -ay1 * hPx;
-      const nextAnchorPxX = tlx - (v1x * cos - v1y * sin);
-      const nextAnchorPxY = tly - (v1x * sin + v1y * cos);
+    const sr = stage.getBoundingClientRect();
+    const screen = { w: sr.width, h: sr.height };
+    const isScreen = node.space === "screen";
+    const cam = cameraForEdit();
+
+    const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(id)}"]`);
+    const rect = nodeEl?.getBoundingClientRect() ?? null;
+    const wantsExactText = node.type === "text" || node.type === "bullets";
+
+    let wPx = isScreen ? t.w * screen.w : t.w * worldToScreenScale(cam, screen).x;
+    let hPx = isScreen ? t.h * screen.h : t.h * worldToScreenScale(cam, screen).y;
+    if (rect && wantsExactText) {
+      const bw = Math.max(1, rect.width);
+      const bh = Math.max(1, rect.height);
+      const c = Math.abs(cos);
+      const s = Math.abs(sin);
+      const denom = c * c - s * s;
+      if (Math.abs(denom) > 1e-4) {
+        const w0 = (bw * c - bh * s) / denom;
+        const h0 = (bh * c - bw * s) / denom;
+        if (Number.isFinite(w0) && Number.isFinite(h0) && w0 > 0.5 && h0 > 0.5) {
+          wPx = w0;
+          hPx = h0;
+        }
+      }
+    }
+
+    const anchorPx = isScreen
+      ? { x: t.x * screen.w, y: t.y * screen.h }
+      : worldToScreen({ x: t.x, y: t.y }, cam, screen);
+
+    const v0x = -ax0 * wPx;
+    const v0y = -ay0 * hPx;
+    const tlx = anchorPx.x + v0x * cos - v0y * sin;
+    const tly = anchorPx.y + v0x * sin + v0y * cos;
+    const v1x = -ax1 * wPx;
+    const v1y = -ay1 * hPx;
+    const nextAnchorPxX = tlx - (v1x * cos - v1y * sin);
+    const nextAnchorPxY = tly - (v1x * sin + v1y * cos);
+    if (isScreen) {
       node.transform = {
         ...t,
         anchor: nextAnchor,
         x: nextAnchorPxX / Math.max(1e-9, screen.w),
-        y: 1 - nextAnchorPxY / Math.max(1e-9, screen.h),
+        y: nextAnchorPxY / Math.max(1e-9, screen.h),
       };
       return;
     }
-    // Compute top-left in world from old anchor (rotation aware)
-    const v0x = -ax0 * t.w;
-    const v0y = -ay0 * t.h;
-    const tlx = t.x + v0x * cos - v0y * sin;
-    const tly = t.y + v0x * sin + v0y * cos;
-    const v1x = -ax1 * t.w;
-    const v1y = -ay1 * t.h;
-    const nextX = tlx - (v1x * cos - v1y * sin);
-    const nextY = tly - (v1x * sin + v1y * cos);
-    node.transform = { ...t, anchor: nextAnchor, x: nextX, y: nextY };
+    const nextWorld = screenToWorld({ x: nextAnchorPxX, y: nextAnchorPxY }, cam, screen);
+    node.transform = { ...t, anchor: nextAnchor, x: nextWorld.x, y: nextWorld.y };
   };
 
   const onPointerDown = (ev: PointerEvent) => {
+    const target = ev.target as HTMLElement | null;
+    const inVideoControls = !!target?.closest?.(".video-controls");
+    const inButtonsUi = !!target?.closest?.(".node-buttons") || !!target?.closest?.(".buttons-grid") || !!target?.closest?.(".buttons-btn");
+    const inSliderUi = !!target?.closest?.(".node-slider") || !!target?.closest?.(".slider-input");
+    const inLiveUi = inVideoControls || inButtonsUi || inSliderUi;
     if (store.mode === "live") {
-      if (ev.button === 1 || ev.button === 0) {
-        ev.preventDefault();
-        return;
+      if (inLiveUi) return;
+      // Allow ctrl-drag arrow creation and right-click deselect in live mode.
+      if ((ev.button === 0 && ev.ctrlKey) || ev.button === 2) {
+        // fall through to dedicated handlers below
+      } else {
+        const nodeEl = target?.closest?.(".node") as HTMLElement | null;
+        const nodeId = nodeEl?.dataset?.nodeId ?? pickNodeNearClientPoint(ev.clientX, ev.clientY);
+        const node = nodeId ? store.model.nodes.find((n) => String(n.id) === String(nodeId)) : null;
+        const allowLiveTextEdit =
+          node && node.type === "text" && String((node as any).pressureRole ?? "") === "peak";
+        const allowLiveTableEdit = node && node.type === "table" && (node as any).editable !== false;
+        if (!node || ((node as any).layer !== "live" && !allowLiveTextEdit && !allowLiveTableEdit)) return;
       }
     }
+    if (inVideoControls) return;
     // Keep mouse position updated even if the user clicks without moving.
     lastClient = { x: ev.clientX, y: ev.clientY };
     // Pan: middle mouse only (no Space-pan).
     if (ev.button === 1) {
+      if (store.mode === "live") {
+        ev.preventDefault();
+        return;
+      }
       const cam = cameraForEdit();
+      const r = stage.getBoundingClientRect();
+      const screen = { w: r.width, h: r.height };
+      const startWorld = screenToWorld({ x: ev.clientX - r.left, y: ev.clientY - r.top }, cam, screen);
       if (!store.cameraOverride) store.cameraOverride = { ...cam };
-      owner = { kind: "pan", pointerId: ev.pointerId, startClientX: ev.clientX, startClientY: ev.clientY, startCx: cam.cx, startCy: cam.cy };
+      owner = {
+        kind: "pan",
+        pointerId: ev.pointerId,
+        startClientX: ev.clientX,
+        startClientY: ev.clientY,
+        startCx: cam.cx,
+        startCy: cam.cy,
+        startWorldX: startWorld.x,
+        startWorldY: startWorld.y,
+        startZoom: cam.zoom,
+      };
       try {
         overlay.setPointerCapture(ev.pointerId);
       } catch (e) {
@@ -1398,12 +1918,22 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       ev.preventDefault();
       return;
     }
-    // Right-drag marquee selection OR right-click clear selection.
+    // Right click: open context menu only when clicking current selection; otherwise marquee-select.
     if (ev.button === 2) {
       // Right click outside the editor should commit+close it (same gesture as clear selection).
       if (activeTextEditor && !(ev.target as HTMLElement | null)?.closest?.(".text-editor")) {
         closeTextEditor({ commit: true });
       }
+      if (activeButtonsEditor && !(ev.target as HTMLElement | null)?.closest?.(".text-editor")) {
+        closeButtonsEditor({ commit: true });
+      }
+      if (activeTableEditor && !(ev.target as HTMLElement | null)?.closest?.(".table-cell")) {
+        closeTableEditor();
+      }
+      const rightHit = hitNodeId(ev) ?? pickNodeNearClientPoint(ev.clientX, ev.clientY);
+      const selectedSet = new Set(store.selectedIds ?? []);
+      const clickedSelected = rightHit ? selectedSet.has(rightHit) || store.selectedId === rightHit : false;
+      if (store.mode !== "live" && clickedSelected) return; // allow native context menu
       owner = {
         kind: "rselect",
         pointerId: ev.pointerId,
@@ -1412,11 +1942,6 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
         dirty: false,
         startSnapshot: snapshotNow(),
       };
-      marquee.style.display = "none";
-      marquee.style.left = "0px";
-      marquee.style.top = "0px";
-      marquee.style.width = "0px";
-      marquee.style.height = "0px";
       try {
         overlay.setPointerCapture(ev.pointerId);
       } catch (e) {
@@ -1426,15 +1951,33 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       return;
     }
     if (ev.button !== 0) return;
-    if ((ev.target as HTMLElement | null)?.closest?.(".text-editor")) return;
+    const targetEl = ev.target as HTMLElement | null;
+    if (targetEl?.closest?.(".text-editor")) return;
+    const tableCell = targetEl?.closest?.(".table-cell");
+    const tableNode = tableCell?.closest?.(".node") as HTMLElement | null;
+    const tableEditing = tableNode?.dataset?.nodeType === "table" && tableNode.dataset.editing === "1";
+    if (tableCell && tableEditing) return;
+    if (activeButtonsEditor) return;
+    if (activeTableEditor && !(ev.target as HTMLElement | null)?.closest?.(".table-cell")) {
+      closeTableEditor();
+    }
 
     // Pan with left-drag on empty canvas.
     {
       const h = hitHandle(ev);
       const targetId = hitNodeId(ev) ?? pickNodeNearClientPoint(ev.clientX, ev.clientY);
       if (!h && !targetId) {
-        if (!(ev.ctrlKey && store.mode !== "live")) {
+        if (store.mode === "live") {
+          if (!ev.ctrlKey) {
+            ev.preventDefault();
+            return;
+          }
+        }
+        if (!ev.ctrlKey) {
           const cam = cameraForEdit();
+          const r = stage.getBoundingClientRect();
+          const screen = { w: r.width, h: r.height };
+          const startWorld = screenToWorld({ x: ev.clientX - r.left, y: ev.clientY - r.top }, cam, screen);
           if (!store.cameraOverride) store.cameraOverride = { ...cam };
           owner = {
             kind: "pan",
@@ -1443,6 +1986,9 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
             startClientY: ev.clientY,
             startCx: cam.cx,
             startCy: cam.cy,
+            startWorldX: startWorld.x,
+            startWorldY: startWorld.y,
+            startZoom: cam.zoom,
           };
           try {
             overlay.setPointerCapture(ev.pointerId);
@@ -1456,7 +2002,7 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       }
     }
 
-    // Double-click empty canvas toggles screen-edit.
+    // Double-click empty canvas toggles screen-edit or exits group edit.
     // (Native dblclick won't fire reliably since we preventDefault on pointer events.)
     {
       const h = hitHandle(ev);
@@ -1468,14 +2014,47 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
         const dpx = prev ? Math.hypot(ev.clientX - prev.x, ev.clientY - prev.y) : Infinity;
         if (prev && dt < 420 && dpx < 10) {
           lastCanvasClick = null;
-          store.mode = store.mode === "screen-edit" ? "edit" : "screen-edit";
-          clearSelection();
+          if (store.activeGroupId) exitGroupEdit();
+          else {
+            store.mode = store.mode === "screen-edit" ? "edit" : "screen-edit";
+            clearSelection();
+          }
           ev.preventDefault();
           return;
         }
         lastCanvasClick = { atMs: now, x: ev.clientX, y: ev.clientY };
       } else {
         lastCanvasClick = null;
+      }
+    }
+
+    // Manual "double click" detection: native dblclick won't fire reliably since we
+    // preventDefault on pointer events (which can cancel click/dblclick synthesis).
+    // Group edit: double-click a group to enter, double-click canvas to exit.
+    {
+      const targetId = store.selectedId ?? hitNodeId(ev) ?? pickNodeNearClientPoint(ev.clientX, ev.clientY);
+      const h = hitHandle(ev);
+      const hvHit = h && !h.startsWith("anchor:") ? ({ id: h, d2: 0 } as any) : hitVirtualHandleAtClientPoint(ev.clientX, ev.clientY, targetId);
+      const hv = hvHit?.id ?? null;
+      if (!hv && targetId) {
+        const node: any = store.model.nodes.find((n) => n.id === targetId);
+        if (node && node.type === "group") {
+          const now = performance.now();
+          const prev = lastGroupClick;
+          const dt = prev ? now - prev.atMs : Infinity;
+          const dpx = prev ? Math.hypot(ev.clientX - prev.x, ev.clientY - prev.y) : Infinity;
+          if (prev && prev.nodeId === targetId && dt < 420 && dpx < 6) {
+            setSingleSelection(targetId);
+            owner = null;
+            enterGroupEdit(targetId);
+            lastGroupClick = null;
+            ev.preventDefault();
+            return;
+          }
+          lastGroupClick = { atMs: now, nodeId: targetId, x: ev.clientX, y: ev.clientY };
+        } else {
+          lastGroupClick = null;
+        }
       }
     }
 
@@ -1489,7 +2068,7 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       const hv = hvHit?.id ?? null;
       if (!hv && targetId) {
         const node: any = store.model.nodes.find((n) => n.id === targetId);
-        if (node && (node.type === "text" || node.type === "bullets")) {
+        if (node && (node.type === "text" || node.type === "bullets" || node.type === "buttons" || node.type === "table")) {
           const now = performance.now();
           const prev = lastClick;
           const dt = prev ? now - prev.atMs : Infinity;
@@ -1499,7 +2078,9 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
             owner = null;
             // open editor
             // (defined below in this scope)
-            openTextEditorForNode(targetId);
+            if (node.type === "buttons") openButtonsEditorForNode(targetId);
+            else if (node.type === "table") openTableEditorForNode(targetId);
+            else openTextEditorForNode(targetId);
             lastClick = null;
             ev.preventDefault();
             return;
@@ -1525,17 +2106,20 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       }
     }
 
-    // Ctrl+drag on empty space creates a new arrow (edit modes only).
-    if (store.mode !== "live" && ev.button === 0 && ev.ctrlKey) {
-      const hitId = hitNodeId(ev) ?? pickNodeNearClientPoint(ev.clientX, ev.clientY);
+    // Ctrl+drag on empty space creates a new arrow (including live notes).
+    if (ev.button === 0 && ev.ctrlKey) {
+      const hitId = store.mode === "live" ? null : hitNodeId(ev);
       if (!hitId) {
         const snap = snapshotNow();
         const isScreen = store.mode === "screen-edit";
+        const groupId = store.activeGroupId;
         const id = newId("arrow");
         const n: any = {
           id,
           type: "arrow",
           space: isScreen ? "screen" : "world",
+          ...(groupId ? { groupId } : null),
+          ...(store.mode === "live" ? { layer: "live" } : null),
           zIndex: 0,
           visible: true,
           opacity: 1,
@@ -1557,6 +2141,7 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
           startClientX: ev.clientX,
           startClientY: ev.clientY,
           dirty: true,
+          zBumped: false,
           startSnapshot: snap,
         };
         try {
@@ -1575,50 +2160,82 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       if (targetId) {
         const node: any = store.model.nodes.find((n) => n.id === targetId);
         if (node?.type === "arrow") {
-          setSingleSelection(targetId);
-          const ends = arrowEndpointsScreen(node);
-          const endRadius = 20;
-          const dStart = Math.hypot(ev.clientX - ends.start.x, ev.clientY - ends.start.y);
-          const dEnd = Math.hypot(ev.clientX - ends.end.x, ev.clientY - ends.end.y);
-          if (dStart <= endRadius || dEnd <= endRadius) {
-            const endId = dStart <= dEnd ? "start" : "end";
-            owner = {
-              kind: "arrow-end",
-              pointerId: ev.pointerId,
-              nodeId: targetId,
-              endId,
-              dirty: false,
-              startSnapshot: snapshotNow(),
-            };
-            try {
-              overlay.setPointerCapture(ev.pointerId);
-            } catch (e) {
-              console.error("[next][state] setPointerCapture failed", e);
+          if (ev.shiftKey || ev.ctrlKey) {
+            // Allow modifier clicks to go through selection logic.
+          } else {
+            setSingleSelection(targetId);
+            const ends = arrowEndpointsScreen(node);
+            const endRadius = 20;
+            const dStart = Math.hypot(ev.clientX - ends.start.x, ev.clientY - ends.start.y);
+            const dEnd = Math.hypot(ev.clientX - ends.end.x, ev.clientY - ends.end.y);
+            const lineHit = distPointToSegment(ev.clientX, ev.clientY, ends.start.x, ends.start.y, ends.end.x, ends.end.y);
+            const lineThreshold = arrowLineHitPx(node);
+            const endOverlapPx = 20;
+            const arrowLen = Math.hypot(ends.end.x - ends.start.x, ends.end.y - ends.start.y);
+            const preferLine = arrowLen <= endOverlapPx && lineHit <= lineThreshold && lineHit <= Math.min(dStart, dEnd);
+            if (preferLine) {
+              owner = {
+                kind: "arrow-move",
+                pointerId: ev.pointerId,
+                nodeId: targetId,
+                startClientX: ev.clientX,
+                startClientY: ev.clientY,
+                startStart: { x: node.start?.x ?? 0, y: node.start?.y ?? 0.5 },
+                startEnd: { x: node.end?.x ?? 1, y: node.end?.y ?? 0.5 },
+                dirty: false,
+                zBumped: false,
+                startSnapshot: snapshotNow(),
+              };
+              try {
+                overlay.setPointerCapture(ev.pointerId);
+              } catch (e) {
+                console.error("[next][state] setPointerCapture failed", e);
+              }
+              overlay.style.cursor = "grabbing";
+              ev.preventDefault();
+              return;
             }
-            ev.preventDefault();
-            return;
-          }
-          const lineHit = distPointToSegment(ev.clientX, ev.clientY, ends.start.x, ends.start.y, ends.end.x, ends.end.y);
-          if (lineHit <= arrowLineHitPx(node)) {
-            owner = {
-              kind: "arrow-move",
-              pointerId: ev.pointerId,
-              nodeId: targetId,
-              startClientX: ev.clientX,
-              startClientY: ev.clientY,
-              startStart: { x: node.start?.x ?? 0, y: node.start?.y ?? 0.5 },
-              startEnd: { x: node.end?.x ?? 1, y: node.end?.y ?? 0.5 },
-              dirty: false,
-              startSnapshot: snapshotNow(),
-            };
-            try {
-              overlay.setPointerCapture(ev.pointerId);
-            } catch (e) {
-              console.error("[next][state] setPointerCapture failed", e);
+            if (dStart <= endRadius || dEnd <= endRadius) {
+              const endId = dStart <= dEnd ? "start" : "end";
+              owner = {
+                kind: "arrow-end",
+                pointerId: ev.pointerId,
+                nodeId: targetId,
+                endId,
+                dirty: false,
+                zBumped: false,
+                startSnapshot: snapshotNow(),
+              };
+              try {
+                overlay.setPointerCapture(ev.pointerId);
+              } catch (e) {
+                console.error("[next][state] setPointerCapture failed", e);
+              }
+              ev.preventDefault();
+              return;
             }
-            overlay.style.cursor = "grabbing";
-            ev.preventDefault();
-            return;
+            if (lineHit <= lineThreshold) {
+              owner = {
+                kind: "arrow-move",
+                pointerId: ev.pointerId,
+                nodeId: targetId,
+                startClientX: ev.clientX,
+                startClientY: ev.clientY,
+                startStart: { x: node.start?.x ?? 0, y: node.start?.y ?? 0.5 },
+                startEnd: { x: node.end?.x ?? 1, y: node.end?.y ?? 0.5 },
+                dirty: false,
+                zBumped: false,
+                startSnapshot: snapshotNow(),
+              };
+              try {
+                overlay.setPointerCapture(ev.pointerId);
+              } catch (e) {
+                console.error("[next][state] setPointerCapture failed", e);
+              }
+              overlay.style.cursor = "grabbing";
+              ev.preventDefault();
+              return;
+            }
           }
         }
       }
@@ -1642,65 +2259,19 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       if (!node) return;
       // handles already updated via setSingleSelection
 
-      const cam = cameraForScreen();
-      const r = stage.getBoundingClientRect();
-      const screen = { w: r.width, h: r.height };
-      const sx = ev.clientX - r.left;
-      const sy = ev.clientY - r.top;
-      const wp = node.space === "world" ? screenToWorld({ x: sx, y: sy }, cam, screen) : null;
-
+      if (String(hv).startsWith("anchor:")) {
+        const a = String(hv).slice("anchor:".length) as Anchor;
+        pushUndo(snapshotNow());
+        applyAnchorChange(id, a);
+        ev.preventDefault();
+        return;
+      }
       // Rotation: use upper corners (nw/ne). No separate rotation handle.
       const isRotateCorner = hv === "nw" || hv === "ne";
       if (isRotateCorner) {
-        const ang0 =
-          node.space === "screen"
-            ? Math.atan2(sy - (1 - node.transform.y) * screen.h, sx - node.transform.x * screen.w)
-            : Math.atan2(wp!.y - node.transform.y, wp!.x - node.transform.x);
-        const targetIds = (store.selectedIds?.length ? store.selectedIds : [id]).includes(id)
-          ? (store.selectedIds?.length ? store.selectedIds : [id])
-          : [id];
-        const starts = targetIds
-          .map((tid) => store.model.nodes.find((n) => n.id === tid))
-          .filter((n): n is any => !!n)
-          .map((n) => ({ id: String(n.id), rotationDeg: n.transform.rotationDeg }));
-        owner = {
-          kind: "rotate",
-          pointerId: ev.pointerId,
-          nodeId: id,
-          targetIds,
-          starts,
-          corner: hv as any,
-          startAngleRad: ang0,
-          startRotationDeg: node.transform.rotationDeg,
-          dirty: false,
-          startSnapshot: snapshotNow(),
-        };
+        owner = transformRuntime.createRotateOwner(id, hv as any, ev) as any;
       } else {
-        const targetIds = (store.selectedIds?.length ? store.selectedIds : [id]).includes(id)
-          ? (store.selectedIds?.length ? store.selectedIds : [id])
-          : [id];
-        const starts = targetIds
-          .map((tid) => store.model.nodes.find((n) => n.id === tid))
-          .filter((n): n is any => !!n)
-          .map((n) => ({
-            id: String(n.id),
-            w: n.transform.w,
-            h: n.transform.h,
-            fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : 0,
-          }));
-        owner = {
-          kind: "resize",
-          pointerId: ev.pointerId,
-          nodeId: id,
-          targetIds,
-          starts,
-          handle: hv as any,
-          startW: node.transform.w,
-          startH: node.transform.h,
-          startFontPx: node.type === "text" || node.type === "bullets" ? node.fontPx : 0,
-          dirty: false,
-          startSnapshot: snapshotNow(),
-        };
+        owner = transformRuntime.createResizeOwner(id, hv as any, ev) as any;
       }
 
       try {
@@ -1712,9 +2283,18 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       return;
     }
 
-    const id = hitNodeId(ev);
+    const id = hitNodeId(ev) ?? pickNodeNearClientPoint(ev.clientX, ev.clientY);
+    if (!id && ev.shiftKey) {
+      // Shift-click on empty space should not clear existing selection.
+      ev.preventDefault();
+      return;
+    }
     if (!id) {
-      if (ev.ctrlKey && store.mode !== "live") {
+      if (store.mode === "live" && !ev.ctrlKey) {
+        ev.preventDefault();
+        return;
+      }
+      if (ev.ctrlKey) {
         // Ctrl-drag is reserved for arrow creation; avoid panning.
         ev.preventDefault();
         return;
@@ -1723,8 +2303,21 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       // Only right click clears selection (see rselect pointerup).
       // Left drag on empty canvas pans.
       const cam = cameraForEdit();
+      const r = stage.getBoundingClientRect();
+      const screen = { w: r.width, h: r.height };
+      const startWorld = screenToWorld({ x: ev.clientX - r.left, y: ev.clientY - r.top }, cam, screen);
       if (!store.cameraOverride) store.cameraOverride = { ...cam };
-      owner = { kind: "pan", pointerId: ev.pointerId, startClientX: ev.clientX, startClientY: ev.clientY, startCx: cam.cx, startCy: cam.cy };
+      owner = {
+        kind: "pan",
+        pointerId: ev.pointerId,
+        startClientX: ev.clientX,
+        startClientY: ev.clientY,
+        startCx: cam.cx,
+        startCy: cam.cy,
+        startWorldX: startWorld.x,
+        startWorldY: startWorld.y,
+        startZoom: cam.zoom,
+      };
       try {
         overlay.setPointerCapture(ev.pointerId);
       } catch (e) {
@@ -1766,25 +2359,8 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     if (!nodeIdForMove) return;
     const node = store.model.nodes.find((n) => n.id === nodeIdForMove);
     if (!node) return;
-
-    owner = {
-      kind: "move",
-      pointerId: ev.pointerId,
-      nodeId: nodeIdForMove,
-      targetIds: (store.selectedIds?.length ? store.selectedIds : [nodeIdForMove]).includes(nodeIdForMove)
-        ? (store.selectedIds?.length ? store.selectedIds : [nodeIdForMove])
-        : [nodeIdForMove],
-      starts: (store.selectedIds?.length ? store.selectedIds : [nodeIdForMove])
-        .map((tid) => store.model.nodes.find((n) => n.id === tid))
-        .filter((n): n is any => !!n)
-        .map((n) => ({ id: String(n.id), x: n.transform.x, y: n.transform.y })),
-      startClientX: ev.clientX,
-      startClientY: ev.clientY,
-      startX: node.transform.x,
-      startY: node.transform.y,
-      dirty: false,
-      startSnapshot: snapshotNow(),
-    };
+    if (!isInteractive(node)) return;
+    owner = transformRuntime.createMoveOwner(nodeIdForMove, ev) as any;
     try {
       overlay.setPointerCapture(ev.pointerId);
     } catch (e) {
@@ -1804,35 +2380,55 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
         overlay.style.cursor = "";
         return;
       }
-      const actualCam = cameraForEdit();
-      const dx = ev.clientX - o.startClientX;
-      const dy = ev.clientY - o.startClientY;
-      const next = { cx: o.startCx - dx / actualCam.zoom, cy: o.startCy - dy / actualCam.zoom, zoom: actualCam.zoom };
-      store.cameraOverride = next;
+      const r = stage.getBoundingClientRect();
+      const sx = ev.clientX - r.left;
+      const sy = ev.clientY - r.top;
+      store.cameraOverride = cameraForScreenPan(
+        { x: o.startWorldX, y: o.startWorldY },
+        { x: sx, y: sy },
+        { cx: o.startCx, cy: o.startCy, zoom: o.startZoom },
+        { w: Math.max(1e-9, r.width), h: Math.max(1e-9, r.height) }
+      );
       ev.preventDefault();
       return;
     }
 
     if (activeTextEditor) {
-      // Armed leave-to-save: only close when the pointer has actually entered the editor once.
       const inEditor = !!(ev.target as HTMLElement | null)?.closest?.(".text-editor");
-      if (inEditor) activeTextEditor.everEntered = true;
+      if (inEditor) {
+        activeTextEditor.everEntered = true;
+        return;
+      }
+      const nodeMargin = 8;
+      const nodeRect = overlay
+        .querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(activeTextEditor.nodeId)}"]`)
+        ?.getBoundingClientRect();
+      const withinEditorMargin = pointWithinActiveTextEditorChrome(ev.clientX, ev.clientY);
+      const withinNodeMargin = !!nodeRect &&
+        ev.clientX >= nodeRect.left - nodeMargin &&
+        ev.clientX <= nodeRect.right + nodeMargin &&
+        ev.clientY >= nodeRect.top - nodeMargin &&
+        ev.clientY <= nodeRect.bottom + nodeMargin;
+      if (withinEditorMargin || withinNodeMargin) return;
+      // If the user is dragging/selecting text and leaves the editor, do not close yet.
+      if ((ev.buttons & 1) !== 0) {
+        activeTextEditor.everEntered = false;
+        return;
+      }
+      closeTextEditor({ commit: true });
+      return;
+    }
+    if (activeButtonsEditor) {
+      const inEditor = !!(ev.target as HTMLElement | null)?.closest?.(".text-editor");
       if (!inEditor) {
         const margin = 20;
-        const r = activeTextEditor.el.getBoundingClientRect();
+        const r = activeButtonsEditor.el.getBoundingClientRect();
         const withinMargin =
           ev.clientX >= r.left - margin &&
           ev.clientX <= r.right + margin &&
           ev.clientY >= r.top - margin &&
           ev.clientY <= r.bottom + margin;
-        if (withinMargin) return;
-        // IMPORTANT: if the user is dragging (selecting text) and leaves the editor,
-        // do NOT close. Also "disarm" so they must re-enter before a later leave will close.
-        if ((ev.buttons & 1) !== 0) {
-          if (activeTextEditor.everEntered) activeTextEditor.everEntered = false;
-          return;
-        }
-        if (activeTextEditor.everEntered) closeTextEditor({ commit: true });
+        if (!withinMargin && (ev.buttons & 1) === 0) closeButtonsEditor({ commit: true });
       }
       return;
     }
@@ -1882,17 +2478,21 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       const screen = { w: sr.width, h: sr.height };
       if (node.space === "screen") {
         const dX = dx / Math.max(1e-9, screen.w);
-        const dY = -dy / Math.max(1e-9, screen.h);
+        const dY = dy / Math.max(1e-9, screen.h);
         node.start = { x: o.startStart.x + dX, y: o.startStart.y + dY };
         node.end = { x: o.startEnd.x + dX, y: o.startEnd.y + dY };
       } else {
-        const dX = dx / cam.zoom;
-        const dY = dy / cam.zoom;
+        const dX = dx / Math.max(1e-9, cam.zoom * screen.w);
+        const dY = dy / Math.max(1e-9, cam.zoom * screen.h);
         node.start = { x: o.startStart.x + dX, y: o.startStart.y + dY };
         node.end = { x: o.startEnd.x + dX, y: o.startEnd.y + dY };
       }
       syncArrowTransform(node);
       o.dirty = true;
+      if (!(o as any).zBumped) {
+        bumpZIndex([String(o.nodeId)]);
+        (o as any).zBumped = true;
+      }
       ev.preventDefault();
       updateHandles();
       return;
@@ -1905,6 +2505,10 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       else node.end = next;
       syncArrowTransform(node);
       o.dirty = true;
+      if (!(o as any).zBumped) {
+        bumpZIndex([String(o.nodeId)]);
+        (o as any).zBumped = true;
+      }
       ev.preventDefault();
       updateHandles();
       return;
@@ -1914,232 +2518,16 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       if (!node) return;
       updateArrowFromClientDrag(node, o.startClientX, o.startClientY, ev.clientX, ev.clientY);
       o.dirty = true;
-      ev.preventDefault();
-      updateHandles();
-      return;
-    }
-    if (o.kind === "move") {
-      const cam = cameraForScreen();
-      const dx = ev.clientX - o.startClientX;
-      const dy = ev.clientY - o.startClientY;
-      if (!o.dirty) {
-        if (Math.hypot(dx, dy) < DRAG_START_PX) return;
-        o.dirty = true;
-      }
-      // Move all selected nodes by the same delta (world or screen).
-      const sr = stage.getBoundingClientRect();
-      const screen = { w: sr.width, h: sr.height };
-      const primary = store.model.nodes.find((n) => n.id === o.nodeId) as any;
-      const isScreen = primary?.space === "screen";
-      let dX = isScreen ? dx / Math.max(1e-9, screen.w) : dx / cam.zoom;
-      // Screen-space uses bottom-left coords, so dragging down decreases y.
-      let dY = isScreen ? -dy / Math.max(1e-9, screen.h) : dy / cam.zoom;
-      if (ev.shiftKey) {
-        if (isScreen) {
-          const snapPx = 10;
-          const nxRel = snapTo((o.startX + dX) * screen.w, snapPx) / Math.max(1e-9, screen.w);
-          const nyRel = snapTo((o.startY + dY) * screen.h, snapPx) / Math.max(1e-9, screen.h);
-          dX = nxRel - o.startX;
-          dY = nyRel - o.startY;
-        } else {
-          const step = gridMajorStepWorld(cameraForEdit().zoom);
-          const nx = snapTo(o.startX + dX, step);
-          const ny = snapTo(o.startY + dY, step);
-          dX = nx - o.startX;
-          dY = ny - o.startY;
-        }
-      }
-      for (const s of o.starts) {
-        const node = store.model.nodes.find((n) => n.id === s.id) as any;
-        if (!node) continue;
-        node.transform.x = s.x + dX;
-        node.transform.y = s.y + dY;
+      if (!(o as any).zBumped) {
+        bumpZIndex([String(o.nodeId)]);
+        (o as any).zBumped = true;
       }
       ev.preventDefault();
       updateHandles();
       return;
     }
-
-    // Rotate about anchor point
-    if (o.kind === "rotate") {
-      const node = store.model.nodes.find((n) => n.id === o.nodeId);
-      if (!node) return;
-      const cam = cameraForScreen();
-      const r = stage.getBoundingClientRect();
-      const screen = { w: r.width, h: r.height };
-      const sx = ev.clientX - r.left;
-      const sy = ev.clientY - r.top;
-      const ang1 =
-        (node as any).space === "screen"
-          ? Math.atan2(sy - (1 - node.transform.y) * screen.h, sx - node.transform.x * screen.w)
-          : (() => {
-              const wp = screenToWorld({ x: sx, y: sy }, cam, screen);
-              return Math.atan2(wp.y - node.transform.y, wp.x - node.transform.x);
-            })();
-      const d = ((ang1 - o.startAngleRad) * 180) / Math.PI;
-      let nextDeg = o.startRotationDeg + d;
-      if (ev.shiftKey) nextDeg = snapTo(nextDeg, ROT_SNAP_DEG);
-      const deltaDeg = nextDeg - o.startRotationDeg;
-      for (const s of o.starts) {
-        const n = store.model.nodes.find((x) => x.id === s.id);
-        if (!n) continue;
-        n.transform.rotationDeg = s.rotationDeg + deltaDeg;
-      }
-      o.dirty = true;
-      // Update cursor continuously during drag (otherwise it appears "stuck").
-      {
-        const rotYour = -(o.startRotationDeg + deltaDeg);
-        const handle = o.corner;
-        const yourAngle = cursorAngleYourForHandle(rotYour, handle);
-        overlay.style.cursor = cursorForRotate(toSvgAngle(yourAngle));
-      }
+    if (transformRuntime.applyPointerMove(o as any, ev)) {
       ev.preventDefault();
-      updateHandles();
-      return;
-    }
-
-    // Resize in the element's local axis (anchor is fixed, rotation preserved)
-    if (o.kind === "resize") {
-      const node = store.model.nodes.find((n) => n.id === o.nodeId);
-      if (!node) return;
-      const t = node.transform;
-      const cam = cameraForScreen();
-      const r = stage.getBoundingClientRect();
-      const screen = { w: r.width, h: r.height };
-      const clientPxX = ev.clientX - r.left;
-      const clientPxY = ev.clientY - r.top;
-
-      const rot = (t.rotationDeg * Math.PI) / 180;
-      const cos = Math.cos(rot);
-      const sin = Math.sin(rot);
-      const isScreen = (node as any).space === "screen";
-      const scaleW = Math.max(1e-9, screen.w);
-      const scaleH = Math.max(1e-9, screen.h);
-      const startWpx = isScreen ? o.startW * scaleW : o.startW;
-      const startHpx = isScreen ? o.startH * scaleH : o.startH;
-      const wp = !isScreen ? screenToWorld({ x: clientPxX, y: clientPxY }, cam, screen) : null;
-      const dxw = isScreen ? clientPxX - t.x * screen.w : wp!.x - t.x;
-      const dyw = isScreen ? clientPxY - (1 - t.y) * screen.h : wp!.y - t.y;
-      // rotate by -rot
-      const lx = dxw * cos + dyw * sin;
-      const ly = -dxw * sin + dyw * cos;
-
-      const { ax, ay } = anchorFrac(t.anchor);
-      const hnd = o.handle;
-
-      // Corner scaling must ALWAYS preserve aspect ratio.
-      // Do uniform scale about the anchor (anchor point stays fixed).
-      const isCorner = hnd === "nw" || hnd === "ne" || hnd === "sw" || hnd === "se";
-      if (isCorner) {
-        const xMin0 = -ax * startWpx;
-        const xMax0 = (1 - ax) * startWpx;
-        const yMin0 = -ay * startHpx;
-        const yMax0 = (1 - ay) * startHpx;
-
-        // Pick the corner direction vector for computing scale.
-        const cornerVec = (() => {
-          if (hnd === "nw") return { x: xMin0, y: yMin0 };
-          if (hnd === "ne") return { x: xMax0, y: yMin0 };
-          if (hnd === "sw") return { x: xMin0, y: yMax0 };
-          return { x: xMax0, y: yMax0 }; // "se"
-        })();
-
-        const denom = cornerVec.x * cornerVec.x + cornerVec.y * cornerVec.y;
-        if (denom > 1e-9) {
-          let s = (lx * cornerVec.x + ly * cornerVec.y) / denom;
-          // Minimum size constraint (uniform).
-          const minWpx = 10;
-          const minHpx = 10;
-          const minW = isScreen ? minWpx / scaleW : minWpx;
-          const minH = isScreen ? minHpx / scaleH : minHpx;
-          const sMin = Math.max(minW / Math.max(1e-9, o.startW), minH / Math.max(1e-9, o.startH));
-          if (!Number.isFinite(s)) s = 1;
-          s = Math.max(sMin, s);
-
-          // Shift snapping: quantize size without breaking aspect ratio.
-          if (ev.shiftKey) {
-            const wSnapPx = snapTo(startWpx * s, isScreen ? 10 : gridMajorStepWorld(cameraForEdit().zoom));
-            s = Math.max(sMin, wSnapPx / Math.max(1e-9, startWpx));
-          }
-
-          const nextW = Math.max(minW, o.startW * s);
-          const nextH = Math.max(minH, o.startH * s);
-          t.w = nextW;
-          t.h = nextH;
-          if (node.type === "text" || node.type === "bullets") node.fontPx = Math.max(1, o.startFontPx * s);
-          // Apply same uniform scale to all selected nodes around their own anchors.
-          for (const st of o.starts) {
-            if (st.id === o.nodeId) continue;
-            const n = store.model.nodes.find((x) => x.id === st.id);
-            if (!n) continue;
-            n.transform.w = Math.max(minW, st.w * s);
-            n.transform.h = Math.max(minH, st.h * s);
-            if (n.type === "text" || n.type === "bullets") n.fontPx = Math.max(1, st.fontPx * s);
-          }
-          o.dirty = true;
-          ev.preventDefault();
-          updateHandles();
-          return;
-        }
-      }
-
-      const minWpx = 10;
-      const minHpx = 10;
-      const minW = isScreen ? minWpx / scaleW : minWpx;
-      const minH = isScreen ? minHpx / scaleH : minHpx;
-
-      // IMPORTANT (anchor compensation):
-      // `t.x,t.y` is the anchor point, so dragging an edge must solve for the new size such that
-      // the dragged edge position equals the cursor in LOCAL coords.
-      //
-      // Example: anchor=center => right edge = +0.5*w. To make the edge follow the cursor (lx),
-      // we must set w = lx / 0.5 = 2*lx.
-      const step = isScreen ? 10 : gridMajorStepWorld(cameraForEdit().zoom);
-      const lxTarget = ev.shiftKey ? snapTo(lx, step) : lx;
-      const lyTarget = ev.shiftKey ? snapTo(ly, step) : ly;
-
-      let wNew = t.w;
-      let hNew = t.h;
-      const eps = 1e-9;
-      if (hnd === "e") wNew = lxTarget / Math.max(eps, 1 - ax);
-      if (hnd === "w") wNew = -lxTarget / Math.max(eps, ax);
-      if (hnd === "s") hNew = lyTarget / Math.max(eps, 1 - ay);
-      if (hnd === "n") hNew = -lyTarget / Math.max(eps, ay);
-
-      if (!Number.isFinite(wNew)) wNew = t.w;
-      if (!Number.isFinite(hNew)) hNew = t.h;
-      if (isScreen) {
-        const wPx = Math.max(minWpx, wNew);
-        const hPx = Math.max(minHpx, hNew);
-        t.w = wPx / scaleW;
-        t.h = hPx / scaleH;
-      } else {
-        t.w = Math.max(minW, wNew);
-        t.h = Math.max(minH, hNew);
-      }
-      o.dirty = true;
-
-      // Apply resize ratios to all selected nodes around their own anchors.
-      const sx = t.w / Math.max(1e-9, o.startW);
-      const sy = t.h / Math.max(1e-9, o.startH);
-      for (const st of o.starts) {
-        if (st.id === o.nodeId) continue;
-        const n = store.model.nodes.find((x) => x.id === st.id);
-        if (!n) continue;
-        n.transform.w = Math.max(minW, st.w * sx);
-        n.transform.h = Math.max(minH, st.h * sy);
-        // Text scaling rule: corners scale font, edges keep font constant.
-        if ((n.type === "text" || n.type === "bullets") && isCorner) n.fontPx = Math.max(1, st.fontPx * sx);
-      }
-
-      // Text scaling rule: corners scale font, edges keep font constant.
-      if ((node.type === "text" || node.type === "bullets") && isCorner) {
-        const sW = t.w / Math.max(1e-9, o.startW);
-        node.fontPx = Math.max(1, o.startFontPx * sW);
-      }
-
-      ev.preventDefault();
-      updateHandles();
       return;
     }
   };
@@ -2147,6 +2535,23 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   // use the true mouse delta instead of a stale lastClient.
   const onWindowPointerMove = (ev: PointerEvent) => {
     lastClient = { x: ev.clientX, y: ev.clientY };
+    if (!activeTextEditor) return;
+    const target = document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null;
+    const inEditor = !!target?.closest?.(".text-editor");
+    if (inEditor) return;
+    const nodeMargin = 8;
+    const nodeRect = overlay
+      .querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(activeTextEditor.nodeId)}"]`)
+      ?.getBoundingClientRect();
+    const withinEditorMargin = pointWithinActiveTextEditorChrome(ev.clientX, ev.clientY);
+    const withinNodeMargin = !!nodeRect &&
+      ev.clientX >= nodeRect.left - nodeMargin &&
+      ev.clientX <= nodeRect.right + nodeMargin &&
+      ev.clientY >= nodeRect.top - nodeMargin &&
+      ev.clientY <= nodeRect.bottom + nodeMargin;
+    if (withinEditorMargin || withinNodeMargin) return;
+    if ((ev.buttons & 1) !== 0) return;
+    closeTextEditor({ commit: true });
   };
 
   const onPointerUp = (ev: PointerEvent) => {
@@ -2156,9 +2561,15 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       marquee.style.display = "none";
       const wasDirty = owner.dirty;
       if (!wasDirty) {
-        // Right click: clear selection.
-        if (store.selectedId || (store.selectedIds?.length ?? 0) > 0) pushUndo(owner.startSnapshot);
-        clearSelection();
+        if (owner.action === "group") {
+          createGroupFromSelection();
+        } else if (owner.action === "ungroup") {
+          ungroupSelectedGroup();
+        } else {
+          // Right click: clear selection.
+          if (store.selectedId || (store.selectedIds?.length ?? 0) > 0) pushUndo(owner.startSnapshot);
+          clearSelection();
+        }
         owner = null;
         return;
       }
@@ -2175,12 +2586,21 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       const bottom = Math.max(y0, y1);
 
       const hits: string[] = [];
+      const cam = cameraForScreen();
+      const screen = { w: or.width, h: or.height };
       for (const n of store.model.nodes as any[]) {
         if (!n || n.visible === false) continue;
         if (!isInteractive(n)) continue;
-        const bb = screenAabbForNode(n);
-        const overlap = bb.maxX >= left && bb.minX <= right && bb.maxY >= top && bb.minY <= bottom;
-        if (overlap) hits.push(String(n.id));
+        const isWorld = n.space !== "screen";
+        const anchorScreen = isWorld
+          ? worldToScreen({ x: n.transform.x, y: n.transform.y }, cam, screen)
+          : screenSpaceToPx({ x: n.transform.x, y: n.transform.y }, screen);
+        const inside =
+          anchorScreen.x >= left &&
+          anchorScreen.x <= right &&
+          anchorScreen.y >= top &&
+          anchorScreen.y <= bottom;
+        if (inside) hits.push(String(n.id));
       }
 
       const prevPrimary = store.selectedId;
@@ -2202,54 +2622,65 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       const nextArr = Array.from(next);
       pushUndo(owner.startSnapshot);
       setMultiSelection(nextArr, prevPrimary);
+      lastMarqueeSelectAt = performance.now();
       owner = null;
       return;
     }
-    // Record undo snapshot once per completed gesture.
-    if ((owner as any).dirty && (owner as any).startSnapshot) pushUndo((owner as any).startSnapshot);
-    if ((owner as any).kind === "pan") overlay.style.cursor = "";
-    // Persist geometry after committed transform gestures.
-    if ((owner as any).dirty) {
-      const ids: string[] = (owner as any).targetIds ?? [(owner as any).nodeId].filter(Boolean);
-      for (const id of ids) {
-        const n: any = store.model.nodes.find((x) => x.id === id);
-        if (!n) continue;
-        const viewId = n.space === "screen" ? "screen_main" : store.activeViewId;
-        if (n.type !== "arrow") {
-          void persistGeometry({
-            id: String(n.id),
-            viewId,
-            transform: normalizeTransformForPersist(store, n.transform, viewId, n.space),
-            fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : undefined,
-            doc: docForNode(n),
-            space: n.space,
-          });
-        }
-        if (n.type === "arrow") {
-          const start = normalizePointForPersist(n.start ?? { x: 0, y: 0.5 }, viewId, n.space);
-          const end = normalizePointForPersist(n.end ?? { x: 1, y: 0.5 }, viewId, n.space);
-          const color = typeof n.color === "string" && n.color.includes(",") ? "white" : n.color;
-          void persistArrow({
-            id: String(n.id),
-            viewId,
-            start,
-            end,
-            color,
-            strokePx: n.strokePx,
-            doc: docForNode(n),
-            space: n.space,
-          });
-        }
-      }
+    if (transformRuntime.finishPointerUp(owner as any)) {
+      owner = null;
+      if (overlayIsOver && lastClient) updateHoverCursorAtClientPoint(lastClient.x, lastClient.y, null);
+      return;
     }
+    if ((owner as any).kind === "pan") overlay.style.cursor = "";
     owner = null;
     updateHandles();
     // Refresh cursor immediately; don't require a "leave and re-enter" or a tiny mouse move.
     if (overlayIsOver && lastClient) updateHoverCursorAtClientPoint(lastClient.x, lastClient.y, null);
   };
 
+  const mediaKindForFile = (file: File): "image" | "video" | "html" | null => {
+    const type = (file.type || "").toLowerCase();
+    const name = String(file.name || "");
+    const ext = name.includes(".") ? name.split(".").pop()!.toLowerCase() : "";
+    if (type.startsWith("image/") || ["png", "jpg", "jpeg", "gif", "webp"].includes(ext)) return "image";
+    if (type.startsWith("video/") || ["mp4", "webm", "mov", "m4v", "ogv"].includes(ext)) return "video";
+    if (type === "text/html" || type === "application/xhtml+xml" || ["html", "htm"].includes(ext)) return "html";
+    return null;
+  };
+
+  const handleMediaDrop = (ev: DragEvent) => {
+    const files = Array.from(ev.dataTransfer?.files ?? []);
+    const file = files.find((f) => mediaKindForFile(f)) ?? null;
+    if (!file) return false;
+    if (store.mode === "live") return true;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const clientX = ev.clientX;
+    const clientY = ev.clientY;
+    const kind = mediaKindForFile(file);
+    if (!kind) return false;
+    void (async () => {
+      if (kind === "html") {
+        const html = await file.text();
+        const src = `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+        createHtmlFrameNodeAtClientPoint(clientX, clientY, { src, filename: file.name, aspect: 16 / 9, html });
+        return;
+      }
+      const uploaded = await uploadMediaFile(file);
+      if (kind === "image") {
+        const aspect = await loadImageAspect(uploaded.src);
+        createImageNodeAtClientPoint(clientX, clientY, { src: uploaded.src, filename: uploaded.filename, aspect });
+      } else if (kind === "video") {
+        const aspect = await loadVideoAspect(uploaded.src);
+        createVideoNodeAtClientPoint(clientX, clientY, { src: uploaded.src, filename: uploaded.filename, aspect });
+      }
+    })();
+    return true;
+  };
+
   const onDragOver = (ev: DragEvent) => {
     if (!ev.dataTransfer?.files?.length) return;
+    if (!Array.from(ev.dataTransfer.files).some((f) => mediaKindForFile(f))) return;
     if (store.mode === "live") return;
     ev.preventDefault();
     ev.dataTransfer.dropEffect = "copy";
@@ -2257,28 +2688,26 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
 
   const onDrop = (ev: DragEvent) => {
     if (!ev.dataTransfer?.files?.length) return;
+    handleMediaDrop(ev);
+  };
+
+  const onWindowDragOver = (ev: DragEvent) => {
+    if (!ev.dataTransfer?.files?.length) return;
+    if (!Array.from(ev.dataTransfer.files).some((f) => mediaKindForFile(f))) return;
     if (store.mode === "live") return;
     ev.preventDefault();
-    const files = Array.from(ev.dataTransfer.files).filter((f) => (f.type || "").startsWith("image/"));
-    if (!files.length) return;
-    const clientX = ev.clientX;
-    const clientY = ev.clientY;
-    const file = files[0]!;
-    void (async () => {
-      const uploaded = await uploadImageFile(file);
-      const img = new Image();
-      img.decoding = "async";
-      img.src = uploaded.src;
-      const aspect = await new Promise<number>((resolve) => {
-        img.onload = () => resolve(img.naturalWidth / Math.max(1, img.naturalHeight));
-        img.onerror = () => resolve(1);
-      });
-      createImageNodeAtClientPoint(clientX, clientY, { src: uploaded.src, filename: uploaded.filename, aspect });
-    })();
+    ev.stopPropagation();
+    ev.dataTransfer.dropEffect = "copy";
+  };
+
+  const onWindowDrop = (ev: DragEvent) => {
+    if (!ev.dataTransfer?.files?.length) return;
+    if (!handleMediaDrop(ev)) return;
   };
 
   const onWheel = (ev: WheelEvent) => {
-    if (activeTextEditor) return;
+    if (store.mode === "live") return;
+    if (activeTextEditor || activeButtonsEditor) return;
     lastClient = { x: ev.clientX, y: ev.clientY };
     // Zoom with wheel (trackpad/mouse). Prevent page scroll.
     ev.preventDefault();
@@ -2288,15 +2717,16 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const sx = ev.clientX - r.left;
     const sy = ev.clientY - r.top;
     // World under cursor before zoom
-    const wx = (sx - screen.w / 2) / actualCam.zoom + actualCam.cx;
-    const wy = (sy - screen.h / 2) / actualCam.zoom + actualCam.cy;
+    const cursorWorld = screenToWorld({ x: sx, y: sy }, actualCam, screen);
+    const cursorRel = screenToWorld({ x: sx, y: sy }, { cx: 0, cy: 0, zoom: 1 }, screen);
     const scale = Math.exp(-ev.deltaY * 0.0012);
     // No practical max-zoom; allow extreme zooming. Rendering already clamps text to >= 1px.
-    const nextActualZoom = Math.max(1e-4, Math.min(1e4, actualCam.zoom * scale));
+    const minZoom = 50 / Math.max(1e-9, screen.w);
+    const nextActualZoom = Math.max(minZoom, Math.min(1e4, actualCam.zoom * scale));
     // Adjust camera center so (wx,wy) stays under cursor
     store.cameraOverride = {
-      cx: wx - (sx - screen.w / 2) / nextActualZoom,
-      cy: wy - (sy - screen.h / 2) / nextActualZoom,
+      cx: cursorWorld.x - cursorRel.x / nextActualZoom,
+      cy: cursorWorld.y - cursorRel.y / nextActualZoom,
       zoom: nextActualZoom,
     };
   };
@@ -2304,9 +2734,16 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   function closeTextEditor(opts?: { commit?: boolean }) {
     const ed = activeTextEditor;
     if (!ed) return;
+    if ((ed.el.dataset as any).closing === "1") return;
     const node: any = store.model.nodes.find((n) => n.id === ed.nodeId);
     if (node && node.type === "text") {
-      node.text = opts?.commit ? ed.el.value : ed.prevText;
+      const next = opts?.commit ? ed.el.value : ed.prevText;
+      node.template = next;
+      node.text = next;
+      (node as any).align = opts?.commit ? ed.currentAlign : editorStartAlignForNode(ed.startSnapshot, ed.nodeId);
+      if (opts?.commit && String((node as any).pressureRole ?? "") === "peak") {
+        (node as any).__manualText = true;
+      }
     }
     if (node && node.type === "bullets") {
       const rawValue = opts?.commit ? ed.el.value : ed.prevText;
@@ -2315,52 +2752,215 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       if (nextSpec) node.bullets = nextSpec;
       node.rawText = parsed.rawText;
       node.items = parsed.items;
+      node.template = rawValue;
+      (node as any).align = opts?.commit ? ed.currentAlign : editorStartAlignForNode(ed.startSnapshot, ed.nodeId);
     }
-    if (opts?.commit && ed.el.value !== ed.prevText) pushUndo(ed.startSnapshot);
-    if (opts?.commit && node && node.type === "text") {
-      const persistViewId = node.space === "screen" ? "screen_main" : store.activeViewId;
-      void persistText({
-        id: String(node.id),
-        viewId: persistViewId,
-        text: String(node.text ?? ""),
-        doc: docForNode(node),
-        space: node.space,
-        align: normalizeAlign((node as any).align),
-      });
-    }
-    if (opts?.commit && node && node.type === "bullets") {
-      const persistViewId = node.space === "screen" ? "screen_main" : store.activeViewId;
-      void persistBullets({
-        id: String(node.id),
-        viewId: persistViewId,
-        text: String(node.rawText ?? ""),
-        bullets: String(node.bullets ?? ""),
-        doc: docForNode(node),
-        space: node.space,
-        align: normalizeAlign((node as any).align),
-      });
-    }
+    const alignChanged = ed.currentAlign !== editorStartAlignForNode(ed.startSnapshot, ed.nodeId);
+    if (opts?.commit && (ed.el.value !== ed.prevText || alignChanged)) pushUndo(ed.startSnapshot);
     const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(ed.nodeId)}"]`);
-    if (nodeEl) delete (nodeEl.dataset as any).editing;
-    // Make close idempotent and avoid re-entrant remove() during blur.
-    activeTextEditor = null;
+    const el = ed.el;
+    const removeEditorChromeNow = () => {
+      try {
+        if (el.isConnected) el.remove();
+      } catch (e) {
+        console.error("[next][textEdit] failed to remove textarea", e);
+      }
+      ed.errEl.remove();
+      ed.alignEl.remove();
+    };
+    const finalizeClose = () => {
+      activeTextEditor = null;
+      if (nodeEl) delete (nodeEl.dataset as any).editing;
+      if (node) {
+        if ((node as any).__manualResize) delete (node as any).__manualResize;
+      }
+      updateHandles();
+    };
+    const persistCommittedState = () => {
+      if (!opts?.commit || !node) return;
+      const groupId = node.groupId ? String(node.groupId) : null;
+      const persistViewId = persistViewIdForNode(node, store.activeViewId);
+      if (node.type === "text") {
+        void persistText({
+          id: String(node.id),
+          viewId: persistViewId,
+          text: String(node.text ?? ""),
+          doc: docForNode(node),
+          space: groupId ? "group" : node.space,
+          align: normalizeAlign((node as any).align),
+          ...bgPayload(node),
+          groupId,
+        });
+      } else if (node.type === "bullets") {
+        void persistBullets({
+          id: String(node.id),
+          viewId: persistViewId,
+          text: String(node.rawText ?? ""),
+          bullets: String(node.bullets ?? ""),
+          doc: docForNode(node),
+          space: groupId ? "group" : node.space,
+          align: normalizeAlign((node as any).align),
+          ...bgPayload(node),
+          groupId,
+        });
+      }
+      if (node.type === "text" || node.type === "bullets") {
+        void persistGeometry({
+          id: String(node.id),
+          viewId: persistViewId,
+          transform: normalizeTransformForPersist(store, node.transform, persistViewId, node.space, groupId),
+          fontPx: (node as any).fontPx,
+          doc: docForNode(node),
+          space: groupId ? "group" : node.space,
+          groupId,
+        });
+      }
+    };
+    (el.dataset as any).closing = "1";
+    removeEditorChromeNow();
+    if (opts?.commit && node && (node.type === "text" || node.type === "bullets")) {
+      requestAnimationFrame(() => {
+        persistCommittedState();
+        finalizeClose();
+      });
+      return;
+    }
+    finalizeClose();
+  }
+
+  function closeButtonsEditor(opts?: { commit?: boolean }) {
+    const ed = activeButtonsEditor;
+    if (!ed) return;
+    const node: any = store.model.nodes.find((n) => n.id === ed.nodeId);
+    if (node && node.type === "buttons") {
+      const rawValue = opts?.commit ? ed.el.value : ed.prevText;
+      const labels: string[] = [];
+      const actions: string[] = [];
+      for (const line of String(rawValue).split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const idx = trimmed.indexOf(":");
+        const label = (idx >= 0 ? trimmed.slice(0, idx) : trimmed).trim();
+        const action = (idx >= 0 ? trimmed.slice(idx + 1) : "").trim();
+        labels.push(label);
+        actions.push(action);
+      }
+      node.templates = labels;
+      node.labels = labels;
+      node.actions = actions;
+      if (opts?.commit && ed.el.value !== ed.prevText) {
+        pushUndo(ed.startSnapshot);
+        const groupId = node.groupId ? String(node.groupId) : null;
+        const persistViewId = persistViewIdForNode(node, store.activeViewId);
+        void persistButtons({
+          id: String(node.id),
+          viewId: persistViewId,
+          labels,
+          actions,
+          buttonsMode: (node as any).buttonsMode,
+          hSplits: node.hSplits,
+          vSplits: node.vSplits,
+          rows: node.rows,
+          cols: node.cols,
+          doc: docForNode(node),
+          space: groupId ? "group" : node.space,
+          groupId,
+        });
+      }
+    }
+    activeButtonsEditor = null;
     const el = ed.el;
     (el.dataset as any).closing = "1";
     requestAnimationFrame(() => {
       try {
         if (el.isConnected) el.remove();
       } catch (e) {
-        console.error("[next][textEdit] failed to remove textarea", e);
+        console.error("[next][buttonsEdit] failed to remove textarea", e);
       }
     });
-    ed.errEl.remove();
-    ed.alignEl.remove();
     updateHandles();
   }
+
+  function openButtonsEditorForNode(nodeId: string, attempt = 0) {
+    const node: any = store.model.nodes.find((n) => n.id === nodeId);
+    if (!node || node.type !== "buttons") return;
+    if (activeTableEditor) closeTableEditor();
+    if (activeTextEditor) closeTextEditor({ commit: true });
+    if (activeButtonsEditor) closeButtonsEditor({ commit: true });
+
+    const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(nodeId)}"]`);
+    if (!nodeEl) {
+      if (attempt < 6) {
+        requestAnimationFrame(() => openButtonsEditorForNode(nodeId, attempt + 1));
+        return;
+      }
+      throw new Error(`[next] missing node element for buttons edit: ${nodeId}`);
+    }
+
+    const labels = Array.isArray(node.templates) ? node.templates : Array.isArray(node.labels) ? node.labels : [];
+    const actions = Array.isArray(node.actions) ? node.actions : [];
+    const rows: string[] = [];
+    const count = Math.max(labels.length, actions.length);
+    for (let i = 0; i < count; i += 1) {
+      const label = labels[i] ?? "";
+      const action = actions[i] ?? "";
+      rows.push(`${label}:${action}`);
+    }
+    const ta = document.createElement("textarea");
+    ta.className = "text-editor";
+    ta.value = rows.join("\n");
+    ta.spellcheck = false;
+    ta.wrap = "soft";
+    ta.rows = Math.max(2, rows.length + 1);
+    ta.style.position = "absolute";
+    ta.style.zIndex = "2000";
+    overlay.appendChild(ta);
+    activeButtonsEditor = {
+      nodeId,
+      el: ta,
+      prevText: ta.value,
+      startSnapshot: snapshotNow(),
+    };
+    relayoutActiveButtonsEditor();
+    ta.addEventListener("input", () => relayoutActiveButtonsEditor());
+    ta.addEventListener("blur", () => closeButtonsEditor({ commit: true }), { once: true });
+    ta.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        closeButtonsEditor({ commit: false });
+      }
+    });
+    requestAnimationFrame(() => {
+      ta.focus();
+      ta.setSelectionRange(0, ta.value.length);
+    });
+  }
+
+  const parseTableCandidate = (value: string) => {
+    const lines = String(value ?? "")
+      .split("\n")
+      .map((line) => line.trim());
+    const dataLines = lines.filter((line) => line && !line.startsWith("#"));
+    if (!dataLines.length) return null;
+    const semicolonCounts = dataLines.map((line) => (line.match(/;/g) || []).length);
+    const totalSemis = semicolonCounts.reduce((sum, count) => sum + count, 0);
+    const linesWithSemis = dataLines.filter((line) => line.includes(";")).length;
+    if (totalSemis < 2 && !(linesWithSemis >= 1 && dataLines.length >= 2)) return null;
+    const rows = dataLines.map((line) => line.split(";").map((cell) => cell.trim()));
+    const cols = rows.reduce((max, row) => Math.max(max, row.length), 0);
+    if (cols < 2) return null;
+    const cells = rows.map((row) => {
+      const padded = row.slice();
+      while (padded.length < cols) padded.push("");
+      return padded;
+    });
+    return { rows: cells.length, cols, cells };
+  };
 
   function openTextEditorForNode(nodeId: string, opts?: { selectAll?: boolean }, attempt = 0) {
     const node: any = store.model.nodes.find((n) => n.id === nodeId);
     if (!node || (node.type !== "text" && node.type !== "bullets")) return;
+    if (activeTableEditor) closeTableEditor();
     if (activeTextEditor) closeTextEditor({ commit: true });
 
     const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(nodeId)}"]`);
@@ -2380,11 +2980,12 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const ta = document.createElement("textarea");
     ta.className = "text-editor";
     if (node.type === "bullets") {
-      const items = Array.isArray(node.items) ? node.items : parseBulletEditorValue(String(node.rawText ?? "")).items;
+      const templateRaw = String((node as any).template ?? node.rawText ?? "");
+      const items = Array.isArray(node.items) ? node.items : parseBulletEditorValue(templateRaw).items;
       const spec = String(node.bullets ?? "1.");
       ta.value = renderBulletEditorValue(items, spec);
     } else {
-      ta.value = String(node.text ?? "");
+      ta.value = String((node as any).template ?? node.text ?? "");
     }
     ta.spellcheck = false;
     ta.wrap = "soft";
@@ -2430,11 +3031,14 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       btn.addEventListener("pointerdown", (e) => {
         e.preventDefault();
         e.stopPropagation();
-      });
-      btn.addEventListener("click", (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        applyNodeAlign(nodeId, key);
+        applyNodeAlign(store, nodeId, key, {
+          activeEditor: activeTextEditor,
+          persistViewIdForNode,
+          docForNode,
+          bgPayload,
+          persistText,
+          persistBullets,
+        });
         ta.focus();
       });
       return btn;
@@ -2455,6 +3059,7 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       alignEl,
       alignDots,
       prevText: ta.value,
+      currentAlign: align,
       everEntered: false,
       startSnapshot: snapshotNow(),
     };
@@ -2502,31 +3107,107 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       const n: any = store.model.nodes.find((x) => x.id === nodeId);
       if (!n) return;
       if (n.type === "text") {
-        n.text = ta.value; // live preview as you type
-        const firstLine = String(ta.value ?? "").split("\n")[0] ?? "";
-        const bulletSpec = bulletSpecForLine(firstLine);
-        if (bulletSpec) {
-          const parsed = parseBulletEditorValue(String(ta.value ?? ""));
-          n.type = "bullets";
-          n.bullets = mergeBulletSpec(undefined, parsed.spec ?? bulletSpec) || bulletSpec;
-          n.rawText = parsed.rawText;
-          n.items = parsed.items;
-          ta.value = renderBulletEditorValue(parsed.items, n.bullets || "1.");
-          ta.setSelectionRange(ta.value.length, ta.value.length);
+        const tableCandidate = parseTableCandidate(ta.value);
+        if (tableCandidate) {
+          const snapshot = activeTextEditor?.startSnapshot ?? snapshotNow();
+          pushUndo(snapshot);
+          n.type = "table";
+          n.cells = tableCandidate.cells;
+          n.rows = tableCandidate.rows;
+          n.cols = tableCandidate.cols;
+          n.editable = true;
+          delete n.text;
+          delete n.template;
+          delete n.rawText;
+          delete n.items;
+          delete n.bullets;
+          const groupId = n.groupId ? String(n.groupId) : null;
+          const doc = docForNode(n);
+          const persistViewId = persistViewIdForNode(n, store.activeViewId);
+          void (async () => {
+            await persistDelete({ ids: [String(n.id)], doc, groupId });
+            await persistGeometry({
+              id: String(n.id),
+              viewId: persistViewId,
+              transform: n.transform,
+              fontPx: (n as any).fontPx,
+              doc,
+              space: groupId ? "group" : n.space,
+              groupId,
+            });
+            await persistTable({
+              id: String(n.id),
+              viewId: persistViewId,
+              cells: tableCandidate.cells,
+              rows: tableCandidate.rows,
+              cols: tableCandidate.cols,
+              editable: true,
+              doc,
+              space: groupId ? "group" : n.space,
+              ...bgPayload(n),
+              groupId,
+            });
+          })();
+          closeTextEditor({ commit: false });
+          openTableEditorForNode(nodeId);
+          return;
         }
+        n.text = ta.value; // live preview as you type
       } else if (n.type === "bullets") {
-        const startRaw = mapCaretToRaw(ta.value, ta.selectionStart ?? 0);
-        const endRaw = mapCaretToRaw(ta.value, ta.selectionEnd ?? 0);
-        const parsed = parseBulletEditorValue(ta.value);
-        const nextSpec = mergeBulletSpec(n.bullets, parsed.spec);
-        if (nextSpec) n.bullets = nextSpec;
+        const startSel = ta.selectionStart ?? 0;
+        const endSel = ta.selectionEnd ?? 0;
+        // Keep bullet mode while editing markers; don't auto-convert to text.
+        const startRaw = mapCaretToRaw(ta.value, startSel);
+        const endRaw = mapCaretToRaw(ta.value, endSel);
+        const value = ta.value;
+        const lines = value.split("\n");
+        let lineIdx = 0;
+        let acc = 0;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i] ?? "";
+          const lineEnd = acc + line.length;
+          if (startSel <= lineEnd) {
+            lineIdx = i;
+            break;
+          }
+          acc = lineEnd + 1;
+        }
+        const line = lines[lineIdx] ?? "";
+        const content = line.replace(/^[\t ]+/, "");
+        const raw = stripBulletMarker(content);
+        const markerLen = content.length - raw.length;
+        const indentChars = line.length - content.length;
+        const caretInMarker = startSel <= acc + indentChars + markerLen;
+        const parsed = parseBulletEditorValue(value);
+        if (caretInMarker) {
+          const derivedSpec = updateBulletSpecFromLines(line, n.bullets);
+          if (derivedSpec) n.bullets = derivedSpec;
+          else n.bullets = ".";
+        } else if (!n.bullets && parsed.spec) {
+          n.bullets = parsed.spec;
+        }
         n.rawText = parsed.rawText;
         n.items = parsed.items;
+        const hasMarkers = value
+          .split("\n")
+          .some((line) => line.trim() && !isElementLine(line) && !!bulletMarkerForLine(line));
+        if (!hasMarkers) {
+          n.type = "text";
+          n.text = value;
+          delete n.rawText;
+          delete n.items;
+          delete n.bullets;
+          return;
+        }
         const display = renderBulletEditorValue(parsed.items, n.bullets || parsed.spec || "1.");
         if (display !== ta.value) {
           ta.value = display;
-          const nextStart = mapRawToCaret(display, startRaw);
-          const nextEnd = mapRawToCaret(display, endRaw);
+          let nextStart = mapRawToCaret(display, startRaw);
+          let nextEnd = mapRawToCaret(display, endRaw);
+          if (caretInMarker && markerLen > 0 && !bulletMarkerForLine(content)) {
+            nextStart = Math.max(0, nextStart - 1);
+            nextEnd = Math.max(0, nextEnd - 1);
+          }
           ta.setSelectionRange(nextStart, nextEnd);
         }
       }
@@ -2585,6 +3266,26 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       }
       if (e.key === "Enter") {
         const n: any = store.model.nodes.find((x) => x.id === nodeId);
+        if (n && n.type === "text") {
+          const value = ta.value;
+          const start = ta.selectionStart ?? 0;
+          const lineIdx = value.slice(0, start).split("\n").length - 1;
+          const current = (value.split("\n")[lineIdx] ?? "").trim();
+          const bulletSpec = bulletSpecForLine(current);
+          if (bulletSpec) {
+            e.preventDefault();
+            const parsed = parseBulletEditorValue(value);
+            n.type = "bullets";
+            const derivedSpec = updateBulletSpecFromLines(value, undefined);
+            n.bullets = mergeBulletSpec(undefined, derivedSpec ?? parsed.spec ?? bulletSpec) || bulletSpec;
+            n.rawText = parsed.rawText;
+            n.items = parsed.items;
+            ta.value = renderBulletEditorValue(parsed.items, n.bullets || "1.");
+            const nextStart = mapRawToCaret(ta.value, mapCaretToRaw(value, start));
+            ta.setSelectionRange(nextStart, nextStart);
+            // Now that we are bullets, fall through to insert the next marker.
+          }
+        }
         if (n && n.type === "bullets") {
           e.preventDefault();
           const value = ta.value;
@@ -2638,19 +3339,166 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     // No manual resize handle: width follows the node bbox while typing.
   }
 
+  function openTableEditorForNode(nodeId: string, opts?: { seed?: string }, attempt = 0) {
+    if (store.mode !== "live") return;
+    const node: any = store.model.nodes.find((n) => n.id === nodeId);
+    const allowPressureTable = node && String(node.pressureRole ?? "") === "table";
+    if (!node || node.type !== "table" || (node.editable === false && !allowPressureTable)) return;
+    if (activeTableEditor) closeTableEditor();
+    const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(nodeId)}"]`);
+    if (!nodeEl) {
+      if (attempt < 6) {
+        requestAnimationFrame(() => openTableEditorForNode(nodeId, opts, attempt + 1));
+        return;
+      }
+      throw new Error(`[next] missing node element for table edit: ${nodeId}`);
+    }
+    (nodeEl.dataset as any).editing = "1";
+    activeTableEditor = { nodeId, startSnapshot: snapshotNow() };
+    requestAnimationFrame(() => {
+      const cell = nodeEl.querySelector<HTMLElement>(".table-cell");
+      if (!cell) return;
+      if (opts?.seed) {
+        const existing = String(cell.textContent ?? "");
+        cell.textContent = existing ? `${existing}${opts.seed}` : opts.seed;
+        window.dispatchEvent(
+          new CustomEvent("ip-table-edit", {
+            detail: {
+              id: nodeId,
+              row: Number(cell.dataset.row ?? 1),
+              col: Number(cell.dataset.col ?? 1),
+              value: String(cell.textContent ?? ""),
+            },
+          })
+        );
+      }
+      cell.focus();
+    });
+  }
+
+  function closeTableEditor() {
+    if (!activeTableEditor) return;
+    const nodeId = activeTableEditor.nodeId;
+    const nodeEl = overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(nodeId)}"]`);
+    if (nodeEl) (nodeEl.dataset as any).editing = "0";
+    activeTableEditor = null;
+  }
+
   // Stage sizing relies on the stage element; overlay handles interaction.
   overlay.addEventListener("pointerenter", onOverlayPointerEnter);
   overlay.addEventListener("pointerleave", onOverlayPointerLeave);
   overlay.addEventListener("pointerdown", onPointerDown);
   overlay.addEventListener("pointermove", onPointerMove);
-  overlay.addEventListener("contextmenu", (e) => e.preventDefault());
+  overlay.addEventListener("contextmenu", (e) => {
+    if (store.mode === "live") {
+      clearSelection();
+      e.preventDefault();
+      return;
+    }
+    if (performance.now() - lastMarqueeSelectAt < 500) {
+      e.preventDefault();
+      return;
+    }
+    const rightHit = pickNodeNearClientPoint(e.clientX, e.clientY);
+    const selectedSet = new Set(store.selectedIds ?? []);
+    const clickedSelected = rightHit ? selectedSet.has(rightHit) || store.selectedId === rightHit : false;
+    if (!clickedSelected) {
+      clearSelection();
+      e.preventDefault();
+    }
+  });
   overlay.addEventListener("wheel", onWheel, { passive: false });
   overlay.addEventListener("dragover", onDragOver);
   overlay.addEventListener("drop", onDrop);
+  window.addEventListener("dragover", onWindowDragOver as any, { capture: true });
+  window.addEventListener("drop", onWindowDrop as any, { capture: true });
+  window.addEventListener("ip-table-edit", (ev: Event) => {
+    const detail = (ev as CustomEvent).detail as any;
+    const id = String(detail?.id ?? "");
+    const row = Number(detail?.row ?? 0);
+    const col = Number(detail?.col ?? 0);
+    const value = String(detail?.value ?? "");
+    if (!id || !row || !col) return;
+    const node: any = store.model.nodes.find((n) => String(n.id) === id);
+    if (!node || node.type !== "table") return;
+    applyTableCellUpdate(node, row, col, value);
+    const doc = docForNode(node);
+    const groupId = node.groupId ? String(node.groupId) : null;
+    const viewId = groupId ? "group" : node.space === "screen" ? "screen_main" : store.activeViewId;
+    if (store.mode !== "live") {
+      void persistTable({
+        id,
+        viewId,
+        cells: Array.isArray(node.cells) ? node.cells : [],
+        rows: Number(node.rows ?? undefined),
+        cols: Number(node.cols ?? undefined),
+        editable: Boolean(node.editable),
+        hHeader: Array.isArray(node.hHeader) ? node.hHeader : undefined,
+        vHeader: Array.isArray(node.vHeader) ? node.vHeader : undefined,
+        hStyle: Array.isArray(node.hStyle) ? node.hStyle : undefined,
+        color: node.color,
+        doc,
+        space: groupId ? "group" : node.space,
+        groupId,
+        ...bgPayload(node),
+      }).catch(() => {});
+    }
+    if (store.mode !== "live") {
+      void publishTableUpdate({ id, row, col, value }).catch(() => {});
+    }
+  });
+  window.addEventListener("ip-table-update", (ev: Event) => {
+    sessionRuntime.applyTableRuntimeUpdate((ev as CustomEvent).detail);
+  });
+  window.addEventListener("ip-node-patch", (ev: Event) => {
+    sessionRuntime.applyNodePatch((ev as CustomEvent).detail);
+  });
+  const onPaste = async (ev: ClipboardEvent) => {
+    const target = ev.target as HTMLElement | null;
+    const tableCell = target?.closest?.(".table-cell");
+    const tableNode = tableCell?.closest?.(".node") as HTMLElement | null;
+    const tableEditing = tableNode?.dataset?.nodeType === "table" && tableNode.dataset.editing === "1";
+    if (activeTextEditor || activeButtonsEditor || activeTableEditor || target?.closest?.(".text-editor") || (tableCell && tableEditing)) return;
+    const items = Array.from(ev.clipboardData?.items ?? []);
+    const imageItem = items.find((item) => item.type.startsWith("image/"));
+    const text = (ev.clipboardData?.getData("text/plain") ?? "").trim();
+    const r = stage.getBoundingClientRect();
+    const cx = lastClient?.x ?? r.left + r.width / 2;
+    const cy = lastClient?.y ?? r.top + r.height / 2;
+    if (imageItem) {
+      const file = imageItem.getAsFile();
+      if (!file) return;
+      ev.preventDefault();
+      try {
+        const uploaded = await uploadImageFile(file);
+        const aspect = await loadImageAspect(uploaded.src);
+        pushUndo(snapshotNow());
+        createImageNodeAtClientPoint(cx, cy, { src: uploaded.src, filename: uploaded.filename, aspect });
+      } catch (err) {
+        console.error("[next][paste] failed to paste image", err);
+      }
+      return;
+    }
+    if (text) {
+      ev.preventDefault();
+      pushUndo(snapshotNow());
+      const id = createTextNodeAtClientPoint(cx, cy, text);
+      pendingTextEdit = { nodeId: id };
+      openTextEditorForNode(id, { selectAll: false });
+      return;
+    }
+    if (internalClipboard) {
+      ev.preventDefault();
+      pasteInternalAtClientPoint(cx, cy);
+    }
+  };
   const onKeyDown = (ev: KeyboardEvent) => {
     // If focus is inside the textarea editor, NEVER treat Space as pan etc.
     const target = ev.target as HTMLElement | null;
-    if (activeTextEditor || target?.closest?.(".text-editor")) return;
+    const tableCell = target?.closest?.(".table-cell");
+    const tableNode = tableCell?.closest?.(".node") as HTMLElement | null;
+    const tableEditing = tableNode?.dataset?.nodeType === "table" && tableNode.dataset.editing === "1";
+    if (activeTextEditor || activeButtonsEditor || activeTableEditor || target?.closest?.(".text-editor") || (tableCell && tableEditing)) return;
 
     // If we're in the short window after type-to-create but before the textarea is mounted,
     // keep routing keys into that new text node (including Space/Backspace).
@@ -2673,7 +3521,36 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       }
     }
 
+    const modSelectAll = ev.ctrlKey || ev.metaKey;
+    if (modSelectAll && (ev.key === "a" || ev.code === "KeyA")) {
+      ev.preventDefault();
+      const view = activeViewRef();
+      const screenId = (view as any).screenId ?? "screen_main";
+      const viewId = view.id;
+      const ids = store.model.nodes
+        .filter((n: any) => isNodeInActiveGroup(n))
+        .filter((n: any) => (store.mode === "live" ? n.layer === "live" : n.layer !== "live"))
+        .filter((n: any) => {
+          if (store.mode === "screen-edit") {
+            return n.space === "screen" && String(n.screenId ?? "screen_main") === String(screenId);
+          }
+          if (n.space === "screen") {
+            return String(n.screenId ?? "screen_main") === String(screenId);
+          }
+          return isNodeForView(n, viewId, screenId);
+        })
+        .map((n: any) => String(n.id));
+      store.selectedIds = ids;
+      store.selectedId = ids[0] ?? null;
+      return;
+    }
+
     if (store.mode === "live") {
+      if (ev.key === "Delete" || ev.key === "Backspace") {
+        ev.preventDefault();
+        deleteSelectedNodes();
+        return;
+      }
       const v = activeView(store);
       const now = performance.now();
       if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
@@ -2692,6 +3569,9 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
         const cues = viewCues(v.id);
         if (!cues.length) return;
         const idx = liveCueIndexByView.get(v.id) ?? 0;
+        if (queueLiveActionAfterReset(ev.key === "ArrowRight" ? "cue-forward" : "cue-back", idx, now)) {
+          return;
+        }
         if (ev.key === "ArrowRight") {
           if (idx >= cues.length) return;
           const batch = runCueBatch(cues, idx, now);
@@ -2710,7 +3590,36 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
         }
         return;
       }
-      return;
+      // Type-to-create notes in live mode.
+      if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.repeat) {
+        const ch = ev.key;
+        if (ch.length === 1 && ch !== " " && ch !== "\t") {
+          const pt = lastClient;
+          const r = stage.getBoundingClientRect();
+          const cx = pt?.x ?? r.left + r.width / 2;
+          const cy = pt?.y ?? r.top + r.height / 2;
+          pushUndo(snapshotNow());
+          const id = createTextNodeAtClientPoint(cx, cy, ch);
+          pendingTextEdit = { nodeId: id };
+          openTextEditorForNode(id, { selectAll: false });
+          ev.preventDefault();
+          return;
+        }
+      }
+      if (!ev.ctrlKey && !ev.metaKey) return;
+    }
+
+    // Type-to-edit: typing while a table is selected opens inline table editing.
+    if (!ev.ctrlKey && !ev.metaKey && !ev.altKey && !ev.repeat) {
+      const selected = store.selectedId
+        ? (store.model.nodes.find((n: any) => String(n.id) === String(store.selectedId)) as any)
+        : null;
+      const ch = ev.key;
+      if (selected?.type === "table" && ch.length === 1 && ch !== " " && ch !== "\t") {
+        openTableEditorForNode(String(selected.id), { seed: ch });
+        ev.preventDefault();
+        return;
+      }
     }
 
     // Type-to-create: typing starts a new text field at the cursor.
@@ -2735,17 +3644,8 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const mod = ev.ctrlKey || ev.metaKey;
     // Delete selected nodes (when not editing text).
     if (!mod && (ev.key === "Delete" || ev.key === "Backspace")) {
-      if ((store.selectedIds?.length ?? 0) > 0) {
-        ev.preventDefault();
-        pushUndo(snapshotNow());
-        const sel = Array.from(new Set(store.selectedIds.map(String)));
-        const by = groupIdsByDoc(sel);
-        if (by.presentation.length) void persistDelete({ ids: by.presentation, doc: "presentation" });
-        if (by.notes.length) void persistDelete({ ids: by.notes, doc: "notes" });
-        const selSet = new Set(sel);
-        store.model.nodes = store.model.nodes.filter((n: any) => !selSet.has(String(n.id)));
-        clearSelection();
-      }
+      ev.preventDefault();
+      deleteSelectedNodes();
       return;
     }
     if (!mod) return;
@@ -2755,25 +3655,45 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const isUndoKey = k === "z" || code === "KeyZ";
     const isRedoKey = k === "y" || code === "KeyY";
 
+    if (k === "g" || code === "KeyG") {
+      ev.preventDefault();
+      if (canUngroupSelected()) {
+        ungroupSelectedGroup();
+      } else if ((store.selectedIds?.length ?? 0) > 1) {
+        createGroupFromSelection();
+      }
+      return;
+    }
+
     // Undo / redo
     if (isUndoKey && !ev.shiftKey) {
       ev.preventDefault();
       const snap = undoStack.pop();
       if (!snap) return;
-      const prevIds = new Set((store.model.nodes ?? []).map((n: any) => String(n?.id ?? "")));
+      const prevMeta = new Map(
+        (store.model.nodes ?? []).map((n: any) => [
+          String(n?.id ?? ""),
+          { doc: docForNode(n), groupId: n?.groupId ? String(n.groupId) : null },
+        ])
+      );
       redoStack.push(snapshotNow());
       restoreSnapshot(snap);
-      persistModelToFiles(prevIds);
+      persistModelToFiles(prevMeta);
       return;
     }
     if (isRedoKey || (isUndoKey && ev.shiftKey)) {
       ev.preventDefault();
       const snap = redoStack.pop();
       if (!snap) return;
-      const prevIds = new Set((store.model.nodes ?? []).map((n: any) => String(n?.id ?? "")));
+      const prevMeta = new Map(
+        (store.model.nodes ?? []).map((n: any) => [
+          String(n?.id ?? ""),
+          { doc: docForNode(n), groupId: n?.groupId ? String(n.groupId) : null },
+        ])
+      );
       undoStack.push(snapshotNow());
       restoreSnapshot(snap);
-      persistModelToFiles(prevIds);
+      persistModelToFiles(prevMeta);
       return;
     }
 
@@ -2787,16 +3707,24 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       const primaryId = selectedId && ids.includes(selectedId) ? selectedId : ids[0]!;
       const primary = store.model.nodes.find((n) => n.id === primaryId) as any;
       if (!primary) return;
-      const px = Number(primary.transform?.x) || 0;
-      const py = Number(primary.transform?.y) || 0;
+    const anchorForNode = (n: any) => {
+      if (n?.type === "arrow") {
+        const start = n.start ?? { x: 0, y: 0 };
+        const end = n.end ?? { x: 0, y: 0 };
+        return { x: (Number(start.x) + Number(end.x)) / 2, y: (Number(start.y) + Number(end.y)) / 2 };
+      }
+      return { x: Number(n?.transform?.x) || 0, y: Number(n?.transform?.y) || 0 };
+    };
+    const primaryAnchor = anchorForNode(primary);
+    const px = primaryAnchor.x;
+    const py = primaryAnchor.y;
 
       const nodes: ClipboardNode[] = ids
         .map((id) => store.model.nodes.find((n) => n.id === id) as any)
         .filter((n) => !!n)
         .map((n) => {
-          const cx = Number(n.transform?.x) || 0;
-          const cy = Number(n.transform?.y) || 0;
-          return { node: cloneModel(n), relAnchor: { dx: cx - px, dy: cy - py } };
+          const anchor = anchorForNode(n);
+          return { node: cloneModel(n), relAnchor: { dx: anchor.x - px, dy: anchor.y - py } };
         });
       internalClipboard = { nodes, primaryType: String(primary.type ?? "n") };
       // Reset paste nudge tracking when making a new copy.
@@ -2804,96 +3732,43 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
       pasteNudgeSteps = 0;
       if (k === "x") {
         pushUndo(snapshotNow());
-        const by = groupIdsByDoc(ids.map(String));
-        if (by.presentation.length) void persistDelete({ ids: by.presentation, doc: "presentation" });
-        if (by.notes.length) void persistDelete({ ids: by.notes, doc: "notes" });
-        store.model.nodes = store.model.nodes.filter((n) => !ids.includes(String((n as any).id)));
+        const expanded = new Set(ids.map(String));
+        for (const id of ids) {
+          const node = store.model.nodes.find((n: any) => String(n.id) === String(id)) as any;
+          if (node?.type === "group") {
+            for (const child of groupChildren(node.id)) {
+              expanded.add(String(child.id));
+            }
+          }
+        }
+        const deletesByDoc: Record<"presentation" | "notes", { root: string[]; groups: Map<string, string[]> }> = {
+          presentation: { root: [], groups: new Map() },
+          notes: { root: [], groups: new Map() },
+        };
+        for (const id of expanded) {
+          const node = store.model.nodes.find((n: any) => String(n.id) === String(id)) as any;
+          if (!node) continue;
+          const doc = docForNode(node);
+          const gid = node.groupId ? String(node.groupId) : null;
+          if (gid) {
+            if (!deletesByDoc[doc].groups.has(gid)) deletesByDoc[doc].groups.set(gid, []);
+            deletesByDoc[doc].groups.get(gid)!.push(String(id));
+          } else {
+            deletesByDoc[doc].root.push(String(id));
+          }
+        }
+        for (const doc of ["presentation", "notes"] as const) {
+          if (deletesByDoc[doc].root.length) void persistDelete({ ids: deletesByDoc[doc].root, doc });
+          for (const [gid, delIds] of deletesByDoc[doc].groups.entries()) {
+            if (delIds.length) void persistDelete({ ids: delIds, doc, groupId: gid });
+          }
+        }
+        store.model.nodes = store.model.nodes.filter((n) => !expanded.has(String((n as any).id)));
         clearSelection();
       }
       return;
     }
 
-    // Paste
-    if (k === "v") {
-      if (!internalClipboard) return;
-      ev.preventDefault();
-      pushUndo(snapshotNow());
-      const cam = cameraForScreen();
-      const r = stage.getBoundingClientRect();
-      const cx = lastClient?.x ?? r.left + r.width / 2;
-      const cy = lastClient?.y ?? r.top + r.height / 2;
-
-      // If you keep pasting without moving the mouse, nudge by +50px,+50px each time to separate.
-      if (lastPasteClient && Math.abs(cx - lastPasteClient.x) < 0.5 && Math.abs(cy - lastPasteClient.y) < 0.5) {
-        pasteNudgeSteps += 1;
-      } else {
-        pasteNudgeSteps = 0;
-      }
-      lastPasteClient = { x: cx, y: cy };
-      const nudgePx = 50 * pasteNudgeSteps;
-      const nudgeWorldX = nudgePx / cam.zoom;
-      const nudgeWorldY = nudgePx / cam.zoom;
-
-      // Place primary anchor exactly at mouse cursor (plus optional repeated-paste nudge).
-      const screen = { w: r.width, h: r.height };
-      const cursorRel = {
-        x: (cx - r.left) / Math.max(1e-9, screen.w),
-        y: 1 - (cy - r.top) / Math.max(1e-9, screen.h),
-      };
-      const cursorWorld = screenToWorld({ x: cx - r.left, y: cy - r.top }, cam, screen);
-
-      const newIds: string[] = [];
-      for (const item of internalClipboard.nodes) {
-        const n: any = cloneModel(item.node);
-        n.id = newId(String(n.type ?? internalClipboard.primaryType ?? "n"));
-        if (n.transform) {
-          if (n.space === "screen") {
-            n.transform.x = cursorRel.x + nudgePx / Math.max(1e-9, screen.w) + item.relAnchor.dx;
-            // downwards nudge should reduce y in bottom-left coords
-            n.transform.y = cursorRel.y - nudgePx / Math.max(1e-9, screen.h) + item.relAnchor.dy;
-          } else {
-            n.transform.x = cursorWorld.x + nudgeWorldX + item.relAnchor.dx;
-            n.transform.y = cursorWorld.y + nudgeWorldY + item.relAnchor.dy;
-          }
-        }
-        store.model.nodes.push(n);
-        newIds.push(n.id);
-        // Persist paste as creation (text + geometry)
-        const doc = docForNode(n);
-        const persistViewId = n.space === "screen" ? "screen_main" : store.activeViewId;
-        if (n.type === "text") {
-          void persistText({
-            id: String(n.id),
-            viewId: persistViewId,
-            text: String(n.text ?? ""),
-            doc,
-            space: n.space,
-            align: normalizeAlign((n as any).align),
-          });
-        }
-        if (n.type === "bullets") {
-          void persistBullets({
-            id: String(n.id),
-            viewId: persistViewId,
-            text: String(n.rawText ?? ""),
-            bullets: String(n.bullets ?? ""),
-            doc,
-            space: n.space,
-            align: normalizeAlign((n as any).align),
-          });
-        }
-        void persistGeometry({
-          id: String(n.id),
-          viewId: persistViewId,
-          transform: normalizeTransformForPersist(store, n.transform, persistViewId, n.space),
-          fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : undefined,
-          doc,
-          space: n.space,
-        });
-      }
-      setMultiSelection(newIds, newIds[0] ?? null);
-      return;
-    }
   };
   const onKeyUp = (ev: KeyboardEvent) => {
     void ev;
@@ -2902,12 +3777,32 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
   window.addEventListener("pointermove", onWindowPointerMove, { capture: true, passive: true });
   window.addEventListener("keydown", onKeyDown, { capture: true });
   window.addEventListener("keyup", onKeyUp, { capture: true });
+  window.addEventListener("paste", onPaste, { capture: true });
   // Frame hook: call this once per render frame (after renderScene) so any DOM size
   // changes are already applied, avoiding "floating" editor/handles.
   const frame = () => {
+    if (store.cameraOverride && store.mode !== "live") {
+      const z = Number(store.cameraOverride.zoom);
+      if (!Number.isFinite(z) || z <= 0) {
+        store.cameraOverride = null;
+        store.cameraTween = null;
+      }
+    }
     if (store.mode !== lastMode) {
       if (store.mode === "live") {
-        const currentCam = store.cameraOverride ?? activeViewRef().camera;
+        if (activeTextEditor) closeTextEditor({ commit: true });
+        if (activeButtonsEditor) closeButtonsEditor({ commit: true });
+        if (activeTableEditor) closeTableEditor();
+        clearSelection();
+        owner = null;
+        overlay.style.cursor = "";
+        marquee.style.display = "none";
+        if (preLiveViewId == null) {
+          preLiveViewId = store.activeViewId;
+          preLiveCameraOverride = store.cameraOverride ? { ...store.cameraOverride } : null;
+          preLiveCameraTween = store.cameraTween ? { ...store.cameraTween, segments: [...store.cameraTween.segments] } : null;
+        }
+        const currentCam = cameraForEdit();
         let best = store.model.views[0];
         let bestD2 = Number.POSITIVE_INFINITY;
         for (const v of store.model.views) {
@@ -2920,8 +3815,20 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
             best = v;
           }
         }
-        initLiveView(best?.id ?? store.activeViewId, false, true);
+        const liveViewId = best?.id ?? (store.activeViewId || store.model.views[0]?.id);
+        initLiveView(liveViewId, false, true);
       } else if (lastMode === "live") {
+        if (preLiveViewId != null) {
+          store.activeViewId = preLiveViewId;
+          persistActiveViewId(store);
+          store.cameraOverride = preLiveCameraOverride;
+          store.cameraTween = preLiveCameraTween;
+          store.transitionFromViewId = null;
+          store.transitionToViewId = null;
+          preLiveViewId = null;
+          preLiveCameraOverride = null;
+          preLiveCameraTween = null;
+        }
         for (const n of store.model.nodes as any[]) {
           n.visible = true;
           (n as any).__exitStartMs = null;
@@ -2949,8 +3856,38 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
         }
       }
     }
+    if (store.mode === "live" && pendingLiveAction) {
+      const now = performance.now();
+      if (now >= pendingLiveAction.runAtMs && store.activeViewId === pendingLiveAction.viewId) {
+        const v = activeView(store);
+        const cues = viewCues(v.id);
+        const idx = pendingLiveAction.index;
+        if (pendingLiveAction.kind === "cue-forward") {
+          if (idx < cues.length) {
+            const batch = runCueBatch(cues, idx, now);
+            liveCueIndexByView.set(v.id, batch.nextIdx);
+            if (batch.nextIdx < cues.length && cues[batch.nextIdx]!.when === "after") {
+              pendingAuto = { viewId: v.id, index: batch.nextIdx, runAtMs: now + batch.batchDuration };
+            } else {
+              pendingAuto = null;
+            }
+          }
+        } else {
+          if (idx > 0) {
+            let start = idx - 1;
+            while (start > 0 && cues[start]!.when === "same") start -= 1;
+            let end = start;
+            while (end + 1 < cues.length && cues[end + 1]!.when === "same") end += 1;
+            resetViewToCueIndex(cues, start);
+            liveCueIndexByView.set(v.id, start);
+          }
+        }
+        pendingLiveAction = null;
+      }
+    }
     updateHandles();
     relayoutActiveTextEditor();
+    relayoutActiveButtonsEditor();
   };
 
   const detach = () => {
@@ -2965,8 +3902,10 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     window.removeEventListener("pointermove", onWindowPointerMove as any, { capture: true } as any);
     window.removeEventListener("keydown", onKeyDown as any, { capture: true } as any);
     window.removeEventListener("keyup", onKeyUp as any, { capture: true } as any);
+    window.removeEventListener("paste", onPaste as any, { capture: true } as any);
+    window.removeEventListener("dragover", onWindowDragOver as any, { capture: true } as any);
+    window.removeEventListener("drop", onWindowDrop as any, { capture: true } as any);
     void stage;
   };
   return { frame, detach };
 }
-
