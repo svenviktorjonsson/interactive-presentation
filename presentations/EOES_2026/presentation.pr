@@ -1,0 +1,77 @@
+text[id=title_text, align=left]: NRM, 24 Jan 2026
+text[id=subtitle_text, align=left]: Presented by Viktor Jonsson
+image[id=logo_image, src=EOES_logo.png, bgColor=white, bgAlpha=0.7, bgPadding=10.0, bgRadius=10.0]
+
+view[id=join_view]:
+
+join[id=join_form, fields={Name, Email, Födelseår}]: Joina så kör vi!
+arrow[id=arrow_d8bccb97, color=red, strokePx=4.0]
+text[id=t_7c7f5379, align=left]: Jag
+image[id=1_baltazar_lab, src=1_baltazar_lab.jpg]
+
+text[id=t_4d55ee15, align=left]: Va en experimentalist!
+view[id=tesseracs, loc=right, ref=join_view]:
+image[id=gotland_image, src=2_gotland.png]
+
+view[id=view_3, loc=right, ref=tesseracs]:
+iframe[id=lines_iframe, src=3_lines.html]
+
+view[id=view_4, loc=right, ref=view_3]:
+image[id=landslaget_image, src=4_landslaget.JPG]
+
+view[id=view_5, loc=right, ref=view_4]:
+player[id=player_main, src=https://www.youtube.com/watch?v=JgJABtXhUiY, playLabel=Play, pauseLabel=Pause]
+
+view[id = view_6, loc=right, ref=view_5]:
+bullets[id=bullets_main, type = -]:
+
+
+view[id=timer_view, loc=bottom, ref=join_view]:
+
+timer[id=timer_main, barColor=orange, bins=20:0.5:40,
+color=green, durationS=10, lineColor=green, resetLabel=Reset,
+sampleMs=100, showTime=false, startLabel=Start, stat=gaussian,
+stopLabel=Stop, valueLabel={{elapsed:.2f}} s, xLabel=Time (s), yLabel=Progress]
+
+view[id=experiment_view, loc=right, ref=timer_view]:
+
+experiment[id=experiment_main, title=Experiment, rows=16, cols=4, hHeader={Blås (Hz), Höjd (mm), Plin (Hz), Massa (g)}, transforms={x, 1/x, 1/sqrt(x)}, fitLabel=y = {{a:.3f}}{{xPrime}} + {{b:.3f}}, fitButtonLabel=Fit, clearLabel=Clear fit]
+
+view[id=noether_view, loc=right, ref=experiment_view]:
+image[id=noether_image, src=noether.jpg]
+text[id=noether_years, align=left]: Emmy Noether (1882 - 1935)
+text[id=noether_principle, align=left]: Continuous symmetry Rightarrow conserved quantity
+
+view[id=taylor_view, loc=right, ref=noether_view]:
+image[id=taylor_image, src=brook_taylor.jpg]
+
+view[id=taylor_iframe_view, loc=right, ref=taylor_view]:
+iframe[id=taylor_iframe, src=taylor.html]
+
+view[id=pressure_view, loc=right, ref=taylor_iframe_view]:
+
+pressure[id=pressure_main, color=white, xLabel=Time (s),
+yLabel=Pressure, peakLabel=Peak t (s), lineWidth=1, pauseLabel=Pause, resumeLabel=Resume,
+runLabel=Run, sampleMs=2, windowS=30]
+
+view[id=diffraction_view, loc=right, ref=pressure_view]:
+bullets[id=diffraction_bullets, type=-, align=left]:
+- Fresnel diffraction (Huygens Fresnel principle)
+- Babinet's principle
+- I(\theta) = I_0 \left[\frac{\sin(\beta)}{\beta}\right]^2
+- \beta = \frac{\pi d \sin(\theta)}{\lambda}
+- d = \frac{\lambda L}{x}
+
+view[id=air_resistance_view, loc=right, ref=diffraction_view]:
+bullets[id=air_resistance_bullets, type=-, align=left]:
+- \frac{dv}{dt} = g - \alpha v^2 \quad \alpha = \frac{\rho C_d A}{2m}
+- v(t) = \sqrt{\frac{g}{\alpha}} \tanh\left(\sqrt{g\alpha}\,t\right), \quad h(t) = h_0 + \frac{1}{\alpha}\ln\left[\cosh\left(\sqrt{g\alpha}\,t\right)\right]
+- h(t) \approx h_0 + \frac{1}{2}gt^2 - \frac{\alpha g^2}{12}t^4
+- \alpha = \frac{6}{g t_2^4}\left(t_2^2 - t_1^2\right) = \frac{6}{g t_2^4}\left(\Delta t\right)\left(t_1 + t_2\right)
+- \rho = \frac{12 m_{\text{pp}}}{C_d A_{\text{pp}} g t_2^4}\left(t_2^2 - t_1^2\right) = \frac{12 m_{\text{pp}}}{C_d \pi r_{\text{pp}}^2 g t_2^4}\left(t_2^2 - t_1^2\right)
+- r_{\text{pp}} = 20\,\text{mm}, \quad r_{\text{m}} = 7.5\,\text{mm}, \quad \text{marble drag negligible} \Rightarrow t_1 \approx t_{\text{vac}}
+
+view[id=laser_view, loc=right, ref=air_resistance_view]:
+
+view[id=laser_camera_view, loc=right, ref=laser_view]:
+webcam[id=webcam_main, recLabel=Rec, shotLabel=Shot]

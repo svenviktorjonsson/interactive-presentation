@@ -1,0 +1,5 @@
+id,view,space,zIndex,x,y,w,h,rotationDeg,anchor,fontPx
+__screen_space__,screen_main,screen,0,0.5,0.5,1.0,1.0,1.0,centerCenter,
+experiment_main,experiment_view,world,11,0.5899280467720972,0.5494416308327812,0.7581803770262144,0.8009359926541809,0.0,centerCenter,
+spectrum_main,experiment_view,world,21,0.1505466059021411,0.5223084111362781,0.28550302002681494,0.7400581731879913,0.0,centerCenter,
+spectrum_main,sound_view,world,2,0.2546505692457919,0.5106670153833641,0.35,0.225,0.0,centerCenter,

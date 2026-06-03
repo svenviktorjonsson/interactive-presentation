@@ -1,0 +1,4 @@
+id,view,space,x,y,w,h,rotationDeg,anchor,fontPx
+__screen_space__,screen_main,screen,0.5,0.5,1.0,1.0,1.0,centerCenter,
+join_form,join_view,world,0.2,0.5,0.22,0.4,0.0,centerCenter,
+timer_main,join_view,world,0.6532684882515449,0.5062562088196172,0.5778132731674297,0.6681552769109058,0.0,centerCenter,

@@ -1,0 +1,7 @@
+view[id=join_view]:
+
+join[id=join_form, fields={Name, Email}]: Welcome
+timer[id=timer_main, barColor=orange, bins=0:0.5:5,
+color=green, durationS=10, lineColor=green, resetLabel=Reset,
+sampleMs=100, showTime=false, startLabel=Start, stat=gaussian,
+stopLabel=Stop, valueLabel={{elapsed:.2f}} s, xLabel=Time (s), yLabel=Progress]

@@ -533,7 +533,7 @@ export function renderSoundCompositeButtons(soundEl: HTMLElement, layer: HTMLEle
 
     const gH = Number(boxEl.style.height.replace("%", "")) / 100;
     const fontScale = Number(String(boxEl.dataset.fontScale ?? "1")) || 1;
-    const fontPx = Math.max(12, soundBox.height * Math.max(0.02, gH) * 0.55 * fontScale);
+    const fontPx = soundBox.height * gH * 0.55 * fontScale;
     if (grid) grid.style.fontSize = `${fontPx}px`;
     for (const btn of btns) (btn.style as any).fontSize = `${fontPx}px`;
 

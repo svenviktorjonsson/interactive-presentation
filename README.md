@@ -71,6 +71,12 @@ Some nodes can live in **screen space** (HUD overlays). To edit those without bu
 - Enter Screen Edit Mode (button in the UI)
 - Press **Escape** to exit Screen Edit Mode
 
+### Coordinate system
+All coordinates are **normalized** and **relative to their parent**:
+- `(0,0)` is top‑left, `(1,1)` is bottom‑right
+- `(0.5,0.5)` is the center
+- The same rules apply to views, groups, and screen‑space nodes
+
 ### Composite edit mode (timer / choices)
 Some node types are **composites**: they are rendered as a group with internal sub‑elements (buttons, labels, canvas, etc.).
 
@@ -82,11 +88,9 @@ This is how the system supports “special widgets” while still keeping them e
 
 ---
 
-## Repo layout (active vs legacy)
+## Repo layout
 
-- `app/` is the **active app** (current implementation).
-- `legacy/` is the **old app** kept for reference only.
-- `legacy/presentations/` contains the archived legacy decks.
+- `app/` is the main app implementation.
 
 ---
 

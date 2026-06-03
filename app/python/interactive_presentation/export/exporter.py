@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import os
 import json
+import re
 import shutil
 from pathlib import Path
-import re
-import os
 
-from ..pr.parser import parse_presentation_pr
-from ..pr.compile import compile_model_payload
+from ..model_compiler import DefaultPresentationModelCompiler
+from ..presentation_workspace import FileSystemPresentationWorkspace
 
 
 def export_bundle(presentation_pr: str, out_dir: str = "dist") -> None:
@@ -18,7 +18,7 @@ def export_bundle(presentation_pr: str, out_dir: str = "dist") -> None:
   - Injects the model into `index.html` so the bundle can run from file:// with no server
   """
   pres_path = Path(presentation_pr).resolve()
-  pres_dir = pres_path.parent
+  workspace = FileSystemPresentationWorkspace(pres_path)
   # exporter.py lives at: app/python/interactive_presentation/export/exporter.py
   # -> parents[3] is app/
   web_dist = (Path(__file__).resolve().parents[3] / "web" / "dist").resolve()
@@ -51,8 +51,8 @@ def export_bundle(presentation_pr: str, out_dir: str = "dist") -> None:
     else:
       shutil.copy2(child, dst)
 
-  spec = parse_presentation_pr(pres_path)
-  payload = compile_model_payload(spec, base_dir=pres_dir)
+  compiler = DefaultPresentationModelCompiler()
+  payload = compiler.compile(workspace.load_snapshot())
   payload_json = json.dumps(payload, ensure_ascii=False)
   (out / "model.json").write_text(payload_json, encoding="utf-8")
 

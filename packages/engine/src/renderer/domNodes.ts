@@ -1508,7 +1508,7 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
         const w = Number(g?.w ?? NaN);
         const h = Number(g?.h ?? NaN);
         if (![x, y, w, h].every((v) => Number.isFinite(v))) return false;
-        // Reject clearly broken legacy geoms (these cause overlap/selection issues).
+        // Reject clearly broken geoms (these cause overlap/selection issues).
         if (w > 1.2 || h > 1.2) return false;
         return true;
       };
@@ -1635,6 +1635,8 @@ export function createDomNode(node: NodeModel): DomNodeHandle | null {
       el.dataset.barColor = (n as any).barColor ?? "orange";
       el.dataset.lineColor = (n as any).lineColor ?? "green";
       el.dataset.stat = (n as any).stat ?? "gaussian";
+      if (Array.isArray((n as any).bins)) el.dataset.bins = JSON.stringify((n as any).bins);
+      else delete (el.dataset as any).bins;
       if (typeof (n as any).minS === "number") el.dataset.minS = String((n as any).minS);
       else delete (el.dataset as any).minS;
       if (typeof (n as any).maxS === "number") el.dataset.maxS = String((n as any).maxS);

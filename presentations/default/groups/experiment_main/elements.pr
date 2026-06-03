@@ -1,0 +1,17 @@
+axis[id=experiment_main_axis, visible=true, opacity=1, bgColor=white, color=white, xMin=0, xMax=1, yMin=0, yMax=1, clamp=True, padPx=40]
+buttons[id=experiment_main_clear_button, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Clear:experiment-clear}, type=click]
+buttons[id=experiment_main_fit_button, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Fit:experiment-fit}, type=click]
+text[id=experiment_main_fit_label, align=left]: 
+buttons[id=experiment_main_t_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={x:experiment-t:0, 1/x:experiment-t:1, 1/sqrt(x):experiment-t:2}, type=radio]
+table[id=experiment_main_table, rows=6, cols=3, editable=true, hHeader=[[Time (s)], color=black, bgColor=white]:
+;;
+;;
+;;
+;;
+;;
+;;
+text[id=experiment_main_title, align=center]: Experiment
+buttons[id=experiment_main_x_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Time (s):experiment-x:0, Distance (m):experiment-x:1, Velocity (m/s):experiment-x:2}, type=radio]
+text[id=experiment_main_x_label, align=center]: [Time (s)
+buttons[id=experiment_main_y_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Time (s):experiment-y:0, Distance (m):experiment-y:1, Velocity (m/s):experiment-y:2}, type=radio]
+text[id=experiment_main_y_label, align=center]: Col 2

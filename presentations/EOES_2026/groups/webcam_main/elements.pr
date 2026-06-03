@@ -1,0 +1,2 @@
+buttons[id=webcam_main_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Rec:rec, Shot:shot}]
+camera[id=webcam_main_camera, visible=true, opacity=1]

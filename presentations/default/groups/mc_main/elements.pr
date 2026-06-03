@@ -1,0 +1,9 @@
+bullets[id=mc_main_answers, type=A., align=left]:
+-
+-
+-
+-
+
+buttons[id=mc_main_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={{{toggleLabel}}:multichoice-toggle, {{resetLabel}}:multichoice-reset}, rows=1, cols=2]
+text[id=mc_main_question, align=left]: Which option do you prefer?
+group[id=mc_main_wheel, visible=true, opacity=1]

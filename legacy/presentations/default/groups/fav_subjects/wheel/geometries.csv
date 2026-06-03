@@ -1,8 +1,0 @@
-id,view,x,y,w,h,rotationDeg,anchor,align,parent
-pie,composite,0.5,0.5,1,1,0,centerCenter,center,
-Biologi,composite,0,0,0.36,0.10,0,centerCenter,center,
-Kemi,composite,0,0,0.36,0.10,0,centerCenter,center,
-Fysik,composite,0,0,0.36,0.10,0,centerCenter,center,
-Matematik,composite,0,0,0.36,0.10,0,centerCenter,center,
-vrigt,composite,0,0,0.36,0.10,0,centerCenter,center,
-other,composite,0,0,0.36,0.10,0,centerCenter,center,

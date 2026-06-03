@@ -1,2 +1,8 @@
-timestamp,join_id,namn,email,födelseår
-2026-01-16T14:04:14.927618,join_1,Viktor,svenviktorjonsson@gmail.com,1987
+timestamp,join_id,Name,Email
+2026-01-23T17:03:23.595328,join_form,Viktor,svenviktorjonsson@gmail.com
+2026-01-23T17:10:12.388391,join_form,Viktor,svenviktorjonsson@gmail.com
+2026-01-23T17:19:36.952978,join_form,Viktor,svenviktorjonsson@gmail.com
+2026-01-23T17:31:44.437248,join_form,Viktor,svenviktorjonsson@gmail.com
+2026-01-23T18:02:17.821490,join_form,Viktor,svenviktorjonsson@gmail.com
+2026-01-23T18:07:41.429647,join_form,Viktor,svenviktorjonsson@gmail.com
+2026-01-23T18:34:39.759887,join_form,Viktor,svenviktorjonsson@gmail.com

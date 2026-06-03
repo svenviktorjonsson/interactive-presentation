@@ -172,6 +172,7 @@ export function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
     mkArrowHit("y_axis");
 
   }
+  layer.dataset.timerDebug = String(!!node?.timerDebug);
 
   // Always sync sub-elements (text/buttons/arrows) from elements.pr.
   // IMPORTANT:
@@ -260,8 +261,32 @@ export function ensureTimerCompositeLayer(engine: Engine, timerId: string) {
       layer!.append(boxEl);
     }
 
-    const labels = parseList(paramsRaw.labels);
-    const actions = parseList(paramsRaw.actions);
+    let labels = parseList(paramsRaw.labels);
+    let actions = parseList(paramsRaw.actions);
+    if (labels.length === 0 && actions.length === 0) {
+      const itemsRaw = paramsRaw.items ?? paramsRaw.item;
+      const raw = String(itemsRaw ?? "").trim();
+      if (raw.startsWith("{") && raw.endsWith("}")) {
+        const inner = raw.slice(1, -1);
+        const parts = inner.split(",").map((p) => p.trim()).filter(Boolean);
+        for (const part of parts) {
+          const idx = part.indexOf(":");
+          if (idx <= 0) continue;
+          labels.push(part.slice(0, idx).trim());
+          actions.push(part.slice(idx + 1).trim());
+        }
+      }
+    }
+    if (String(layer.dataset.timerDebug ?? "false") !== "true") {
+      const filtered: Array<{ label: string; action: string }> = [];
+      for (let i = 0; i < Math.max(labels.length, actions.length); i += 1) {
+        const action = String(actions[i] ?? "");
+        if (action === "timer-debug") continue;
+        filtered.push({ label: String(labels[i] ?? ""), action });
+      }
+      labels = filtered.map((x) => x.label);
+      actions = filtered.map((x) => x.action);
+    }
     const vSplits = parseSplits(parseList((paramsRaw as any).vSplits));
     const hSplits = parseSplits(parseList((paramsRaw as any).hSplits));
     const fontScale0 = Number(String((paramsRaw as any).fontScale ?? "1").trim());
@@ -546,7 +571,7 @@ export function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLEle
     // - corners scale should affect font size (via h change, no fontScale compensation)
     const gH = Number(boxEl.style.height.replace("%", "")) / 100;
     const fontScale = Number(String(boxEl.dataset.fontScale ?? "1")) || 1;
-    const fontPx = Math.max(12, timerBox.height * Math.max(0.02, gH) * 0.55 * fontScale);
+    const fontPx = timerBox.height * gH * 0.55 * fontScale;
     if (grid) grid.style.fontSize = `${fontPx}px`;
     for (const btn of btns) {
       (btn.style as any).fontSize = `${fontPx}px`;
@@ -562,7 +587,7 @@ export function renderTimerCompositeButtons(timerEl: HTMLElement, layer: HTMLEle
         if (contentEl) contentEl.innerHTML = renderTextWithKatexToHtml(resolved).replaceAll("\n", "<br/>");
       }
     }
-    // Hide legacy header if present
+    // Hide header if present
     timerEl.querySelector<HTMLElement>(".timer-header")?.setAttribute("style", "display:none !important");
   }
 }

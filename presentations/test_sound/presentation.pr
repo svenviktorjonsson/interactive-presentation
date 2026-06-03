@@ -1,0 +1,5 @@
+view[id=sound_view]:
+
+pressure[id=pressure_main, color=white, xLabel=Time (s),
+yLabel=Pressure, peakLabel=Peak t (s), lineWidth=1, pauseLabel=Pause, resumeLabel=Resume,
+runLabel=Run, sampleMs=2, windowS=30]

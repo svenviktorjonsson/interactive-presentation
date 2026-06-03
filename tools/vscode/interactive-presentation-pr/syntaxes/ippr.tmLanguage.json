@@ -3,6 +3,7 @@
   "name": "Interactive Presentation (.pr)",
   "scopeName": "source.ippr",
   "patterns": [
+    { "include": "#hexColor" },
     { "include": "#comments" },
     { "include": "#viewHeader" },
     { "include": "#nodeLine" },
@@ -13,7 +14,15 @@
       "patterns": [
         {
           "name": "comment.line.number-sign.ippr",
-          "match": "#.*$"
+          "match": "(^|\\s)#(?![0-9a-fA-F]{3}(?:[0-9a-fA-F]{3})?\\b).*"
+        }
+      ]
+    },
+    "hexColor": {
+      "patterns": [
+        {
+          "name": "constant.other.color.hex.ippr",
+          "match": "#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})\\b"
         }
       ]
     },
@@ -71,6 +80,7 @@
             "0": { "name": "punctuation.section.brackets.end.ippr" }
           },
           "patterns": [
+            { "include": "#hexColor" },
             { "include": "#comments" },
             { "include": "#strings" },
             { "include": "#template" },

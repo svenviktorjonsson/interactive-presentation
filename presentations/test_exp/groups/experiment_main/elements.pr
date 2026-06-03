@@ -1,0 +1,26 @@
+axis[id=experiment_main_axis, visible=true, opacity=1, color=white, xMin=0, xMax=1, yMin=0, yMax=1, clamp=True, padPx=40]
+text[id=experiment_main_fit_label, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=left]: {{fit}}
+buttons[id=experiment_main_t_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={x:experiment-t:0, 1/x:experiment-t:1, 1/sqrt(x):experiment-t:2, Fit:experiment-fit, Clear fit:experiment-clear}, type=radio]
+table[id=experiment_main_table, visible=true, opacity=1, bgColor=white, color=black, rows=16, cols=4, editable=true, hHeader=[Blås-frek. (Hz), Höjd (mm), Pling-frek. (Hz), Massa (g)]]:
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+
+text[id=experiment_main_title, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=center]: Experiment
+buttons[id=experiment_main_x_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Blås-frek. (Hz):experiment-x:0, Höjd (mm):experiment-x:1, Pling-frek. (Hz):experiment-x:2, Massa (g):experiment-x:3}, type=radio]
+text[id=experiment_main_x_label, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=center]: {{xLabel}}
+buttons[id=experiment_main_y_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={Blås-frek. (Hz):experiment-y:0, Höjd (mm):experiment-y:1, Pling-frek. (Hz):experiment-y:2, Massa (g):experiment-y:3}, type=radio]
+text[id=experiment_main_y_label, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=center]: {{yLabel}}

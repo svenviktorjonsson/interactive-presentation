@@ -1,18 +1,35 @@
-text[id=screen_title,align=left]: NRM, 24 Jan 2026
-text[id=screen_hint,align=left]: Presented by Viktor Jonsson
-Presented by Viktor Jonsson
-Screen footer (bottom)
-image[id=EOES_logo,src=/media/EOES_logo.png]
+text[id=title_text, align=left]: NRM, 24 Jan 2026
+text[id=subtitle_text, align=left]: Presented by Viktor Jonsson
+image[id=logo_image, src=/media/EOES_logo.png, bgColor=white, bgAlpha=0.7, bgPadding=10.0, bgRadius=10.0]
 
-text[id=t_73ba1c77,align=left]: NRM, 24 Jan 2026
-view[id=home]:
-text[id=home_title,align=left]: Home view text
-bullets[id=home_bullets,type=1.a.,align=center]: A\nB\n	C\n	D\nE\nF
-join[id=join_1,fields={namn,email,födelseår}]: Fyll i detaljerna så kör vi!
-arrow[id=arrow_034b85c7,color=white,strokePx=4.0]
-view[id=view2,loc=right,ref=home]:
-text[id=view2_title,align=left]: View 2 text
-text[id=view2_note,align=left]: View 2 secondary text
-view[id=view3,loc=down,ref=view2]:
-text[id=view3_title,align=left]: View 3 text
-text[id=view3_note,align=left]: View 3 secondary text
+view[id=join_view]:
+
+join[id=join_form, fields={Name, Email}]: Welcome
+view[id=player_view, loc=right, refView=join_view]:
+player[id=player_main, src=https://www.youtube.com/watch?v=JgJABtXhUiY, playLabel=Play, pauseLabel=Pause]
+view[id=webcam_view, loc=right, refView=player_view]:
+webcam[id=webcam_main, recLabel=Rec, shotLabel=Shot]
+
+view[id=multichoice_view, loc=bottom, refView=join_view]:
+multichoice[id=mc_main, answers={Alpha, Beta, Gamma, Delta}, type=A, showWheel=true]: Which option do you prefer?
+
+view[id=sound_view, loc=right, refView=multichoice_view]:
+sound[id=sound_main, color=white, fLabel=Frequency, fXLabel=Frequency (Hz), fYLabel=Normalized Intensity, freqButtonLabel=Frequency, freqLabel=Frequency, homeLabel=Home, lineWidth=1, mode=spectrum, pauseLabel=Pause, resetLabel=Reset, resumeLabel=Resume, runLabel=Run, sampleMs=1, tLabel=Time, tXLabel=Time (ms), tYLabel=Intensity, timeButtonLabel=Time, timeLabel=Time, windowS=30, yLabel=Normalized Intensity]
+table[id=sound_table, rows=12, cols=2, editable=false, hHeader=[Max X, Max Y], color=black, bgColor=white]:
+;
+;
+;
+;
+;
+;
+;
+;
+;
+;
+;
+;
+view[id=timer_view, loc=right, refView=sound_view]:
+timer[id=timer_main, showTime=true, color=green, barColor=orange, startLabel=Start, stopLabel=Stop, resetLabel=Reset, xLabel=Time (s), yLabel=Progress, valueLabel={{elapsed:.2f}} s]
+
+view[id=experiment_view, loc=bottom, refView=multichoice_view]:
+experiment[id=experiment_main, title=Experiment, rows=6, cols=3, hHeader={Time (s), Distance (m), Velocity (m/s)}]:

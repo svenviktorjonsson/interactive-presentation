@@ -1,0 +1,8 @@
+view[id=experiment_view]:
+
+experiment[id=experiment_main, title=Experiment, rows=16, cols=4, 
+hHeader={Blås-frek. (Hz), Höjd (mm), Pling-frek. (Hz), Massa (g)}, transforms={x, 1/x, 1/sqrt(x)},
+ fitLabel=y = {{a:.3f}}{{xPrime}} + {{b:.3f}}, fitButtonLabel=Fit, clearLabel=Clear fit]:
+
+spectrum[id=spectrum_main, color=white, lineWidth=1, runLabel=Run, resumeLabel=Resume, pauseLabel=Pause, fLabel=Frequency, fXLabel=Frequency (Hz), fYLabel=Normalized Intensity, windowS=30, sampleMs=1, yLabel=Normalized Intensity]
+sound[id=spectrum_main, color=white, fLabel=Frequency, fXLabel=Frequency (Hz), fYLabel=Normalized Intensity, freqButtonLabel=Frequency, freqLabel=Frequency, homeLabel=Home, lineWidth=1, mode=spectrum, pauseLabel=Pause, resetLabel=Reset, resumeLabel=Resume, runLabel=Run, sampleMs=1, tLabel=Time, timeButtonLabel=Time, timeLabel=Time, windowS=30, yLabel=Normalized Intensity]

@@ -6,6 +6,7 @@ type TimerState = {
   accepting: boolean;
   samplesMs: number[];
   stats: { n: number; meanMs: number | null; sigmaMs: number | null };
+  lastSubmitMs?: number | null;
 };
 
 let __timerPollStarted = false;
@@ -111,12 +112,17 @@ export function createTimerPlugin(): ElementPlugin {
           const countN = st && Number.isFinite(st.stats.n) ? Number(st.stats.n) : 0;
           const hasRunOnce = getHasRunOnce(el);
           const accepting = !!st?.accepting;
+          const lastSubmitMs = typeof st?.lastSubmitMs === "number" ? st.lastSubmitMs : null;
+          const submitLabel = lastSubmitMs !== null ? fmtS(lastSubmitMs) : "-";
+          const statusLabel = accepting ? "Running" : lastSubmitMs !== null ? `Submit: ${submitLabel}s` : "Stopped";
           const data: Record<string, string | number> = {
             name: id,
             mean: countN > 0 && st ? fmtS(st.stats.meanMs) : "-",
             sigma: countN > 1 && st ? fmtS(st.stats.sigmaMs) : "-",
             count: countN > 0 ? String(countN) : "-",
             runPauseResume: runPauseResumeLabel(accepting, hasRunOnce),
+            status: statusLabel,
+            submitTime: submitLabel,
           };
           renderTimerCompositeTexts(el, layer, data);
           renderTimerCompositeButtons(el, layer, data);

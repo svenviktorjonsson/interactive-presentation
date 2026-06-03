@@ -1,4 +1,0 @@
-id,view,x,y,w,h,rotationDeg,anchor,align,parent
-bullets,composite,0.00,0.00,0.62,1.00,0,topLeft,left,
-buttons,composite,0.50,-0.02,0.86,0.10,0,topCenter,center,
-wheel,composite,0.81,0.46,0.38,0.38,0,centerCenter,center,
