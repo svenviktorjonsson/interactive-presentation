@@ -1,0 +1,5 @@
+id,view,space,zIndex,x,y,w,h,rotationDeg,anchor,fontPx
+__screen_space__,screen_main,screen,0,0.5,0.5,1.0,1.0,1.0,centerCenter,
+deck_hint,screen_main,screen,0,0.03,0.1,0.56,0.04,0.0,topLeft,20.0
+deck_title,screen_main,screen,0,0.03,0.04,0.32,0.05,0.0,topLeft,34.0
+spectrum_main,spectrum_view,world,1,0.18615750995413072,0.48893471356263035,0.5124451054338336,0.7429155493489328,0.0,centerLeft,

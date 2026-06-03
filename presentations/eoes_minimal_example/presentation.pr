@@ -1,0 +1,26 @@
+text[id=deck_title, align=left]: EOES minimal module example
+text[id=deck_hint, align=left]: Join -> Multichoice -> Player -> Timer -> Experiment -> Pressure -> Webcam -> Spectrum
+
+view[id=join_view]:
+join[id=join_main, fields={Name, Email, Team}]: Join the example session
+
+view[id=multichoice_view, loc=right, ref=join_view]:
+multichoice[id=mc_main, answers="Alpha:, Beta:, Gamma:, Delta:", choiceType=A, question=Which option do you prefer?, resetLabel=Reset, showWheel=true, startLabel=Start, stopLabel=Stop, type=A]
+
+view[id=player_view, loc=right, ref=multichoice_view]:
+player[id=player_main, src=https://www.youtube.com/watch?v=JgJABtXhUiY, playLabel=Play, pauseLabel=Pause]
+
+view[id=timer_view, loc=right, ref=player_view]:
+timer[id=timer_main, barColor=orange, color=green, debug=false, durationS=10, resetLabel=Reset, sampleMs=100, showTime=false, startLabel=Start, stat=gaussian, stopLabel=Stop, valueLabel={{elapsed:.2f}} s, xLabel=Time (s), yLabel=Progress]
+
+view[id=experiment_view, loc=right, ref=timer_view]:
+experiment[id=experiment_main, title=Experiment, rows=8, cols=4, hHeader={Blas (Hz), Hojd (mm), Plin (Hz), Massa (g)}, transforms={x, 1/x, 1/sqrt(x)}, fitLabel=y = {{a:.3f}}{{xPrime}} + {{b:.3f}}, fitButtonLabel=Fit, clearLabel=Clear fit]
+
+view[id=pressure_view, loc=right, ref=experiment_view]:
+pressure[id=pressure_main, color=white, xLabel=Time (s), yLabel=Pressure, peakLabel=Peak t (s), lineWidth=1, pauseLabel=Pause, resumeLabel=Resume, runLabel=Run, sampleMs=2, windowS=30]
+
+view[id=webcam_view, loc=right, ref=pressure_view]:
+webcam[id=webcam_main, recLabel=Rec, shotLabel=Shot]
+
+view[id=spectrum_view, loc=right, ref=webcam_view]:
+spectrum[id=spectrum_main, color=white, lineWidth=1, runLabel=Run, resumeLabel=Resume, pauseLabel=Pause, fLabel=Frequency, fXLabel=Frequency (Hz), fYLabel=Normalized Intensity, windowS=30, sampleMs=1, yLabel=Normalized Intensity]

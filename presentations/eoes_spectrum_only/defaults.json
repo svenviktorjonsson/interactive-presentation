@@ -1,0 +1,16 @@
+{
+  "designWidth": 1920,
+  "designHeight": 1080,
+  "viewTransitionMs": 1200,
+  "pixelateSteps": 20,
+  "elements": {
+    "buttons": {
+      "bgColor": "black",
+      "bgAlpha": 0.7
+    },
+    "slider": {
+      "bgColor": "black",
+      "bgAlpha": 0.7
+    }
+  }
+}

@@ -1,0 +1,5 @@
+axis[id=spectrum_main_axis, visible=true, opacity=1, xMin=0.0, xMax=3000.0, yMin=0.0, yMax=1.1, clamp=True, padPx=40, maxPoints=10000]
+buttons[id=spectrum_main_buttons, visible=true, opacity=1, bgColor=black, bgAlpha=0.7, items={{{runPauseResume}}:sound-toggle}, type=click, rows=1, cols=1]
+text[id=spectrum_main_peak, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=right]: Peak: {{value}} Hz
+text[id=spectrum_main_x_label, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=center]: Frequency (Hz)
+text[id=spectrum_main_y_label, visible=true, opacity=1, color=rgba(255,255,255,0.92), align=center]: Normalized Intensity

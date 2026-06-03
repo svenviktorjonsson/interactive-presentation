@@ -1,0 +1,5 @@
+text[id=deck_title, align=left]: EOES spectrum tuning
+text[id=deck_hint, align=left]: Single spectrum module for layout and label tuning
+
+view[id=spectrum_view]:
+spectrum[id=spectrum_main, color=white, lineWidth=1, runLabel=Run, resumeLabel=Resume, pauseLabel=Pause, fLabel=Frequency, fXLabel=Frequency (Hz), fYLabel=Normalized Intensity, windowS=30, sampleMs=1, yLabel=Normalized Intensity]

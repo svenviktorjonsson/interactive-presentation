@@ -7,9 +7,11 @@ export type Store = {
   activeViewId: string;
   selectedId: string | null;
   selectedIds: string[];
+  activeGroupId: string | null;
   mode: AppMode;
   screen: { w: number; h: number };
   cameraFit: number;
+  screenSpaceMode: "normalized";
   cameraOverride: { cx: number; cy: number; zoom: number } | null;
   cameraTween:
     | null
@@ -27,16 +29,59 @@ export type Store = {
   transitionToViewId: string | null;
 };
 
+const activeViewStorageKey = () => {
+  try {
+    return `ip:active-view:${window.location.origin}${window.location.pathname}`;
+  } catch {
+    return "ip:active-view";
+  }
+};
+
+const validViewId = (model: Model, candidate: string | null | undefined) => {
+  const viewId = String(candidate ?? "").trim();
+  if (!viewId) return null;
+  return (model.views ?? []).some((view) => String(view.id) === viewId) ? viewId : null;
+};
+
+export function restorePersistedActiveViewId(model: Model): string | null {
+  try {
+    return validViewId(model, window.localStorage.getItem(activeViewStorageKey()));
+  } catch {
+    return null;
+  }
+}
+
+export function resolveInitialActiveViewId(model: Model, preferred?: string | null): string {
+  return (
+    validViewId(model, preferred)
+    ?? restorePersistedActiveViewId(model)
+    ?? validViewId(model, model.initialViewId)
+    ?? validViewId(model, model.views[0]?.id)
+    ?? "home"
+  );
+}
+
+export function persistActiveViewId(store: Store): void {
+  try {
+    const next = validViewId(store.model, store.activeViewId);
+    if (!next) return;
+    window.localStorage.setItem(activeViewStorageKey(), next);
+  } catch {}
+}
+
 export function createStore(initialModel?: Model): Store {
   const model = initialModel ?? defaultModel();
+  const activeViewId = resolveInitialActiveViewId(model);
   return {
     model,
-    activeViewId: model.initialViewId,
+    activeViewId,
     selectedId: null,
     selectedIds: [],
+    activeGroupId: null,
     mode: "edit",
     screen: { w: 1, h: 1 },
     cameraFit: 1,
+    screenSpaceMode: "normalized",
     cameraOverride: null,
     cameraTween: null,
     transitionFromViewId: null,
@@ -45,11 +90,9 @@ export function createStore(initialModel?: Model): Store {
 }
 
 export function computeCameraFit(store: Store) {
-  const designW = (store.model as any).defaults?.designWidth ?? 1920;
-  const designH = (store.model as any).defaults?.designHeight ?? 1080;
-  const screenW = Math.max(1, store.screen?.w ?? 1);
-  const screenH = Math.max(1, store.screen?.h ?? 1);
-  return Math.min(screenW / designW, screenH / designH);
+  void store;
+  // Data coords are normalized to screen width; no extra fit scaling needed.
+  return 1;
 }
 
 export function fitCameraToScreen(
@@ -93,7 +136,7 @@ export function resolveViewCamera(store: Store, viewId: string) {
   const views = store.model.views;
   const idx = views.findIndex((x) => x.id === viewId);
   const view = views[idx] ?? views[0];
-  if (!view) return { cx: 0, cy: 0, zoom: 1 };
+  if (!view) return { cx: 0.5, cy: 0.5, zoom: 1 };
   const loc = (view as any).loc as string | undefined;
   const refView = (view as any).refView as string | undefined;
   if (!loc && !refView) return { ...view.camera };
@@ -128,16 +171,18 @@ export function resolveViewCamera(store: Store, viewId: string) {
       return out;
     }
     const locNorm = vLoc.trim().replace(/[_-]/g, "").toLowerCase();
-    const designW = (store.model as any).defaults?.designWidth ?? 1920;
-    const designH = (store.model as any).defaults?.designHeight ?? 1080;
-    const hw = designW / (2 * Math.max(1e-9, base.zoom));
-    const hh = designH / (2 * Math.max(1e-9, base.zoom));
+    const hw = 0.5 / Math.max(1e-9, base.zoom);
+    const hh = 0.5 / Math.max(1e-9, base.zoom);
     let dx = 0;
     let dy = 0;
-    if (locNorm.includes("right")) dx += 2 * hw;
-    if (locNorm.includes("left")) dx -= 2 * hw;
-    if (locNorm.includes("bottom") || locNorm.includes("down")) dy += 2 * hh;
-    if (locNorm.includes("top") || locNorm.includes("up")) dy -= 2 * hh;
+    if (locNorm.includes("right") || locNorm.includes("east")) dx += 2 * hw;
+    if (locNorm.includes("left") || locNorm.includes("west")) dx -= 2 * hw;
+    if (locNorm.includes("bottom") || locNorm.includes("down") || locNorm.includes("south") || locNorm.includes("below")) {
+      dy += 2 * hh;
+    }
+    if (locNorm.includes("top") || locNorm.includes("up") || locNorm.includes("north") || locNorm.includes("above")) {
+      dy -= 2 * hh;
+    }
     const out = { cx: base.cx + dx, cy: base.cy + dy, zoom: v.camera.zoom ?? base.zoom };
     memo.set(id, out);
     resolving.delete(id);
@@ -146,4 +191,3 @@ export function resolveViewCamera(store: Store, viewId: string) {
 
   return resolve(viewId);
 }
-

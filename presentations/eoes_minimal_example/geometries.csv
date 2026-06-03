@@ -1,0 +1,12 @@
+id,view,space,zIndex,x,y,w,h,rotationDeg,anchor,fontPx
+__screen_space__,screen_main,screen,0,0.5,0.5,1.0,1.0,1.0,centerCenter,
+deck_hint,screen_main,screen,0,0.03,0.1,0.56,0.04,0.0,topLeft,20.0
+deck_title,screen_main,screen,0,0.03,0.04,0.32,0.05,0.0,topLeft,34.0
+experiment_main,experiment_view,world,0,0.5,0.55,0.84,0.76,0.0,centerCenter,
+join_main,join_view,world,0,0.5,0.53,0.42,0.52,0.0,centerCenter,
+mc_main,multichoice_view,world,47,0.3767834364812903,0.38780210806696924,0.7644,0.46019749547171673,0.0,centerCenter,
+player_main,player_view,world,0,0.5,0.53,0.72,0.78,0.0,centerCenter,
+pressure_main,pressure_view,world,48,0.509704834577752,0.47447880142821486,0.84,0.7795759012303451,0.0,centerCenter,
+spectrum_main,spectrum_view,world,49,0.7649845733596212,0.6068940603839458,1.3835211415675588,0.7400581731879913,0.0,centerCenter,
+timer_main,timer_view,world,0,0.47013944597959867,0.5928028612725984,0.7226914050705062,0.6347848139649503,0.0,centerCenter,
+webcam_main,webcam_view,world,0,0.5,0.55,0.72,0.82,0.0,centerCenter,
