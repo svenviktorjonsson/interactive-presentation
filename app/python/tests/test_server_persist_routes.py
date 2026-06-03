@@ -156,6 +156,63 @@ class PersistRouteTests(unittest.TestCase):
       rows = list(csv.DictReader(handle))
     self.assertEqual(rows, [])
 
+  def test_persist_table_route_writes_table_configuration(self) -> None:
+    root, client = self._make_client()
+
+    response = client.post(
+      "/persist/table",
+      json={
+        "id": "tbl1",
+        "viewId": "home",
+        "cells": [["A", "B"], ["1", "2"]],
+        "rows": 2,
+        "cols": 2,
+        "editable": True,
+        "hHeader": ["X", "Y"],
+        "color": "white",
+      },
+    )
+
+    self.assertEqual(response.status_code, 200)
+    source = root.read_text(encoding="utf-8")
+    self.assertIn("table[id=tbl1", source)
+    self.assertIn("editable=true", source)
+    self.assertIn("A;B", source)
+    self.assertIn("1;2", source)
+
+  def test_persist_image_route_writes_image_source(self) -> None:
+    root, client = self._make_client()
+
+    response = client.post(
+      "/persist/image",
+      json={
+        "id": "img1",
+        "viewId": "home",
+        "src": "/media/demo.png",
+      },
+    )
+
+    self.assertEqual(response.status_code, 200)
+    source = root.read_text(encoding="utf-8")
+    self.assertIn("image[id=img1, src=/media/demo.png", source)
+
+  def test_persist_join_route_writes_join_fields(self) -> None:
+    root, client = self._make_client()
+
+    response = client.post(
+      "/persist/join",
+      json={
+        "id": "join1",
+        "viewId": "home",
+        "text": "Welcome",
+        "fields": ["Name", "Email"],
+      },
+    )
+
+    self.assertEqual(response.status_code, 200)
+    source = root.read_text(encoding="utf-8")
+    self.assertIn("join[id=join1, fields={Name, Email}]: Welcome", source)
+
 
 if __name__ == "__main__":
   unittest.main()
