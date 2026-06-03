@@ -1,7 +1,26 @@
+import { viewRect } from "../core/geom";
+
+export type ViewGridOptions = {
+  enabled: boolean;
+  viewCam: { cx: number; cy: number; zoom: number };
+  designW: number;
+  designH: number;
+  gridBaseWorld?: number | { x: number; y: number };
+  gridOriginWorld?: { x: number; y: number };
+};
+
 export function drawGrid(
   ctx: CanvasRenderingContext2D,
   screen: { w: number; h: number },
-  camera: { cx: number; cy: number; zoom: number }
+  camera: { cx: number; cy: number; zoom: number },
+  opts?: {
+    viewGrid?: ViewGridOptions;
+    viewBoxes?: Array<{
+      viewCam: { cx: number; cy: number; zoom: number };
+      designW: number;
+      designH: number;
+    }>;
+  }
 ) {
   // IMPORTANT:
   // Keep the canvas transparent so the nice CSS background shading (body gradients)
@@ -17,45 +36,82 @@ export function drawGrid(
     ctx.stroke();
   };
 
-  const baseWorld = 1;
-  const zoom = Math.max(1e-6, camera.zoom);
-  const majorTargetPx = 225;
-  const raw = majorTargetPx / (baseWorld * zoom);
-  const log10 = Math.log10(Math.max(1e-9, raw));
-  const k = Math.max(-10, Math.min(10, Math.floor(log10)));
-  const t = log10 - k; // 0..1 for smooth transition between decades
-  const majorStepWorld = baseWorld * Math.pow(10, k);
-  const nextStepWorld = baseWorld * Math.pow(10, k + 1);
-  const majorStepPx = majorStepWorld * zoom;
-  const nextStepPx = nextStepWorld * zoom;
+  const viewGrid = opts?.viewGrid;
+  if (!viewGrid?.enabled) return;
+  const gridCam = viewGrid.viewCam ?? camera;
+  const view = viewRect(gridCam);
+  const viewLeft = view.left;
+  const viewTop = view.top;
+  const scaleX = screen.w / Math.max(1e-9, view.width);
+  const scaleY = screen.h / Math.max(1e-9, view.height);
+  const toScreenX = (wx: number) => (wx - viewLeft) * scaleX;
+  const toScreenY = (wy: number) => (wy - viewTop) * scaleY;
 
-  const denseFade = (stepPx: number) => Math.max(0, Math.min(1, (stepPx - 8) / 18));
-  const majorAlpha = 0.12 * denseFade(majorStepPx) * (1 - t);
-  const nextAlpha = 0.12 * denseFade(nextStepPx) * t;
-
-  const drawLines = (stepWorld: number, alpha: number) => {
+  const drawLines = (
+    stepWorldX: number,
+    stepWorldY: number,
+    alpha: number,
+    origin?: { x: number; y: number },
+    width = 1
+  ) => {
     if (alpha <= 0.001) return;
-    const stepPx = stepWorld * zoom;
+    const stepPxX = stepWorldX * scaleX;
+    const stepPxY = stepWorldY * scaleY;
     const stroke = `rgba(255,255,255,${alpha})`;
-    const worldLeft = camera.cx - screen.w / (2 * zoom);
-    const worldTop = camera.cy - screen.h / (2 * zoom);
-    const startX = Math.floor(worldLeft / stepWorld) * stepWorld;
-    const startY = Math.floor(worldTop / stepWorld) * stepWorld;
-    const nX = Math.ceil(screen.w / stepPx) + 4;
-    const nY = Math.ceil(screen.h / stepPx) + 4;
+    const worldLeft = viewLeft;
+    const worldTop = viewTop;
+    const ox = origin?.x ?? 0;
+    const oy = origin?.y ?? 0;
+    const startX = Math.floor((worldLeft - ox) / stepWorldX) * stepWorldX + ox;
+    const startY = Math.floor((worldTop - oy) / stepWorldY) * stepWorldY + oy;
+    const nX = Math.ceil(screen.w / Math.max(1e-9, stepPxX)) + 4;
+    const nY = Math.ceil(screen.h / Math.max(1e-9, stepPxY)) + 4;
     for (let ix = -2; ix < nX; ix++) {
-      const wx = startX + ix * stepWorld;
-      const sx = (wx - camera.cx) * zoom + screen.w / 2;
-      line(sx, 0, sx, screen.h, stroke, 1);
+      const wx = startX + ix * stepWorldX;
+      const sx = toScreenX(wx);
+      line(sx, 0, sx, screen.h, stroke, width);
     }
     for (let iy = -2; iy < nY; iy++) {
-      const wy = startY + iy * stepWorld;
-      const sy = (wy - camera.cy) * zoom + screen.h / 2;
-      line(0, sy, screen.w, sy, stroke, 1);
+      const wy = startY + iy * stepWorldY;
+      const sy = toScreenY(wy);
+      line(0, sy, screen.w, sy, stroke, width);
     }
   };
 
-  drawLines(majorStepWorld, majorAlpha);
-  drawLines(nextStepWorld, nextAlpha);
+  // Fade out dense lines: transparent at 25px, fully visible at 50px.
+  const denseFade = (px: number) => Math.max(0, Math.min(1, (px - 25) / 25));
+  const defaultBaseX = 0.1;
+  const defaultBaseY = 0.1;
+  const baseStepWorld = viewGrid.gridBaseWorld;
+  const baseOrigin = viewGrid.gridOriginWorld ?? { x: 0, y: 0 };
+  const baseStepWorldX = Math.max(
+    1e-9,
+    typeof baseStepWorld === "number" ? baseStepWorld : baseStepWorld?.x ?? defaultBaseX
+  );
+  const baseStepWorldY = Math.max(
+    1e-9,
+    typeof baseStepWorld === "number" ? baseStepWorld : baseStepWorld?.y ?? defaultBaseY
+  );
+  // Draw grid levels from 10^-5 to 10 (relative to base step).
+  for (let k = -4; k <= 2; k += 1) {
+    const scale = Math.pow(10, k);
+    const stepWorldX = baseStepWorldX * scale;
+    const stepWorldY = baseStepWorldY * scale;
+    const stepPx = Math.min(stepWorldX * scaleX, stepWorldY * scaleY);
+    const fade = denseFade(stepPx);
+    const alphaBase = 0.12 * fade;
+    const lineWidth = k === 1 ? 2 : 1;
+    const stepOrigin = baseOrigin;
+    // Ensure the base grid stays visible.
+    const alpha =
+      stepWorldX === 1 && stepWorldY === 1
+        ? 1
+        : k === 0
+          ? Math.max(alphaBase, 0.22)
+          : alphaBase;
+    drawLines(stepWorldX, stepWorldY, alpha, stepOrigin, lineWidth);
+  }
+
+  // View boxes intentionally hidden to avoid extra overlay square.
 }
 

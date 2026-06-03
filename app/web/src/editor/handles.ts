@@ -23,6 +23,8 @@ const ANCHORS: Array<{ a: Anchor; fx: number; fy: number }> = [
   { a: "bottomRight", fx: 1, fy: 1 },
 ];
 
+const SELECTION_STROKE_PX = 2;
+
 export function anchorFrac(a: Anchor): { ax: number; ay: number } {
   const hit = ANCHORS.find((x) => x.a === a) ?? ANCHORS[4]!;
   return { ax: hit.fx, ay: hit.fy };
@@ -30,6 +32,7 @@ export function anchorFrac(a: Anchor): { ax: number; ay: number } {
 
 export type HandlesView = {
   root: HTMLElement;
+  showForRect: (rect: { left: number; top: number; width: number; height: number }, currentAnchor: Anchor) => void;
   showFor: (nodeEl: HTMLElement, t: Transform, currentAnchor: Anchor) => void;
   hide: () => void;
 };
@@ -47,6 +50,21 @@ export function createHandlesView(overlay: HTMLElement): HandlesView {
 
   const clear = () => root.replaceChildren();
 
+  const mkSelectionBox = () => {
+    const d = document.createElement("div");
+    d.className = "selection-box";
+    d.style.position = "absolute";
+    d.style.left = `${-SELECTION_STROKE_PX / 2}px`;
+    d.style.top = `${-SELECTION_STROKE_PX / 2}px`;
+    d.style.width = `calc(100% + ${SELECTION_STROKE_PX}px)`;
+    d.style.height = `calc(100% + ${SELECTION_STROKE_PX}px)`;
+    d.style.border = `${SELECTION_STROKE_PX}px solid rgba(110, 168, 255, 0.95)`;
+    d.style.boxSizing = "border-box";
+    d.style.pointerEvents = "none";
+    root.appendChild(d);
+    return d;
+  };
+
   const mk = (cls: string, leftPct: number, topPct: number, handleId: HandleId) => {
     const d = document.createElement("div");
     d.className = cls;
@@ -61,15 +79,35 @@ export function createHandlesView(overlay: HTMLElement): HandlesView {
   };
 
   const showFor = (nodeEl: HTMLElement, _t: Transform, currentAnchor: Anchor) => {
+    const nr = nodeEl.getBoundingClientRect();
+    const or = overlay.getBoundingClientRect();
+    showForRect(
+      {
+        left: nr.left - or.left,
+        top: nr.top - or.top,
+        width: nr.width,
+        height: nr.height,
+      },
+      currentAnchor
+    );
+  };
+
+  const showForRect = (rect: { left: number; top: number; width: number; height: number }, currentAnchor: Anchor) => {
     clear();
-    // Attach to the node so rotation/anchor behavior matches exactly.
-    if (root.parentElement !== nodeEl) nodeEl.appendChild(root);
-    root.style.left = "0px";
-    root.style.top = "0px";
-    root.style.width = "100%";
-    root.style.height = "100%";
+    // Attach to overlay and use axis-aligned bbox so anchor dots are centered on the bbox.
+    if (root.parentElement !== overlay) overlay.appendChild(root);
+    const snappedLeft = Math.round(rect.left);
+    const snappedTop = Math.round(rect.top);
+    const snappedRight = Math.round(rect.left + rect.width);
+    const snappedBottom = Math.round(rect.top + rect.height);
+    root.style.left = `${snappedLeft}px`;
+    root.style.top = `${snappedTop}px`;
+    root.style.width = `${Math.max(0, snappedRight - snappedLeft)}px`;
+    root.style.height = `${Math.max(0, snappedBottom - snappedTop)}px`;
     root.style.transform = "";
     root.style.transformOrigin = "";
+
+    mkSelectionBox();
 
     // Anchor dots
     for (const a of ANCHORS) {
@@ -88,6 +126,6 @@ export function createHandlesView(overlay: HTMLElement): HandlesView {
     root.style.transform = "";
   };
 
-  return { root, showFor, hide };
+  return { root, showForRect, showFor, hide };
 }
 
