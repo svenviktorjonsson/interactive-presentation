@@ -6,7 +6,7 @@ import { ensureMultichoiceNodeElement, ensureTableNodeElement, ensureWheelNodeEl
 import { ensureHtmlFrameNodeElement, ensureJoinNodeElement, ensureVideoNodeElement, updateHtmlFrameNode, updateJoinNode, updateVideoNode } from "./mediaNodes";
 
 type AxisView = { xMin: number; xMax: number; yMin: number; yMax: number };
-type AxisState = { view: AxisView; limits: AxisView | null; clamp: boolean; padPx: number };
+type AxisState = { view: AxisView; limits: AxisView | null; clamp: boolean; padPx: number; history: AxisView[] };
 
 export type NodeRenderContext = {
   mode: string;
@@ -25,9 +25,11 @@ export type NodeRenderContext = {
   playerLinks: Map<string, any>;
   webcamLinks: Map<string, any>;
   persistButtons: (payload: any) => Promise<void>;
+  persistElement: (payload: any) => Promise<void>;
   getAxisState: (node: Node) => AxisState;
   clampAxisView: (view: AxisView, limits: AxisView | null, clamp: boolean) => AxisView;
   renderAxisNode: (ctx: CanvasRenderingContext2D, el: HTMLElement, node: Node, timeMs: number) => void;
+  activateAxis: (axisId: string | null) => void;
   ensureCameraStream: (nodeId: string, opts: { deviceId?: string }) => Promise<MediaStream>;
   stopCameraStream: (nodeId: string) => void;
   ensureWebcamBus: () => void;
@@ -69,6 +71,7 @@ const nodeRenderAdapters: NodeRenderAdapter[] = [
         getAxisState: ctx.getAxisState,
         clampAxisView: ctx.clampAxisView,
         renderAxisNode: ctx.renderAxisNode,
+        activateAxis: ctx.activateAxis,
         sizePx: ctx.sizePx,
         applyBackground: ctx.applyBackground,
       }),
@@ -110,6 +113,7 @@ const nodeRenderAdapters: NodeRenderAdapter[] = [
         webcamLinks: ctx.webcamLinks,
         renderKatex: (text) => ctx.renderKatex(text, []).html,
         persistButtons: ctx.persistButtons,
+        persistElement: ctx.persistElement,
       }),
   },
   {
@@ -119,6 +123,7 @@ const nodeRenderAdapters: NodeRenderAdapter[] = [
       inferPlayerId: ctx.inferPlayerId,
       ensurePlayerBus: ctx.ensurePlayerBus,
       playerLinks: ctx.playerLinks,
+      persistElement: ctx.persistElement,
     }),
   },
   {

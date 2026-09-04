@@ -536,6 +536,7 @@ const resetSound = (rt: SoundRuntime) => {
   rt.needsViewReset = true;
   const axisId = `${rt.id}_axis`;
   (window as any).ipAxisStream?.clear(axisId);
+  (window as any).ipAxisStream?.resetView?.(axisId);
 };
 
 const setSoundMode = (rt: SoundRuntime, mode: SoundMode) => {

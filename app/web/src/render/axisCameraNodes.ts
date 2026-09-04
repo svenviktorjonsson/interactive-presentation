@@ -7,6 +7,7 @@ type AxisState = {
   limits: AxisView | null;
   clamp: boolean;
   padPx: number;
+  history: AxisView[];
 };
 
 type CameraDeps = {
@@ -32,6 +33,7 @@ type AxisDeps = {
   getAxisState: (node: Node) => AxisState;
   clampAxisView: (view: AxisView, limits: AxisView | null, clamp: boolean) => AxisView;
   renderAxisNode: (ctx: CanvasRenderingContext2D, el: HTMLElement, node: Node, timeMs: number) => void;
+  activateAxis: (axisId: string | null) => void;
   sizePx: () => { wPx: number; hPx: number };
   applyBackground: (el: HTMLElement, bgColor: any, bgAlpha: any, bgPadding: any, bgRadius: any, wPx: number, hPx: number) => void;
 };
@@ -41,6 +43,7 @@ export const ensureAxisNodeElement = (el: HTMLElement) => {
   if (!el.querySelector(".axis-canvas")) {
     const canvas = document.createElement("canvas");
     canvas.className = "axis-canvas";
+    canvas.style.touchAction = "none";
     el.appendChild(canvas);
   }
 };
@@ -84,10 +87,23 @@ export const updateAxisNode = (
   if (!canvas) throw new Error("[next] axis node missing canvas");
   if (!el.dataset.axisBound) {
     el.dataset.axisBound = "1";
-    let isPanning = false;
+    let dragMode: "pan" | "zoom" | null = null;
     let startX = 0;
     let startY = 0;
     let startView: AxisView | null = null;
+    let activePointerId: number | null = null;
+    let zoomBox = el.querySelector<HTMLElement>(".axis-zoom-box");
+    if (!zoomBox) {
+      zoomBox = document.createElement("div");
+      zoomBox.className = "axis-zoom-box";
+      zoomBox.style.position = "absolute";
+      zoomBox.style.pointerEvents = "none";
+      zoomBox.style.display = "none";
+      zoomBox.style.border = "1px solid rgba(255,255,255,0.9)";
+      zoomBox.style.background = "rgba(255,255,255,0.12)";
+      zoomBox.style.boxSizing = "border-box";
+      el.appendChild(zoomBox);
+    }
     const getPlotMetrics = () => {
       const rect = canvas.getBoundingClientRect();
       const st = deps.getAxisState(node);
@@ -99,8 +115,22 @@ export const updateAxisNode = (
       const bottom = Math.max(top + 1, rect.height - pad);
       return { rect, st, left, right, top, bottom, w: right - left, h: bottom - top };
     };
-    const canAxisInteract = () =>
-      deps.mode === "live" && (!(node as any).soundId || !(node as any).__soundRunning);
+    const pushHistory = (st: AxisState, view: AxisView) => {
+      st.history.push({ ...view });
+      if (st.history.length > 100) st.history.splice(0, st.history.length - 100);
+    };
+    const hideZoomBox = () => {
+      if (zoomBox) zoomBox.style.display = "none";
+    };
+    const axisLocks = () => {
+      const pressureAxis = String((node as any).pressureRole ?? "") === "axis" && !!(node as any).pressureId;
+      const soundAxis = String((node as any).soundRole ?? "") === "axis" && !!(node as any).soundId;
+      return {
+        lockX: false,
+        lockY: pressureAxis || soundAxis,
+      };
+    };
+    const canAxisInteract = () => deps.mode === "live";
     const onPointerDown = (ev: PointerEvent) => {
       if (!canAxisInteract()) return;
       if (ev.button !== 0) return;
@@ -108,38 +138,101 @@ export const updateAxisNode = (
       const x = ev.clientX - plot.rect.left;
       const y = ev.clientY - plot.rect.top;
       if (x < plot.left || x > plot.right || y < plot.top || y > plot.bottom) return;
-      isPanning = true;
+      dragMode = ev.shiftKey || ev.ctrlKey || ev.metaKey ? "zoom" : "pan";
+      activePointerId = ev.pointerId;
       startX = ev.clientX;
       startY = ev.clientY;
       startView = { ...plot.st.view };
+      deps.activateAxis(String((node as any).id ?? ""));
       canvas.setPointerCapture(ev.pointerId);
+      if (zoomBox && dragMode === "zoom") {
+        zoomBox.style.left = `${x}px`;
+        zoomBox.style.top = `${y}px`;
+        zoomBox.style.width = "0px";
+        zoomBox.style.height = "0px";
+        zoomBox.style.display = "block";
+      } else {
+        hideZoomBox();
+      }
       ev.preventDefault();
+      ev.stopPropagation();
     };
     const onPointerMove = (ev: PointerEvent) => {
-      if (!isPanning || !startView) return;
+      if (!dragMode || !startView || activePointerId !== ev.pointerId) return;
       const plot = getPlotMetrics();
-      const dx = ev.clientX - startX;
-      const dy = ev.clientY - startY;
-      const rangeX = startView.xMax - startView.xMin;
-      const rangeY = startView.yMax - startView.yMin;
-      const lockY = String((node as any).pressureRole ?? "") === "axis" && !!(node as any).pressureId;
-      const next: AxisView = {
-        xMin: startView.xMin - (dx / Math.max(1, plot.w)) * rangeX,
-        xMax: startView.xMax - (dx / Math.max(1, plot.w)) * rangeX,
-        yMin: lockY ? startView.yMin : startView.yMin - (dy / Math.max(1, plot.h)) * rangeY,
-        yMax: lockY ? startView.yMax : startView.yMax - (dy / Math.max(1, plot.h)) * rangeY,
-      };
-      plot.st.view = deps.clampAxisView(next, plot.st.limits, plot.st.clamp);
+      if (dragMode === "zoom" && zoomBox) {
+        const x0 = Math.max(plot.left, Math.min(plot.right, startX - plot.rect.left));
+        const y0 = Math.max(plot.top, Math.min(plot.bottom, startY - plot.rect.top));
+        const x1 = Math.max(plot.left, Math.min(plot.right, ev.clientX - plot.rect.left));
+        const y1 = Math.max(plot.top, Math.min(plot.bottom, ev.clientY - plot.rect.top));
+        zoomBox.style.left = `${Math.min(x0, x1)}px`;
+        zoomBox.style.top = `${Math.min(y0, y1)}px`;
+        zoomBox.style.width = `${Math.abs(x1 - x0)}px`;
+        zoomBox.style.height = `${Math.abs(y1 - y0)}px`;
+      } else if (dragMode === "pan") {
+        const { lockX, lockY } = axisLocks();
+        const dx = ev.clientX - startX;
+        const dy = ev.clientY - startY;
+        const rangeX = startView.xMax - startView.xMin;
+        const rangeY = startView.yMax - startView.yMin;
+        const next: AxisView = {
+          xMin: lockX ? startView.xMin : startView.xMin - (dx / Math.max(1, plot.w)) * rangeX,
+          xMax: lockX ? startView.xMax : startView.xMax - (dx / Math.max(1, plot.w)) * rangeX,
+          yMin: lockY ? startView.yMin : startView.yMin + (dy / Math.max(1, plot.h)) * rangeY,
+          yMax: lockY ? startView.yMax : startView.yMax + (dy / Math.max(1, plot.h)) * rangeY,
+        };
+        plot.st.view = deps.clampAxisView(next, plot.st.limits, plot.st.clamp);
+      }
       ev.preventDefault();
+      ev.stopPropagation();
     };
     const onPointerUp = (ev: PointerEvent) => {
-      if (!isPanning) return;
-      isPanning = false;
+      if (!dragMode || activePointerId !== ev.pointerId) return;
+      const finishedMode = dragMode;
+      dragMode = null;
+      activePointerId = null;
+      hideZoomBox();
+      const plot = getPlotMetrics();
+      const x0 = Math.max(plot.left, Math.min(plot.right, startX - plot.rect.left));
+      const y0 = Math.max(plot.top, Math.min(plot.bottom, startY - plot.rect.top));
+      const x1 = Math.max(plot.left, Math.min(plot.right, ev.clientX - plot.rect.left));
+      const y1 = Math.max(plot.top, Math.min(plot.bottom, ev.clientY - plot.rect.top));
+      const boxW = Math.abs(x1 - x0);
+      const boxH = Math.abs(y1 - y0);
+      const { lockX, lockY } = axisLocks();
+      if (finishedMode === "zoom" && startView && (boxW >= 8 || (!lockY && boxH >= 8))) {
+        const xMinPx = Math.min(x0, x1);
+        const xMaxPx = Math.max(x0, x1);
+        const yMinPx = Math.min(y0, y1);
+        const yMaxPx = Math.max(y0, y1);
+        const rangeX = startView.xMax - startView.xMin;
+        const rangeY = startView.yMax - startView.yMin;
+        const dataXMin = startView.xMin + ((xMinPx - plot.left) / Math.max(1, plot.w)) * rangeX;
+        const dataXMax = startView.xMin + ((xMaxPx - plot.left) / Math.max(1, plot.w)) * rangeX;
+        const dataYMax = startView.yMax - ((yMinPx - plot.top) / Math.max(1, plot.h)) * rangeY;
+        const dataYMin = startView.yMax - ((yMaxPx - plot.top) / Math.max(1, plot.h)) * rangeY;
+        const next: AxisView = {
+          xMin: lockX ? startView.xMin : Math.min(dataXMin, dataXMax),
+          xMax: lockX ? startView.xMax : Math.max(dataXMin, dataXMax),
+          yMin: lockY ? startView.yMin : Math.min(dataYMin, dataYMax),
+          yMax: lockY ? startView.yMax : Math.max(dataYMin, dataYMax),
+        };
+        pushHistory(plot.st, startView);
+        plot.st.view = deps.clampAxisView(next, plot.st.limits, plot.st.clamp);
+      } else if (finishedMode === "pan" && startView) {
+        const moved =
+          Math.abs(plot.st.view.xMin - startView.xMin) > 1e-9 ||
+          Math.abs(plot.st.view.xMax - startView.xMax) > 1e-9 ||
+          Math.abs(plot.st.view.yMin - startView.yMin) > 1e-9 ||
+          Math.abs(plot.st.view.yMax - startView.yMax) > 1e-9;
+        if (moved) pushHistory(plot.st, startView);
+      }
       startView = null;
       try {
         canvas.releasePointerCapture(ev.pointerId);
       } catch {}
       ev.preventDefault();
+      ev.stopPropagation();
     };
     const onWheel = (ev: WheelEvent) => {
       if (!canAxisInteract()) return;
@@ -154,16 +247,19 @@ export const updateAxisNode = (
       const py = y - plot.top;
       const ax = v.xMin + (px / Math.max(1, plot.w)) * rangeX;
       const ay = v.yMax - (py / Math.max(1, plot.h)) * rangeY;
-      const zoom = Math.exp(ev.deltaY * 0.001);
-      const lockY = String((node as any).pressureRole ?? "") === "axis" && !!(node as any).pressureId;
+      const zoom = Math.exp(ev.deltaY * 0.0024);
+      const { lockX, lockY } = axisLocks();
+      deps.activateAxis(String((node as any).id ?? ""));
+      pushHistory(plot.st, v);
       const next: AxisView = {
-        xMin: ax - (ax - v.xMin) * zoom,
-        xMax: ax + (v.xMax - ax) * zoom,
+        xMin: lockX ? v.xMin : ax - (ax - v.xMin) * zoom,
+        xMax: lockX ? v.xMax : ax + (v.xMax - ax) * zoom,
         yMin: lockY ? v.yMin : ay - (ay - v.yMin) * zoom,
         yMax: lockY ? v.yMax : ay + (v.yMax - ay) * zoom,
       };
       plot.st.view = deps.clampAxisView(next, plot.st.limits, plot.st.clamp);
       ev.preventDefault();
+      ev.stopPropagation();
     };
     canvas.addEventListener("pointerdown", onPointerDown);
     canvas.addEventListener("pointermove", onPointerMove);

@@ -77,9 +77,22 @@ const setMode = (m: AppMode) => {
   if (prev === "live" && m !== "live") exitFullscreen();
 };
 
+let lastUiMode = "";
+let lastUiGroupId: string | null = null;
+let lastNormalizedModelRef: any = null;
+let lastNormalizedNodeCount = -1;
+let lastScreenNormalizedModelRef: any = null;
+let lastScreenNormalizedNodeCount = -1;
+let lastScreenNormalizedSize = { w: -1, h: -1 };
+
 const syncModeUi = () => {
+  if (lastUiMode === store.mode && lastUiGroupId === store.activeGroupId) return;
+  lastUiMode = store.mode;
+  lastUiGroupId = store.activeGroupId;
   document.body.dataset.ipMode = store.mode;
-  toolbar.style.display = store.mode === "live" ? "none" : "";
+  toolbar.style.display = "";
+  modeLive.textContent = store.mode === "live" ? "Exit Live" : "Go Live";
+  modeScreen.style.display = store.mode === "live" ? "none" : "";
   if (store.activeGroupId) {
     modeScreen.textContent = "Exit Group Edit";
   } else {
@@ -88,7 +101,7 @@ const syncModeUi = () => {
 };
 syncModeUi();
 
-modeLive.addEventListener("click", () => setMode("live"));
+modeLive.addEventListener("click", () => setMode(store.mode === "live" ? "edit" : "live"));
 modeScreen.addEventListener("click", () => {
   if (store.activeGroupId) {
     window.dispatchEvent(new CustomEvent("ip-exit-group-edit"));
@@ -328,13 +341,25 @@ const updateCameraTween = (now: number) => {
 
 const tick = () => {
   const now = performance.now();
-  const r = stage.getBoundingClientRect();
-  const screen = { w: r.width, h: r.height };
-  store.screen = screen;
-  normalizeScreenNodes();
-  normalizeGroupNodes();
-  normalizeWorldNodes();
-  refreshCameraFit(store);
+  const screen = store.screen;
+  const modelChanged = lastNormalizedModelRef !== store.model || lastNormalizedNodeCount !== store.model.nodes.length;
+  const screenChanged =
+    lastScreenNormalizedModelRef !== store.model
+    || lastScreenNormalizedNodeCount !== store.model.nodes.length
+    || lastScreenNormalizedSize.w !== screen.w
+    || lastScreenNormalizedSize.h !== screen.h;
+  if (store.mode === "screen-edit" || screenChanged) {
+    normalizeScreenNodes();
+    lastScreenNormalizedModelRef = store.model;
+    lastScreenNormalizedNodeCount = store.model.nodes.length;
+    lastScreenNormalizedSize = { w: screen.w, h: screen.h };
+  }
+  if (modelChanged) {
+    normalizeGroupNodes();
+    normalizeWorldNodes();
+    lastNormalizedModelRef = store.model;
+    lastNormalizedNodeCount = store.model.nodes.length;
+  }
   updateCameraTween(now);
   const view = activeView(store);
   const cam = store.cameraOverride ?? fitCameraToScreen(view.camera, store);
@@ -378,5 +403,6 @@ const tick = () => {
 };
 
 window.addEventListener("resize", resize);
+new ResizeObserver(() => resize()).observe(stage);
 resize();
 requestAnimationFrame(tick);

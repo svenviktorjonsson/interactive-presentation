@@ -20,6 +20,22 @@ export const createSelectionRuntime = (deps: {
   toSvgAngle: (angle: number) => number;
   snapAngle: (deg: number, stepDeg: number) => number;
 }) => {
+  let frameToken = 0;
+  let cachedStageRect: DOMRect | null = null;
+  const cachedGroupRects = new Map<string, any | null>();
+
+  const beginFrame = () => {
+    frameToken += 1;
+    cachedStageRect = null;
+    cachedGroupRects.clear();
+  };
+
+  const stageRect = () => {
+    if (cachedStageRect) return cachedStageRect;
+    cachedStageRect = deps.stage.getBoundingClientRect();
+    return cachedStageRect;
+  };
+
   const distPointToSegment = (px: number, py: number, ax: number, ay: number, bx: number, by: number) => {
     const abx = bx - ax;
     const aby = by - ay;
@@ -40,33 +56,42 @@ export const createSelectionRuntime = (deps: {
   };
 
   const groupVisibleRectPx = (groupId: string) => {
+    if (cachedGroupRects.has(groupId)) return cachedGroupRects.get(groupId) ?? null;
     const groupNode = deps.store.model.nodes.find((n: any) => String(n.id) === String(groupId)) as any;
-    if (!groupNode || groupNode.type !== "group") return null;
+    if (!groupNode || groupNode.type !== "group") {
+      cachedGroupRects.set(groupId, null);
+      return null;
+    }
     const descendantRects = deps.groupDescendants(groupId)
       .map((child: any) => deps.overlay.querySelector<HTMLElement>(`.node[data-node-id="${CSS.escape(String(child.id))}"]`))
       .filter((el): el is HTMLElement => !!el && el.style.display !== "none")
       .map((el) => el.getBoundingClientRect());
-    if (!descendantRects.length) return null;
-    const stageRect = deps.stage.getBoundingClientRect();
+    if (!descendantRects.length) {
+      cachedGroupRects.set(groupId, null);
+      return null;
+    }
+    const sr = stageRect();
     const minLeft = Math.min(...descendantRects.map((r) => r.left));
     const minTop = Math.min(...descendantRects.map((r) => r.top));
     const maxRight = Math.max(...descendantRects.map((r) => r.right));
     const maxBottom = Math.max(...descendantRects.map((r) => r.bottom));
-    return {
-      left: minLeft - stageRect.left,
-      top: minTop - stageRect.top,
-      right: maxRight - stageRect.left,
-      bottom: maxBottom - stageRect.top,
+    const rect = {
+      left: minLeft - sr.left,
+      top: minTop - sr.top,
+      right: maxRight - sr.left,
+      bottom: maxBottom - sr.top,
       width: Math.max(1, maxRight - minLeft),
       height: Math.max(1, maxBottom - minTop),
-      midX: (minLeft + maxRight) / 2 - stageRect.left,
-      midY: (minTop + maxBottom) / 2 - stageRect.top,
+      midX: (minLeft + maxRight) / 2 - sr.left,
+      midY: (minTop + maxBottom) / 2 - sr.top,
     };
+    cachedGroupRects.set(groupId, rect);
+    return rect;
   };
 
   const localForNodePx = (node: any, clientX: number, clientY: number) => {
     const cam = deps.cameraForScreen();
-    const sr = deps.stage.getBoundingClientRect();
+    const sr = stageRect();
     const screen = { w: sr.width, h: sr.height };
     const px = clientX - sr.left;
     const py = clientY - sr.top;
@@ -118,7 +143,7 @@ export const createSelectionRuntime = (deps: {
 
   const arrowEndpointsScreen = (node: any) => {
     const cam = deps.cameraForScreen();
-    const sr = deps.stage.getBoundingClientRect();
+    const sr = stageRect();
     const screen = { w: sr.width, h: sr.height };
     const start = node.start ?? { x: 0, y: 0.5 };
     const end = node.end ?? { x: 1, y: 0.5 };
@@ -133,7 +158,7 @@ export const createSelectionRuntime = (deps: {
 
   const arrowPointFromClient = (node: any, clientX: number, clientY: number) => {
     const cam = deps.cameraForScreen();
-    const sr = deps.stage.getBoundingClientRect();
+    const sr = stageRect();
     const screen = { w: sr.width, h: sr.height };
     const px = clientX - sr.left;
     const py = clientY - sr.top;
@@ -144,7 +169,7 @@ export const createSelectionRuntime = (deps: {
 
   const pickNodeNearClientPoint = (clientX: number, clientY: number): string | null => {
     const cam = deps.cameraForScreen();
-    const sr = deps.stage.getBoundingClientRect();
+    const sr = stageRect();
     const screen = { w: sr.width, h: sr.height };
     const px = clientX - sr.left;
     const py = clientY - sr.top;
@@ -371,6 +396,7 @@ export const createSelectionRuntime = (deps: {
   };
 
   return {
+    beginFrame,
     distPointToSegment,
     arrowLineHitPx,
     groupVisibleRectPx,

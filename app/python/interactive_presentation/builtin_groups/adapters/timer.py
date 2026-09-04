@@ -31,8 +31,6 @@ class TimerModuleAdapter:
     reset_label = str(getattr(spec, "reset_label", None) or "Reset")
     x_label = str(getattr(spec, "x_label", None) or "Time (s)")
     y_label = str(getattr(spec, "y_label", None) or "Progress")
-    value_label = str(getattr(spec, "value_label", None) or "{{elapsed:.2f}} s")
-
     group_node: dict[str, Any] = {
       "id": base_id,
       "type": "group",
@@ -55,7 +53,6 @@ class TimerModuleAdapter:
       "timerResetLabel": reset_label,
       "timerXLabel": x_label,
       "timerYLabel": y_label,
-      "timerValueLabel": value_label,
     }
     if getattr(spec, "bg_color", None):
       group_node["bgColor"] = spec.bg_color
@@ -104,9 +101,9 @@ class TimerModuleAdapter:
       "remaining": duration_s,
       "progressPct": 0,
     }
-    labels_tpl = ["{{toggleLabel}}"]
+    labels_tpl = ["{{toggleLabel}}", "{{resetLabel}}"]
     labels = [format_template(template, tpl_data) for template in labels_tpl]
-    actions = ["timer-toggle"]
+    actions = ["timer-toggle", "timer-reset"]
     if debug:
       labels_tpl.append("Test")
       labels.append("Test")
@@ -140,9 +137,9 @@ class TimerModuleAdapter:
       buttons_node["rows"] = int(spec.rows)
     if spec.cols is not None:
       buttons_node["cols"] = int(spec.cols)
-    if debug and spec.rows is None and spec.cols is None and not spec.h_splits and not spec.v_splits:
+    if spec.rows is None and spec.cols is None and not spec.h_splits and not spec.v_splits:
       buttons_node["rows"] = 1
-      buttons_node["cols"] = 2
+      buttons_node["cols"] = 3 if debug else 2
     ctx.append_node(buttons_node, view_id=view_id, space=space, layer=layer)
 
     def _timer_text_node(node_id: str, template: str, local_t: dict[str, Any], *, align: str = "center", font_px: float = 34.0) -> dict[str, Any]:
@@ -179,13 +176,6 @@ class TimerModuleAdapter:
         "{{yLabel}}",
         {"x": 0.03, "y": 0.62, "w": 0.08, "h": 0.4, "rotationDeg": -90, "anchor": "centerCenter"},
         align="center",
-        font_px=32.0,
-      ),
-      _timer_text_node(
-        f"{base_id}_value",
-        value_label,
-        {"x": 0.85, "y": 0.92, "w": 0.3, "h": 0.08, "rotationDeg": 0, "anchor": "centerCenter"},
-        align="right",
         font_px=32.0,
       ),
       _timer_text_node(

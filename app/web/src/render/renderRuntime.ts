@@ -15,6 +15,7 @@ export type RenderRuntime = {
   iframePreviewAttempts: Map<string, number>;
   iframePreviewTimers: Map<string, number>;
   axisState: Map<string, any>;
+  activeAxisId: string | null;
   playerLinks: Map<string, any>;
   webcamLinks: Map<string, any>;
   youtubePending: Map<string, Promise<any>>;
@@ -39,6 +40,7 @@ export const createRenderRuntime = (): RenderRuntime => ({
   iframePreviewAttempts: new Map<string, number>(),
   iframePreviewTimers: new Map<string, number>(),
   axisState: new Map<string, any>(),
+  activeAxisId: null,
   playerLinks: new Map<string, any>(),
   webcamLinks: new Map<string, any>(),
   youtubePending: new Map<string, Promise<any>>(),

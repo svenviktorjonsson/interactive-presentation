@@ -37,6 +37,24 @@ type TransformDeps = {
 };
 
 export const createTransformRuntime = (deps: TransformDeps) => {
+  let handlesFramePending = false;
+  const scheduleHandleUpdate = () => {
+    if (handlesFramePending) return;
+    handlesFramePending = true;
+    requestAnimationFrame(() => {
+      handlesFramePending = false;
+      deps.updateHandles();
+    });
+  };
+
+  const resolveTargetNodes = (targetIds: string[]) =>
+    targetIds
+      .map((tid) => deps.store.model.nodes.find((n) => n.id === tid) as any)
+      .filter((n): n is any => !!n);
+
+  const resolveGroupChildNodes = (node: any) =>
+    node.type === "group" ? deps.groupDescendants(node.id).filter((n): n is any => !!n) : [];
+
   const groupChildStartsFor = (node: any) =>
     node.type === "group"
       ? deps.groupDescendants(node.id).map((n: any) => ({
@@ -63,16 +81,18 @@ export const createTransformRuntime = (deps: TransformDeps) => {
     const node = deps.store.model.nodes.find((n) => n.id === nodeId) as any;
     if (!node) return null;
     const targetIds = buildTargetIds(node);
+    const targetNodes = resolveTargetNodes(targetIds);
+    const groupChildNodes = resolveGroupChildNodes(node);
     return {
       kind: "move",
       pointerId: ev.pointerId,
       nodeId,
       targetIds,
+      targetNodes,
+      node,
+      groupChildNodes,
       zBumped: false,
-      starts: targetIds
-        .map((tid) => deps.store.model.nodes.find((n) => n.id === tid))
-        .filter((n): n is any => !!n)
-        .map((n) => ({
+      starts: targetNodes.map((n) => ({
           id: String(n.id),
           x: n.transform.x,
           y: n.transform.y,
@@ -106,15 +126,17 @@ export const createTransformRuntime = (deps: TransformDeps) => {
           })()
         : Math.atan2(wp!.y - node.transform.y, wp!.x - node.transform.x);
     const targetIds = buildTargetIds(node);
+    const targetNodes = resolveTargetNodes(targetIds);
+    const groupChildNodes = resolveGroupChildNodes(node);
     return {
       kind: "rotate",
       pointerId: ev.pointerId,
       nodeId,
       targetIds,
-      starts: targetIds
-        .map((tid) => deps.store.model.nodes.find((n) => n.id === tid))
-        .filter((n): n is any => !!n)
-        .map((n) => ({ id: String(n.id), rotationDeg: n.transform.rotationDeg, x: n.transform.x, y: n.transform.y })),
+      targetNodes,
+      node,
+      groupChildNodes,
+      starts: targetNodes.map((n) => ({ id: String(n.id), rotationDeg: n.transform.rotationDeg, x: n.transform.x, y: n.transform.y })),
       groupChildStarts: groupChildStartsFor(node),
       groupStart: node.type === "group" ? { x: node.transform.x, y: node.transform.y, w: node.transform.w, h: node.transform.h, rotationDeg: node.transform.rotationDeg } : undefined,
       corner: handle,
@@ -129,8 +151,9 @@ export const createTransformRuntime = (deps: TransformDeps) => {
     const node = deps.store.model.nodes.find((n) => n.id === nodeId) as any;
     if (!node) return null;
     const targetIds = buildTargetIds(node);
-    for (const tid of targetIds) {
-      const n = deps.store.model.nodes.find((x) => x.id === tid) as any;
+    const targetNodes = resolveTargetNodes(targetIds);
+    const groupChildNodes = resolveGroupChildNodes(node);
+    for (const n of targetNodes) {
       if (!n) continue;
       n.__resizing = true;
       n.__resizeHandle = handle;
@@ -142,10 +165,10 @@ export const createTransformRuntime = (deps: TransformDeps) => {
       pointerId: ev.pointerId,
       nodeId,
       targetIds,
-      starts: targetIds
-        .map((tid) => deps.store.model.nodes.find((n) => n.id === tid))
-        .filter((n): n is any => !!n)
-        .map((n) => ({ id: String(n.id), w: n.transform.w, h: n.transform.h, fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : 0 })),
+      targetNodes,
+      node,
+      groupChildNodes,
+      starts: targetNodes.map((n) => ({ id: String(n.id), w: n.transform.w, h: n.transform.h, fontPx: n.type === "text" || n.type === "bullets" ? n.fontPx : 0 })),
       groupChildStarts: groupChildStartsFor(node),
       groupStart: node.type === "group" ? { x: node.transform.x, y: node.transform.y, w: node.transform.w, h: node.transform.h, rotationDeg: node.transform.rotationDeg } : undefined,
       groupVisualStart: groupVisualStart ? { midX: groupVisualStart.midX, midY: groupVisualStart.midY, width: groupVisualStart.width, height: groupVisualStart.height } : undefined,
@@ -195,8 +218,9 @@ export const createTransformRuntime = (deps: TransformDeps) => {
           dY = ny - owner.startY;
         }
       }
-      for (const s of owner.starts) {
-        const node = deps.store.model.nodes.find((n) => n.id === s.id) as any;
+      for (let i = 0; i < owner.starts.length; i += 1) {
+        const s = owner.starts[i];
+        const node = owner.targetNodes?.[i] as any;
         if (!node) continue;
         if (node.type === "arrow") {
           const sStart = s.start ?? node.start ?? { x: 0, y: 0.5 };
@@ -210,18 +234,19 @@ export const createTransformRuntime = (deps: TransformDeps) => {
         node.transform.y = s.y + dY;
       }
       if (owner.groupChildStarts?.length) {
-        for (const st of owner.groupChildStarts) {
-          const node = deps.store.model.nodes.find((n) => n.id === st.id) as any;
+        for (let i = 0; i < owner.groupChildStarts.length; i += 1) {
+          const st = owner.groupChildStarts[i];
+          const node = owner.groupChildNodes?.[i] as any;
           if (!node) continue;
           node.transform.x = st.x + dX;
           node.transform.y = st.y + dY;
         }
       }
-      deps.updateHandles();
+      scheduleHandleUpdate();
       return true;
     }
     if (owner.kind === "rotate") {
-      const node = deps.store.model.nodes.find((n) => n.id === owner.nodeId) as any;
+      const node = owner.node as any;
       if (!node) return true;
       const cam = deps.cameraForScreen();
       const r = deps.stage.getBoundingClientRect();
@@ -243,16 +268,18 @@ export const createTransformRuntime = (deps: TransformDeps) => {
       if (ev.shiftKey) nextDeg = deps.snapTo(nextDeg, deps.rotSnapDeg);
       const deltaDeg = nextDeg - owner.startRotationDeg;
       if (node.type === "group" && owner.groupChildStarts && owner.groupStart) {
-        for (const s of owner.starts) {
-          const n = deps.store.model.nodes.find((x) => x.id === s.id) as any;
+        for (let i = 0; i < owner.starts.length; i += 1) {
+          const s = owner.starts[i];
+          const n = owner.targetNodes?.[i] as any;
           if (!n) continue;
           n.transform.rotationDeg = s.rotationDeg + deltaDeg;
         }
         const rot = (deltaDeg * Math.PI) / 180;
         const cos = Math.cos(rot);
         const sin = Math.sin(rot);
-        for (const st of owner.groupChildStarts) {
-          const n = deps.store.model.nodes.find((x) => x.id === st.id) as any;
+        for (let i = 0; i < owner.groupChildStarts.length; i += 1) {
+          const st = owner.groupChildStarts[i];
+          const n = owner.groupChildNodes?.[i] as any;
           if (!n) continue;
           const dx = st.x - owner.groupStart.x;
           const dy = st.y - owner.groupStart.y;
@@ -260,8 +287,9 @@ export const createTransformRuntime = (deps: TransformDeps) => {
           n.transform.y = owner.groupStart.y + dx * sin + dy * cos;
         }
       } else {
-        for (const s of owner.starts) {
-          const n = deps.store.model.nodes.find((x) => x.id === s.id) as any;
+        for (let i = 0; i < owner.starts.length; i += 1) {
+          const s = owner.starts[i];
+          const n = owner.targetNodes?.[i] as any;
           if (!n) continue;
           n.transform.rotationDeg = s.rotationDeg + deltaDeg;
         }
@@ -270,11 +298,11 @@ export const createTransformRuntime = (deps: TransformDeps) => {
       const rotYour = -(owner.startRotationDeg + deltaDeg);
       const yourAngle = deps.cursorAngleYourForHandle(rotYour, owner.corner);
       deps.overlay.style.cursor = deps.cursorForRotate(deps.toSvgAngle(yourAngle));
-      deps.updateHandles();
+      scheduleHandleUpdate();
       return true;
     }
     if (owner.kind === "resize") {
-      const node = deps.store.model.nodes.find((n) => n.id === owner.nodeId) as any;
+      const node = owner.node as any;
       if (!node) return true;
       const t = node.transform;
       const cam = deps.cameraForScreen();
@@ -308,8 +336,9 @@ export const createTransformRuntime = (deps: TransformDeps) => {
         const rotG = (owner.groupStart.rotationDeg * Math.PI) / 180;
         const cosG = Math.cos(rotG);
         const sinG = Math.sin(rotG);
-        for (const st of owner.groupChildStarts) {
-          const n = deps.store.model.nodes.find((x) => x.id === st.id) as any;
+        for (let i = 0; i < owner.groupChildStarts.length; i += 1) {
+          const st = owner.groupChildStarts[i];
+          const n = owner.groupChildNodes?.[i] as any;
           if (!n) continue;
           const dx = st.x - owner.groupStart.x;
           const dy = st.y - owner.groupStart.y;
@@ -362,7 +391,7 @@ export const createTransformRuntime = (deps: TransformDeps) => {
           }
           applyGroupResize(s, s);
           owner.dirty = true;
-          deps.updateHandles();
+          scheduleHandleUpdate();
           return true;
         }
       }
@@ -402,20 +431,26 @@ export const createTransformRuntime = (deps: TransformDeps) => {
       owner.dirty = true;
       const sx = t.w / Math.max(1e-9, owner.startW);
       const sy = t.h / Math.max(1e-9, owner.startH);
-      for (const st of owner.starts) {
-        if (st.id === owner.nodeId) continue;
-        const n = deps.store.model.nodes.find((x) => x.id === st.id) as any;
-        if (!n) continue;
-        n.transform.w = Math.max(minW, st.w * sx);
-        n.transform.h = Math.max(minH, st.h * sy);
-        if ((n.type === "text" || n.type === "bullets") && isCorner) n.fontPx = Math.max(1, st.fontPx * sx);
+      const shouldScaleGroupContents = isCorner || node.type !== "group";
+      if (shouldScaleGroupContents) {
+        for (let i = 0; i < owner.starts.length; i += 1) {
+          const st = owner.starts[i];
+          if (st.id === owner.nodeId) continue;
+          const n = owner.targetNodes?.[i] as any;
+          if (!n) continue;
+          n.transform.w = Math.max(minW, st.w * sx);
+          n.transform.h = Math.max(minH, st.h * sy);
+          if ((n.type === "text" || n.type === "bullets") && isCorner) n.fontPx = Math.max(1, st.fontPx * sx);
+        }
       }
       if ((node.type === "text" || node.type === "bullets") && isCorner) {
         const sW = t.w / Math.max(1e-9, owner.startW);
         node.fontPx = Math.max(1, owner.startFontPx * sW);
       }
-      applyGroupResize(finalWpx / Math.max(1e-9, startWpx), finalHpx / Math.max(1e-9, startHpx));
-      deps.updateHandles();
+      if (node.type === "group" && isCorner) {
+        applyGroupResize(finalWpx / Math.max(1e-9, startWpx), finalHpx / Math.max(1e-9, startHpx));
+      }
+      scheduleHandleUpdate();
       return true;
     }
     return false;
@@ -424,11 +459,9 @@ export const createTransformRuntime = (deps: TransformDeps) => {
   const finishPointerUp = (owner: any) => {
     if (!owner || (owner.kind !== "move" && owner.kind !== "rotate" && owner.kind !== "resize")) return false;
     if (owner.kind === "resize") {
-      const ids: string[] = owner.targetIds ?? [];
       const handle = String(owner.handle ?? "");
       const isEdgeHandle = handle === "n" || handle === "s" || handle === "e" || handle === "w";
-      for (const id of ids) {
-        const n = deps.store.model.nodes.find((x) => x.id === id) as any;
+      for (const n of owner.targetNodes ?? []) {
         if (!n) continue;
         if (n.__resizing) delete n.__resizing;
         if (n.__resizeHandle) delete n.__resizeHandle;
@@ -446,10 +479,14 @@ export const createTransformRuntime = (deps: TransformDeps) => {
         deps.bumpZIndex(targetIds);
       }
       const baseIds: string[] = owner.targetIds ?? [owner.nodeId].filter(Boolean);
-      const ownerNode = owner.nodeId ? deps.store.model.nodes.find((x) => x.id === owner.nodeId) : null;
+      const ownerNode = owner.nodeId ? (owner.node as any) : null;
       const persistIds = ownerNode && ownerNode.type === "group" ? [String(ownerNode.id)] : baseIds;
       for (const id of persistIds) {
-        const n: any = deps.store.model.nodes.find((x) => x.id === id);
+        const n: any =
+          id === owner.nodeId
+            ? ownerNode
+            : owner.targetNodes?.find((node: any) => String(node.id) === String(id)) ??
+              deps.store.model.nodes.find((x) => x.id === id);
         if (!n) continue;
         const viewId = deps.persistViewIdForNode(n, deps.store.activeViewId);
         if (n.type !== "arrow") {
@@ -486,6 +523,7 @@ export const createTransformRuntime = (deps: TransformDeps) => {
         }
       }
     }
+    handlesFramePending = false;
     deps.updateHandles();
     return true;
   };

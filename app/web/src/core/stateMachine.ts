@@ -942,28 +942,32 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     const or = overlay.getBoundingClientRect();
     const left = nr.left - or.left;
     const width = nr.width;
-
-    // Keep editor width glued to bbox width.
-    ed.el.style.left = `${left}px`;
-    ed.el.style.width = `${width}px`;
-
-    // Rows: one more than number of lines (min 2).
     const lines = String(ed.el.value ?? "").split("\n").length;
-    ed.el.rows = Math.max(2, lines + 1);
+    const lineCount = Math.max(2, lines + 1);
+    const cache = ed.layoutCache;
+    const widthChanged = !cache || Math.abs(cache.width - width) > 0.5;
+    const leftChanged = !cache || Math.abs(cache.left - left) > 0.5;
+    const lineCountChanged = !cache || cache.lineCount !== lineCount;
+    if (leftChanged) ed.el.style.left = `${left}px`;
+    if (widthChanged) ed.el.style.width = `${width}px`;
+    if (lineCountChanged) ed.el.rows = lineCount;
 
-    // Place just above bbox.
-    const h = ed.el.getBoundingClientRect().height;
+    const h =
+      widthChanged || lineCountChanged || !cache
+        ? ed.el.getBoundingClientRect().height
+        : cache.height;
     const top = Math.max(8, nr.top - or.top - h - 6);
-    ed.el.style.top = `${top}px`;
+    const topChanged = !cache || Math.abs(cache.top - top) > 0.5;
+    if (topChanged) ed.el.style.top = `${top}px`;
+    if (leftChanged) ed.errEl.style.left = `${left}px`;
+    if (widthChanged) ed.errEl.style.width = `${width}px`;
+    if (topChanged || widthChanged || lineCountChanged) ed.errEl.style.top = `${top + h + 4}px`;
 
-    ed.errEl.style.left = ed.el.style.left;
-    ed.errEl.style.width = ed.el.style.width;
-    ed.errEl.style.top = `${top + h + 4}px`;
-
-    ed.alignEl.style.left = ed.el.style.left;
-    ed.alignEl.style.top = ed.el.style.top;
-    ed.alignEl.style.width = ed.el.style.width;
-    ed.alignEl.style.height = "0px";
+    if (leftChanged) ed.alignEl.style.left = `${left}px`;
+    if (topChanged) ed.alignEl.style.top = `${top}px`;
+    if (widthChanged) ed.alignEl.style.width = `${width}px`;
+    if (!cache) ed.alignEl.style.height = "0px";
+    ed.layoutCache = { lineCount, left, width, top, height: h };
   };
 
   const pointWithinRectMargin = (x: number, y: number, rect: DOMRect | undefined | null, margin: number) => {
@@ -1250,6 +1254,7 @@ export function attachStateMachine(opts: { stage: HTMLElement; overlay: HTMLElem
     snapAngle,
   });
   const {
+    beginFrame: beginSelectionFrame,
     distPointToSegment,
     arrowLineHitPx,
     groupVisibleRectPx,
@@ -3054,6 +3059,7 @@ const normalizePointForPersist = (
 
     activeTextEditor = {
       nodeId,
+      nodeRef: node,
       el: ta,
       errEl: err,
       alignEl,
@@ -3062,18 +3068,12 @@ const normalizePointForPersist = (
       currentAlign: align,
       everEntered: false,
       startSnapshot: snapshotNow(),
+      layoutCache: undefined,
     };
     if (pendingTextEdit?.nodeId === nodeId) pendingTextEdit = null;
     updateEditorAlignUi(activeTextEditor, align);
 
-    const updateRows = () => {
-      const lines = String(ta.value ?? "").split("\n").length;
-      // "one more row than there are text" => minimum 2 rows.
-      ta.rows = Math.max(2, lines + 1);
-    };
-
     const layout = () => {
-      updateRows();
       const nr2 = nodeEl.getBoundingClientRect();
       const or2 = overlay.getBoundingClientRect();
       // IMPORTANT: editor width follows the node's bbox width exactly.
@@ -3092,6 +3092,13 @@ const normalizePointForPersist = (
       alignEl.style.top = ta.style.top;
       alignEl.style.width = ta.style.width;
       alignEl.style.height = "0px";
+      activeTextEditor!.layoutCache = {
+        lineCount: Math.max(2, String(ta.value ?? "").split("\n").length + 1),
+        left: left2,
+        width: width2,
+        top: desiredTop,
+        height: taH,
+      };
     };
 
     requestAnimationFrame(() => {
@@ -3104,7 +3111,7 @@ const normalizePointForPersist = (
     });
 
     ta.addEventListener("input", () => {
-      const n: any = store.model.nodes.find((x) => x.id === nodeId);
+      const n: any = activeTextEditor?.nodeId === nodeId ? activeTextEditor.nodeRef : store.model.nodes.find((x) => x.id === nodeId);
       if (!n) return;
       if (n.type === "text") {
         const tableCandidate = parseTableCandidate(ta.value);
@@ -3197,6 +3204,7 @@ const normalizePointForPersist = (
           delete n.rawText;
           delete n.items;
           delete n.bullets;
+          if (activeTextEditor) activeTextEditor.nodeRef = n;
           return;
         }
         const display = renderBulletEditorValue(parsed.items, n.bullets || parsed.spec || "1.");
@@ -3210,6 +3218,10 @@ const normalizePointForPersist = (
           }
           ta.setSelectionRange(nextStart, nextEnd);
         }
+      }
+      if (activeTextEditor && activeTextEditor.nodeId === nodeId) {
+        activeTextEditor.nodeRef = n;
+        activeTextEditor.layoutCache = undefined;
       }
       // Layout is synced from the main render frame hook (after renderScene).
 
@@ -3667,6 +3679,13 @@ const normalizePointForPersist = (
 
     // Undo / redo
     if (isUndoKey && !ev.shiftKey) {
+      if (store.mode === "live") {
+        const axisUndone = Boolean((window as any).ipAxisStream?.undoView?.());
+        if (axisUndone) {
+          ev.preventDefault();
+          return;
+        }
+      }
       ev.preventDefault();
       const snap = undoStack.pop();
       if (!snap) return;
@@ -3781,6 +3800,7 @@ const normalizePointForPersist = (
   // Frame hook: call this once per render frame (after renderScene) so any DOM size
   // changes are already applied, avoiding "floating" editor/handles.
   const frame = () => {
+    beginSelectionFrame();
     if (store.cameraOverride && store.mode !== "live") {
       const z = Number(store.cameraOverride.zoom);
       if (!Number.isFinite(z) || z <= 0) {

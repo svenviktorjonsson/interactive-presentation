@@ -179,7 +179,7 @@ const formatRuntimeData = (rt: TimerRuntime) => {
   return { mu: rt.mu, sigma: rt.sigma, count: rt.samples.length };
 };
 
-const updateLabels = (rt: TimerRuntime, links: TimerLinks, timeMs: number) => {
+const updateLabels = (rt: TimerRuntime, links: TimerLinks, _timeMs: number) => {
   const toggleLabel = rt.accepting ? rt.stopLabel : rt.startLabel;
   const data = {
     toggleLabel,
@@ -198,15 +198,6 @@ const updateLabels = (rt: TimerRuntime, links: TimerLinks, timeMs: number) => {
   };
   applyText(links.xLabel, rt.xLabel);
   applyText(links.yLabel, rt.yLabel);
-  if (links.value) {
-    const baseColor = String((links.value as any).__baseColor ?? (links.value as any).color ?? "rgba(255,255,255,0.92)");
-    (links.value as any).__baseColor = baseColor;
-    const hasRun = rt.samples.length > 0;
-    const dots = ".".repeat(Math.floor(timeMs / 300) % 4);
-    const statusText = rt.accepting ? `Running${dots}` : hasRun ? "Stopped" : "Ready";
-    if ((links.value as any).text !== statusText) (links.value as any).text = statusText;
-    (links.value as any).color = rt.accepting ? "rgba(110,255,110,0.95)" : baseColor;
-  }
   applyText(links.stats);
   if (links.buttons) {
     const templates = Array.isArray(links.buttons.templates)
@@ -239,7 +230,7 @@ const updateLabels = (rt: TimerRuntime, links: TimerLinks, timeMs: number) => {
       actions.push(...filteredActions);
       if (!links.buttons.hSplits && !links.buttons.vSplits) {
         links.buttons.rows = 1;
-        links.buttons.cols = 1;
+        links.buttons.cols = Math.max(2, templates.length || actions.length || 2);
       }
     }
     const labels = templates.map((tpl: string) => formatTemplate(tpl, data));

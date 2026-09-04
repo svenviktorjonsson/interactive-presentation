@@ -37,7 +37,7 @@ class ModelCompilerRegressionTests(unittest.TestCase):
 
   def test_timer_compiles_non_placeholder_labels(self) -> None:
     nodes = self._compiled_nodes()
-    self.assertEqual(nodes["timer_main_buttons"]["labels"], ["Start"])
+    self.assertEqual(nodes["timer_main_buttons"]["labels"], ["Start", "Reset"])
     self.assertEqual(nodes["timer_main_x_label"]["text"], "Time (s)")
     self.assertEqual(nodes["timer_main_y_label"]["text"], "Progress")
 

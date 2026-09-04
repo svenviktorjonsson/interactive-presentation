@@ -35,6 +35,7 @@ type PressureRuntime = {
   runLabel: string;
   resumeLabel: string;
   pauseLabel: string;
+  resetLabel: string;
   xLabel: string;
   yLabel: string;
   maxPoints: number;
@@ -322,19 +323,40 @@ const shutdownPressure = (rt: PressureRuntime) => {
   rt.running = false;
 };
 
+const resetPressure = (rt: PressureRuntime) => {
+  rt.running = false;
+  rt.hasRunOnce = false;
+  rt.pressure = [];
+  rt.timeCursorS = 0;
+  rt.lastPeakTimes = [];
+  rt.lastEmittedTimeS = -Infinity;
+  rt.lastProcessedTimeS = -Infinity;
+  rt.timePeakActive = false;
+  rt.timePeakRow = null;
+  rt.needsViewReset = true;
+  const axisId = `${rt.id}_axis`;
+  (window as any).ipAxisStream?.clear(axisId);
+  (window as any).ipAxisStream?.resetView?.(axisId);
+};
+
 const ensurePressureBus = () => {
   if (pressureBusInstalled || typeof window === "undefined") return;
   pressureBusInstalled = true;
   window.addEventListener("ip-buttons-action", (ev: Event) => {
     const detail = (ev as CustomEvent).detail as any;
     const action = String(detail?.action ?? "");
-    if (action !== "pressure-toggle") return;
+    if (action !== "pressure-toggle" && action !== "pressure-reset") return;
     const store = activeStore;
     if (!store || store.mode !== "live") return;
     const btnId = String(detail?.id ?? "");
     const pressureId = pressureButtons.get(btnId) || (btnId.endsWith("_buttons") ? btnId.slice(0, -"_buttons".length) : "");
     if (!pressureId) return;
     const rt = ensureRuntime(pressureId);
+    if (action === "pressure-reset") {
+      resetPressure(rt);
+      void stopPressure(rt);
+      return;
+    }
     if (rt.running) void stopPressure(rt);
     else void startPressure(rt);
   });
@@ -357,6 +379,7 @@ const ensureRuntime = (id: string): PressureRuntime => {
     runLabel: "Run",
     resumeLabel: "Resume",
     pauseLabel: "Pause",
+    resetLabel: "Reset",
     xLabel: "Time (s)",
     yLabel: "Pressure",
     maxPoints: 2000,
@@ -431,6 +454,7 @@ const updateLabels = (rt: PressureRuntime, links: PressureLinks) => {
     runLabel: rt.runLabel,
     resumeLabel: rt.resumeLabel,
     pauseLabel: rt.pauseLabel,
+    resetLabel: rt.resetLabel,
     xLabel: rt.xLabel,
     yLabel: rt.yLabel,
     peakLabel: rt.peakLabel,
@@ -540,6 +564,7 @@ const syncRuntimeFromNodes = (rt: PressureRuntime, links: PressureLinks) => {
   const nextRunLabel = String(root?.pressureRunLabel ?? root?.runLabel ?? rt.runLabel);
   const nextResumeLabel = String(root?.pressureResumeLabel ?? root?.resumeLabel ?? rt.resumeLabel);
   const nextPauseLabel = String(root?.pressurePauseLabel ?? root?.pauseLabel ?? rt.pauseLabel);
+  const nextResetLabel = String(root?.pressureResetLabel ?? root?.resetLabel ?? rt.resetLabel);
   const nextXLabel = String(root?.pressureXLabel ?? root?.xLabel ?? rt.xLabel);
   const nextYLabel = String(root?.pressureYLabel ?? root?.yLabel ?? rt.yLabel);
   const nextPeakLabel = String(root?.pressurePeakLabel ?? root?.peakLabel ?? rt.peakLabel);
@@ -560,6 +585,7 @@ const syncRuntimeFromNodes = (rt: PressureRuntime, links: PressureLinks) => {
   if (nextRunLabel && nextRunLabel !== rt.runLabel) rt.runLabel = nextRunLabel;
   if (nextResumeLabel && nextResumeLabel !== rt.resumeLabel) rt.resumeLabel = nextResumeLabel;
   if (nextPauseLabel && nextPauseLabel !== rt.pauseLabel) rt.pauseLabel = nextPauseLabel;
+  if (nextResetLabel && nextResetLabel !== rt.resetLabel) rt.resetLabel = nextResetLabel;
   if (nextXLabel && nextXLabel !== rt.xLabel) rt.xLabel = nextXLabel;
   if (nextYLabel && nextYLabel !== rt.yLabel) rt.yLabel = nextYLabel;
   if (nextPeakLabel && nextPeakLabel !== rt.peakLabel) rt.peakLabel = nextPeakLabel;

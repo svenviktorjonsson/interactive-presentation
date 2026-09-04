@@ -67,10 +67,10 @@ class CompositeAdapterTests(unittest.TestCase):
     ids = [node["id"] for node in self.nodes]
     self.assertEqual(
       ids,
-      ["timer_test", "timer_test_axis", "timer_test_buttons", "timer_test_x_label", "timer_test_y_label", "timer_test_value", "timer_test_stats"],
+      ["timer_test", "timer_test_axis", "timer_test_buttons", "timer_test_x_label", "timer_test_y_label", "timer_test_stats"],
     )
     self.assertEqual(self.nodes[1]["timerRole"], "axis")
-    self.assertEqual(self.nodes[2]["actions"], ["timer-toggle"])
+    self.assertEqual(self.nodes[2]["actions"], ["timer-toggle", "timer-reset"])
 
   def test_experiment_adapter_builds_table_axis_text_and_buttons(self) -> None:
     spec = ExperimentSpec(
@@ -164,7 +164,7 @@ class CompositeAdapterTests(unittest.TestCase):
       ["spectrum_test", "spectrum_test_axis", "spectrum_test_buttons", "spectrum_test_x_label", "spectrum_test_y_label", "spectrum_test_peak"],
     )
     self.assertEqual(self.nodes[1]["soundRole"], "axis")
-    self.assertEqual(self.nodes[2]["actions"], ["sound-toggle"])
+    self.assertEqual(self.nodes[2]["actions"], ["sound-toggle", "sound-reset"])
 
 
 if __name__ == "__main__":

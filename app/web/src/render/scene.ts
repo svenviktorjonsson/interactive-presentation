@@ -6,15 +6,30 @@ import type { Node } from "../core/model";
 import { renderTextWithKatexToHtmlCached } from "./textMath";
 import { findNodeRenderAdapter } from "./nodeRenderRegistry";
 import { updateBuiltinRenderModules } from "./moduleRegistry";
-import { persistButtons } from "../core/transport";
+import { persistButtons, persistElement } from "../core/transport";
 import { isNodeInteractiveInMode } from "../core/mode";
 import { sharedRenderRuntime } from "./renderRuntime";
 
-type DomNodeHandle = { id: string; el: HTMLElement; update: () => void; destroy: () => void };
+type DomNodeHandle = {
+  id: string;
+  el: HTMLElement;
+  update: () => void;
+  destroy: () => void;
+  lastStaticRenderKey?: string;
+};
 
 export type Scene = {
   overlay: HTMLElement;
   domNodes: Map<string, DomNodeHandle>;
+  derivedCache: {
+    modelRef: Store["model"] | null;
+    nodeCount: number;
+    viewCount: number;
+    byId: Set<string>;
+    parentById: Map<string, string>;
+    nodeById: Map<string, any>;
+    viewById: Map<string, any>;
+  };
 };
 
 let colorProbe: HTMLElement | null = sharedRenderRuntime.colorProbe;
@@ -33,6 +48,7 @@ const cameraPreviewCooldown = sharedRenderRuntime.cameraPreviewCooldown;
 const iframePreviewAttempts = sharedRenderRuntime.iframePreviewAttempts;
 const iframePreviewTimers = sharedRenderRuntime.iframePreviewTimers;
 const axisState = sharedRenderRuntime.axisState as Map<string, AxisState>;
+const activeAxisIdRef = sharedRenderRuntime;
 const playerLinks = sharedRenderRuntime.playerLinks as Map<
   string,
   {
@@ -64,6 +80,7 @@ type AxisState = {
   padPx: number;
   maxPoints: number;
   series: Map<string, AxisSeries>;
+  history: AxisView[];
 };
 type AxisPacket = {
   axisId?: string;
@@ -472,6 +489,7 @@ const getAxisState = (node: any): AxisState => {
     existing.padPx = padPx;
     existing.maxPoints = maxPoints;
     existing.clamp = !!clamp;
+    existing.history = Array.isArray(existing.history) ? existing.history : [];
     if (limits) existing.view = clampAxisView(existing.view, limits, existing.clamp);
     return existing;
   }
@@ -485,7 +503,7 @@ const getAxisState = (node: any): AxisState => {
       }
     : fallback;
   const view = clampAxisView(baseView, limits, !!clamp);
-  const st: AxisState = { view, limits, clamp: !!clamp, padPx, maxPoints, series: new Map() };
+  const st: AxisState = { view, limits, clamp: !!clamp, padPx, maxPoints, series: new Map(), history: [] };
   axisState.set(id, st);
   return st;
 };
@@ -501,6 +519,7 @@ const applyAxisPacket = (packet: AxisPacket) => {
       padPx: 40,
       maxPoints: 2000,
       series: new Map(),
+      history: [],
     };
     axisState.set(axisId, st);
     return st;
@@ -537,6 +556,7 @@ const ensureAxisStream = () => {
     clear: (axisId?: string, seriesId?: string) => {
       if (!axisId) {
         axisState.clear();
+        activeAxisIdRef.activeAxisId = null;
         return;
       }
       const st = axisState.get(String(axisId));
@@ -550,7 +570,7 @@ const ensureAxisStream = () => {
       const st =
         axisState.get(id) ??
         (() => {
-          const base: AxisState = { view: axisDefaultView(), limits: null, clamp: false, padPx: 40, maxPoints: 2000, series: new Map() };
+          const base: AxisState = { view: axisDefaultView(), limits: null, clamp: false, padPx: 40, maxPoints: 2000, series: new Map(), history: [] };
           axisState.set(id, base);
           return base;
         })();
@@ -561,6 +581,39 @@ const ensureAxisStream = () => {
         yMax: Number.isFinite(Number(view.yMax)) ? Number(view.yMax) : st.view.yMax,
       };
       st.view = clampAxisView(next, st.limits, st.clamp);
+      activeAxisIdRef.activeAxisId = id;
+    },
+    undoView: (axisId?: string) => {
+      const id = String(axisId || activeAxisIdRef.activeAxisId || "");
+      if (!id) return false;
+      const st = axisState.get(id);
+      const prev = st?.history?.pop();
+      if (!st || !prev) return false;
+      st.view = clampAxisView(prev, st.limits, st.clamp);
+      activeAxisIdRef.activeAxisId = id;
+      return true;
+    },
+    resetView: (axisId?: string) => {
+      const id = String(axisId || activeAxisIdRef.activeAxisId || "");
+      if (!id) return false;
+      const st = axisState.get(id);
+      if (!st) return false;
+      const base = st.limits ? { ...st.limits } : axisDefaultView();
+      const next = clampAxisView(base, st.limits, st.clamp);
+      if (
+        Math.abs(st.view.xMin - next.xMin) < 1e-9 &&
+        Math.abs(st.view.xMax - next.xMax) < 1e-9 &&
+        Math.abs(st.view.yMin - next.yMin) < 1e-9 &&
+        Math.abs(st.view.yMax - next.yMax) < 1e-9
+      ) return false;
+      st.history.push({ ...st.view });
+      if (st.history.length > 100) st.history.splice(0, st.history.length - 100);
+      st.view = next;
+      activeAxisIdRef.activeAxisId = id;
+      return true;
+    },
+    setActive: (axisId?: string) => {
+      activeAxisIdRef.activeAxisId = axisId ? String(axisId) : null;
     },
   };
   window.addEventListener(AXIS_STREAM_EVENT, (ev: Event) => {
@@ -912,8 +965,97 @@ const releaseYoutubePortal = (nodeId: string, frame: HTMLElement, iframe: HTMLIF
 };
 
 export function createScene(overlay: HTMLElement): Scene {
-  return { overlay, domNodes: new Map() };
+  return {
+    overlay,
+    domNodes: new Map(),
+    derivedCache: {
+      modelRef: null,
+      nodeCount: -1,
+      viewCount: -1,
+      byId: new Set(),
+      parentById: new Map(),
+      nodeById: new Map(),
+      viewById: new Map(),
+    },
+  };
 }
+
+const STATIC_NODE_TYPES = new Set(["text", "bullets", "image", "arrow", "join", "group"]);
+
+const buildStaticRenderKey = (
+  node: any,
+  screen: { w: number; h: number },
+  camera: { cx: number; cy: number; zoom: number },
+  mode: string,
+  selected: boolean,
+  activeGroupId: string | null,
+  inGroup: boolean,
+  disableForMode: boolean,
+  disableForGrouping: boolean
+) => {
+  const t = node.transform ?? {};
+  const base = [
+    node.type,
+    node.space,
+    node.viewId ?? "",
+    node.screenId ?? "",
+    node.groupId ?? "",
+    node.visible ? 1 : 0,
+    node.opacity ?? 1,
+    node.zIndex ?? 0,
+    t.x ?? 0,
+    t.y ?? 0,
+    t.w ?? 0,
+    t.h ?? 0,
+    t.rotationDeg ?? 0,
+    t.anchor ?? "",
+    node.fontPx ?? "",
+    node.align ?? "",
+    node.bgColor ?? "",
+    node.bgAlpha ?? "",
+    node.bgPadding ?? "",
+    node.bgRadius ?? "",
+    mode,
+    selected ? 1 : 0,
+    activeGroupId ?? "",
+    inGroup ? 1 : 0,
+    disableForMode ? 1 : 0,
+    disableForGrouping ? 1 : 0,
+    screen.w,
+    screen.h,
+  ];
+  if (node.space !== "screen") {
+    base.push(camera.cx, camera.cy, camera.zoom);
+  }
+  switch (node.type) {
+    case "text":
+      base.push(node.text ?? "", node.color ?? "", node.template ?? "");
+      break;
+    case "bullets":
+      base.push(node.rawText ?? "", node.bullets ?? "", JSON.stringify(node.items ?? []), node.color ?? "", node.template ?? "");
+      break;
+    case "image":
+      base.push(node.src ?? "");
+      break;
+    case "arrow":
+      base.push(
+        node.start?.x ?? "",
+        node.start?.y ?? "",
+        node.end?.x ?? "",
+        node.end?.y ?? "",
+        node.color ?? "",
+        node.strokePx ?? ""
+      );
+      break;
+    case "join":
+      base.push(node.text ?? "", JSON.stringify(node.fields ?? []), node.color ?? "", node.template ?? "");
+      break;
+    case "group":
+      base.push(node.__groupUnpacked ? 1 : 0);
+      break;
+  }
+  return base.join("|");
+};
 
 export function renderScene(scene: Scene, store: Store, screen: { w: number; h: number }, timeMs: number) {
   ensureAxisStream();
@@ -921,9 +1063,23 @@ export function renderScene(scene: Scene, store: Store, screen: { w: number; h: 
   const view = activeView(store);
   const cam = store.cameraOverride ?? fitCameraToScreen(view.camera, store);
   const selectedSet = new Set(store.selectedIds ?? []);
-  const byId = new Set(store.model.nodes.map((n) => n.id));
-  const parentById = new Map(store.model.nodes.map((n: any) => [String(n.id), String(n.groupId ?? "")]));
-  const nodeById = new Map(store.model.nodes.map((n: any) => [String(n.id), n]));
+  const derived = scene.derivedCache;
+  if (
+    derived.modelRef !== store.model
+    || derived.nodeCount !== store.model.nodes.length
+    || derived.viewCount !== store.model.views.length
+  ) {
+    derived.modelRef = store.model;
+    derived.nodeCount = store.model.nodes.length;
+    derived.viewCount = store.model.views.length;
+    derived.byId = new Set(store.model.nodes.map((n) => n.id));
+    derived.parentById = new Map(store.model.nodes.map((n: any) => [String(n.id), String(n.groupId ?? "")]));
+    derived.nodeById = new Map(store.model.nodes.map((n: any) => [String(n.id), n]));
+    derived.viewById = new Map(store.model.views.map((v) => [String(v.id), v]));
+  }
+  const byId = derived.byId;
+  const parentById = derived.parentById;
+  const nodeById = derived.nodeById;
 
   // remove stale
   for (const [id, h] of Array.from(scene.domNodes.entries())) {
@@ -939,7 +1095,7 @@ export function renderScene(scene: Scene, store: Store, screen: { w: number; h: 
     }
   }
 
-  const viewById = new Map(store.model.views.map((v) => [String(v.id), v]));
+  const viewById = derived.viewById;
   const resolveVisibilityTarget = (node: any) => {
     let space = node?.space;
     let viewId = node?.viewId ?? null;
@@ -1113,9 +1269,8 @@ export function renderScene(scene: Scene, store: Store, screen: { w: number; h: 
       (!isNodeInteractiveInMode(store.mode, node) ||
         isLiveLayer ||
         ((!isEditableTable && !!activeGroupId && !inGroup) || (!isEditableTable && isGroupRoot)));
-    const isPlayerControl =
-      (node.type === "buttons" || node.type === "slider") && Boolean((node as any).playerId);
-    const disableForGrouping = store.mode !== "live" && !activeGroupId && hasGroupParent && !isPlayerControl;
+    const isStandaloneEditableControl = node.type === "buttons" || node.type === "slider";
+    const disableForGrouping = store.mode !== "live" && !activeGroupId && hasGroupParent && !isStandaloneEditableControl;
     handle.el.classList.toggle("is-disabled", disableForMode);
     if (disableForMode || disableForGrouping) {
       if (node.type === "axis" && store.mode === "live") handle.el.style.pointerEvents = "";
@@ -1124,7 +1279,31 @@ export function renderScene(scene: Scene, store: Store, screen: { w: number; h: 
       handle.el.style.pointerEvents = "";
     }
     handle.update = () => updateNodeDom(handle!.el, node, cam, screen, timeMs, store.mode, store);
-    handle.update();
+    const shouldUseStaticCache =
+      store.mode !== "live"
+      && STATIC_NODE_TYPES.has(String(node.type))
+      && !isSelected
+      && !(node.type === "group" && !!activeGroupId);
+    if (shouldUseStaticCache) {
+      const staticKey = buildStaticRenderKey(
+        node,
+        screen,
+        cam,
+        store.mode,
+        isSelected,
+        activeGroupId,
+        inGroup,
+        disableForMode,
+        disableForGrouping
+      );
+      if (handle.lastStaticRenderKey !== staticKey) {
+        handle.update();
+        handle.lastStaticRenderKey = staticKey;
+      }
+    } else {
+      handle.lastStaticRenderKey = undefined;
+      handle.update();
+    }
   }
 }
 
@@ -1588,9 +1767,14 @@ function updateNodeDom(
     playerLinks,
     webcamLinks,
     persistButtons,
+    persistElement,
     getAxisState,
     clampAxisView,
     renderAxisNode,
+    activateAxis: (axisId: string | null) => {
+      activeAxisIdRef.activeAxisId = axisId;
+      (window as any).ipAxisStream?.setActive?.(axisId ?? undefined);
+    },
     ensureCameraStream,
     stopCameraStream,
     ensureWebcamBus,

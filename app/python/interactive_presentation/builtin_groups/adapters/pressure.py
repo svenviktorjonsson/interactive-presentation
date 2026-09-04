@@ -27,6 +27,7 @@ class PressureModuleAdapter:
     run_label = str(getattr(spec, "run_label", None) or "Run")
     resume_label = str(getattr(spec, "resume_label", None) or "Resume")
     pause_label = str(getattr(spec, "pause_label", None) or "Pause")
+    reset_label = str(getattr(spec, "reset_label", None) or "Reset")
 
     group_node: dict[str, Any] = {
       "id": base_id,
@@ -45,6 +46,7 @@ class PressureModuleAdapter:
       "pressureRunLabel": run_label,
       "pressureResumeLabel": resume_label,
       "pressurePauseLabel": pause_label,
+      "pressureResetLabel": reset_label,
       "pressureXLabel": x_label,
       "pressureYLabel": y_label,
       "pressurePeakLabel": peak_label,
@@ -86,7 +88,7 @@ class PressureModuleAdapter:
     }
     ctx.append_node(axis_node, view_id=view_id, space=space, layer=layer)
 
-    tpl_data = {"runPauseResume": run_label, "xLabel": x_label, "yLabel": y_label, "peakLabel": peak_label}
+    tpl_data = {"runPauseResume": run_label, "resetLabel": reset_label, "xLabel": x_label, "yLabel": y_label, "peakLabel": peak_label}
     buttons_local = local_override(
       f"{base_id}_buttons",
       {"x": 0.12660755594922043, "y": 0.0023648634072202515, "w": 0.15017711947865328, "h": 0.0845995902030589, "rotationDeg": 0, "anchor": "topLeft"},
@@ -103,12 +105,12 @@ class PressureModuleAdapter:
       "opacity": 1,
       "transform": child_transform(buttons_local),
       "groupLocal": buttons_local,
-      "labels": [format_template("{{runPauseResume}}", tpl_data)],
-      "templates": ["{{runPauseResume}}"],
-      "actions": ["pressure-toggle"],
+      "labels": [format_template("{{runPauseResume}}", tpl_data), format_template("{{resetLabel}}", tpl_data)],
+      "templates": ["{{runPauseResume}}", "{{resetLabel}}"],
+      "actions": ["pressure-toggle", "pressure-reset"],
       "buttonsMode": "click",
       "rows": 1,
-      "cols": 1,
+      "cols": 2,
     }
     ctx.apply_element_defaults(buttons_node, "buttons")
     ctx.append_node(buttons_node, view_id=view_id, space=space, layer=layer)

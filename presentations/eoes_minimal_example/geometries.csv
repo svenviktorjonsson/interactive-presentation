@@ -2,11 +2,11 @@ id,view,space,zIndex,x,y,w,h,rotationDeg,anchor,fontPx
 __screen_space__,screen_main,screen,0,0.5,0.5,1.0,1.0,1.0,centerCenter,
 deck_hint,screen_main,screen,0,0.03,0.1,0.56,0.04,0.0,topLeft,20.0
 deck_title,screen_main,screen,0,0.03,0.04,0.32,0.05,0.0,topLeft,34.0
-experiment_main,experiment_view,world,0,0.5,0.55,0.84,0.76,0.0,centerCenter,
+experiment_main,experiment_view,world,66,0.3925154968266744,0.4310221368748001,0.9681693671887424,0.8759627607898145,0.0,centerCenter,
 join_main,join_view,world,0,0.5,0.53,0.42,0.52,0.0,centerCenter,
-mc_main,multichoice_view,world,47,0.3767834364812903,0.38780210806696924,0.7644,0.46019749547171673,0.0,centerCenter,
+mc_main,multichoice_view,world,47,0.3919856196454452,0.35746777605633084,0.73399563367169,0.3504910565084703,0.0,centerCenter,
 player_main,player_view,world,0,0.5,0.53,0.72,0.78,0.0,centerCenter,
-pressure_main,pressure_view,world,48,0.509704834577752,0.47447880142821486,0.84,0.7795759012303451,0.0,centerCenter,
-spectrum_main,spectrum_view,world,49,0.7649845733596212,0.6068940603839458,1.3835211415675588,0.7400581731879913,0.0,centerCenter,
-timer_main,timer_view,world,0,0.47013944597959867,0.5928028612725984,0.7226914050705062,0.6347848139649503,0.0,centerCenter,
-webcam_main,webcam_view,world,0,0.5,0.55,0.72,0.82,0.0,centerCenter,
+pressure_main,pressure_view,world,91,0.5074537441035325,0.47034943142534397,0.8259590852912166,0.768291088702102,0.0,centerCenter,
+spectrum_main,spectrum_view,world,99,0.6451056009237703,0.44827389646014026,0.49137766934134885,0.9833422141534491,0.0,centerCenter,
+timer_main,timer_view,world,89,0.5117704852684759,0.5031014006700202,0.9300052256465219,0.8168814379228211,0.0,centerCenter,
+webcam_main,webcam_view,world,110,0.35088396113180487,0.41115286185052713,0.72,0.82,0.0,centerCenter,

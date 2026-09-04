@@ -37,6 +37,7 @@ export type PersistBulletsPayload = {
 
 export type ActiveTextEditor = {
   nodeId: string;
+  nodeRef?: any;
   el: HTMLTextAreaElement;
   errEl: HTMLDivElement;
   alignEl: HTMLDivElement;
@@ -45,6 +46,13 @@ export type ActiveTextEditor = {
   currentAlign: TextAlign;
   everEntered: boolean;
   startSnapshot: TextEditSnapshot;
+  layoutCache?: {
+    lineCount: number;
+    left: number;
+    width: number;
+    top: number;
+    height: number;
+  };
 };
 
 export const normalizeAlign = (value: unknown): TextAlign => {

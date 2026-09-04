@@ -42,6 +42,15 @@ type ControlNodeDeps = {
     space?: "world" | "screen" | "group";
     groupId?: string | null;
   }) => Promise<void>;
+  persistElement: (payload: {
+    id: string;
+    type: string;
+    viewId: string;
+    attrs?: Record<string, unknown>;
+    doc?: "presentation" | "notes";
+    space?: "world" | "screen" | "group";
+    groupId?: string | null;
+  }) => Promise<void>;
 };
 
 export const ensureSliderNodeElement = (el: HTMLElement) => {
@@ -377,7 +386,7 @@ export const updateButtonsControlNode = (
 export const updateSliderControlNode = (
   el: HTMLElement,
   node: Node,
-  deps: Pick<ControlNodeDeps, "inferPlayerId" | "ensurePlayerBus" | "playerLinks">,
+  deps: Pick<ControlNodeDeps, "inferPlayerId" | "ensurePlayerBus" | "playerLinks" | "persistElement">,
 ) => {
   const input = el.querySelector<HTMLInputElement>(".slider-input");
   if (!input) throw new Error("[next] slider node missing input");
@@ -433,6 +442,22 @@ export const updateSliderControlNode = (
     deps.playerLinks.set(playerId, link);
   }
 
+  const persistSliderValue = () => {
+    const n: any = (el as any).__sliderNode;
+    if (!n) return;
+    const groupId = n.groupId ? String(n.groupId) : null;
+    const persistViewId = groupId ? "group" : n.space === "screen" ? "screen_main" : n.viewId ?? "";
+    if (!persistViewId) return;
+    void deps.persistElement({
+      id: String(n.id ?? ""),
+      type: "slider",
+      viewId: persistViewId,
+      attrs: { value: n.value },
+      space: groupId ? "group" : n.space,
+      groupId,
+    });
+  };
+
   if (!input.dataset.bound) {
     input.dataset.bound = "1";
     input.addEventListener("pointerdown", () => {
@@ -440,6 +465,13 @@ export const updateSliderControlNode = (
     });
     input.addEventListener("pointerup", () => {
       delete input.dataset.dragging;
+      persistSliderValue();
+      input.blur();
+    });
+    input.addEventListener("pointercancel", () => {
+      delete input.dataset.dragging;
+      persistSliderValue();
+      input.blur();
     });
     input.addEventListener("input", () => {
       const n: any = (el as any).__sliderNode;
@@ -460,8 +492,12 @@ export const updateSliderControlNode = (
             playerId: deps.inferPlayerId(n),
             value: valueOut,
           },
-        }),
-      );
+          }),
+        );
+      });
+    input.addEventListener("change", () => {
+      persistSliderValue();
+      input.blur();
     });
   }
 };

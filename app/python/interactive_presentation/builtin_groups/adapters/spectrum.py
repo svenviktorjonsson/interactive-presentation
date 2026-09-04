@@ -24,6 +24,7 @@ class SpectrumModuleAdapter:
     run_label = str(getattr(spec, "run_label", None) or "Run")
     resume_label = str(getattr(spec, "resume_label", None) or "Resume")
     pause_label = str(getattr(spec, "pause_label", None) or "Pause")
+    reset_label = str(getattr(spec, "reset_label", None) or "Reset")
     y_label = str(getattr(spec, "y_label", None) or "Normalized Intensity")
     f_label = str(getattr(spec, "f_label", None) or "Frequency")
     f_x_label = str(getattr(spec, "f_x_label", None) or "Frequency (Hz)")
@@ -51,7 +52,7 @@ class SpectrumModuleAdapter:
       "soundRunLabel": run_label,
       "soundResumeLabel": resume_label,
       "soundPauseLabel": pause_label,
-      "soundResetLabel": "Reset",
+      "soundResetLabel": reset_label,
       "soundHomeLabel": "Home",
       "soundFreqLabel": f_label,
       "soundTimeLabel": "Time",
@@ -107,6 +108,7 @@ class SpectrumModuleAdapter:
 
     tpl_data = {
       "runPauseResume": run_label,
+      "resetLabel": reset_label,
       "freqLabel": f_label,
       "timeLabel": "Time",
       "xLabel": f_x_label or "Frequency (Hz)",
@@ -130,12 +132,12 @@ class SpectrumModuleAdapter:
       "opacity": 1,
       "transform": child_transform(buttons_local),
       "groupLocal": buttons_local,
-      "labels": [format_template("{{runPauseResume}}", tpl_data)],
-      "templates": ["{{runPauseResume}}"],
-      "actions": ["sound-toggle"],
+      "labels": [format_template("{{runPauseResume}}", tpl_data), format_template("{{resetLabel}}", tpl_data)],
+      "templates": ["{{runPauseResume}}", "{{resetLabel}}"],
+      "actions": ["sound-toggle", "sound-reset"],
       "buttonsMode": "click",
       "rows": 1,
-      "cols": 1,
+      "cols": 2,
     }
     ctx.apply_element_defaults(buttons_node, "buttons")
     ctx.append_node(buttons_node, view_id=view_id, space=space, layer=layer)
